@@ -68,6 +68,9 @@ slope = 32
 # A wave is counted in whole steps, rounded down but for a step's 1/dead (what is not
 # nearly a step long is grain more often than picture).
 dead = 12
+# A tile counts as moved only when a moved place is this much more like it than the same
+# place, summed over its 256 pixels (a vector that follows the grain costs bytes for nothing).
+still = 256
 
 # The smoother: vectors between node A and node B.
 [smoother]

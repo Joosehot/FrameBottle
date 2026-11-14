@@ -261,8 +261,14 @@ fn verify(b: &Bottle, movie_path: &Path, far: &mut (u8, f64, u64), mended: &mut 
         if seen < to {
             let unpacked = b.frames(seen, to, &mut chain)?;
             same += unpacked.iter().zip(&frames).filter(|(u, f)| u == f).count();
-            for (u, f) in unpacked.iter().zip(&frames) {
+            for (k, (u, f)) in unpacked.iter().zip(&frames).enumerate() {
+                let before = far.1;
                 distance(u, f, far);
+                if std::env::var_os("FBOTT_EACH").is_some() {
+                    // One line a frame, for looking at where the loss is.
+                    let mean = (far.1 - before) / u.len() as f64;
+                    println!("frame {} {:.2}", seen + k, if mean == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mean).log10() });
+                }
             }
             for (m, f) in chain.mended.drain(..).zip(&frames) {
                 distance(&m, f, mended);

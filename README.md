@@ -351,3 +351,52 @@ a pixel, guesses of a tile from its neighbours in many directions (here
 one flat value), a filter that smooths block edges inside the loop, tiles
 of many sizes, frames guessed from a later frame as well, and a packer that
 weighs bytes against loss for every choice.
+
+### Blocks, second round, and a correction to the table above
+
+**The PSNR of H.264 and AV1 in the table above is wrong.** It was taken
+with ffmpeg's `psnr` filter, which pairs frames by their time; this clip's
+frame times are uneven, so some frames were compared with the wrong frame
+and the two looked about 5 dB worse than they are. Measured frame by frame
+in decoding order (the way `fbottle verify` counts), they are far ahead:
+
+| | bytes | PSNR |
+|---|---|---|
+| Frame Bottle, blocks, coarse 5 | 17 602 274 | 47.58 dB |
+| Frame Bottle, blocks, coarse 8 | 9 402 634 | 45.44 dB |
+| Frame Bottle, blocks, coarse 12 | 6 372 995 | 43.89 dB |
+| H.264, crf 22 | 4 621 893 | 46.33 dB |
+| Frame Bottle, blocks, coarse 18 | 3 972 884 | 41.75 dB |
+| AV1, crf 24 | 3 394 188 | 46.33 dB |
+| Frame Bottle, blocks, coarse 26 | 2 886 012 | 40.05 dB |
+| H.264, crf 26 | 2 334 877 | 44.23 dB |
+| AV1, crf 30 | 2 159 426 | 45.76 dB |
+| Frame Bottle, blocks, coarse 40 | 2 133 715 | 37.92 dB |
+| AV1, crf 36 | 1 450 315 | 45.09 dB |
+| H.264, crf 30 | 1 313 941 | 41.97 dB |
+
+At about 45.4 dB a bottle is 9.4 MB, H.264 about 3.3 MB and AV1 about
+1.7 MB: H.264 is about 3 times smaller, AV1 about 5.5 times.
+
+What changed in this round (each measured on the clip):
+
+- **Seams smoothed inside the loop.** The seams between 8 x 8 blocks are
+  smoothed when a frame is rebuilt, and the smoothed frame is what the next
+  one is found in; only seams of blocks made anew in that frame.
+  Coarse 22: 39.0 to 40.7 dB, 4 % smaller.
+- **Vectors to half a pixel.** Whole pixels first, then the eight
+  half-pixel places around the best. A little nearer at the same size.
+- **The frame before is preferred to a flat guess.** The packer had
+  compared the frame before with the tile's own mean, and took "flat" for
+  four tiles in ten of a picture that stands still; the quality sank from
+  42 to 36 dB along the film. Now a flat guess is taken only when it is far
+  nearer. Coarse 45: 36.8 to 37.9 dB at the same size.
+- **A tile counts as moved only when that is clearly nearer** than standing
+  still (`still` in rules.toml). A quarter fewer bytes for half a dB.
+- **The top frame is kept three times finer**: every still tile after it is
+  a copy of it.
+
+Together: about 41 dB took 5.9 MB before this round and takes about 3.5 MB
+now. Tried and dropped, because they made it worse: looking 20 pixels away
+instead of 7, a stronger preference for standing still, and leaving out
+blocks with only one or two small waves.

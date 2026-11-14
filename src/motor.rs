@@ -125,6 +125,7 @@ impl Rules {
                 range: num(table("block")?, "range", "block")? as usize,
                 slope: (num(table("block")?, "slope", "block")? as usize).clamp(1, 255) as u8,
                 dead: (num(table("block")?, "dead", "block")? as usize).clamp(1, 255) as u8,
+                still: num(table("block")?, "still", "block")? as u32,
             },
         })
     }
