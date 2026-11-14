@@ -176,12 +176,109 @@ impl Tables {
     }
 }
 
+/// A block's corrections as a pattern: which waves are left, and each one's steps.
+type Waves = Vec<(u8, i16)>;
+
+/// The pattern dictionary on the corrections themselves, before the coder: a book of
+/// whole blocks' corrections that have come up before. A block whose corrections are
+/// in the book is kept as the pattern's label. The book works as the bit dictionary
+/// does: a pattern enters the second time it is seen, the most used have the lowest
+/// ranks, at most `BOOK` are held and the one not used for the longest is dropped.
+/// It is never stored: the player learns each block's corrections as it rebuilds
+/// them and keeps the same book. Each band of a frame has its own, carried from
+/// frame to frame.
+pub struct Book {
+    entries: Vec<(Waves, u32, u64, usize)>,
+    find: std::collections::HashMap<Waves, usize>,
+    ranks: Vec<usize>,
+    oldest: std::collections::BTreeSet<(u64, usize)>,
+    waiting: std::collections::HashSet<Waves>,
+    ticks: u64,
+    hit: [u16; 2],
+    rank_bits: [u16; 32],
+    /// Blocks with corrections, and how many of them were in the book.
+    pub blocks: u64,
+    pub hits: u64,
+}
+
+const BOOK: usize = 1024;
+
+impl Book {
+    pub fn new() -> Book {
+        Book { entries: Vec::new(), find: Default::default(), ranks: Vec::new(), oldest: Default::default(), waiting: Default::default(), ticks: 0, hit: [HALF; 2], rank_bits: [HALF; 32], blocks: 0, hits: 0 }
+    }
+    pub fn patterns(&self) -> usize {
+        self.entries.len()
+    }
+    fn used(&mut self, e: usize) {
+        self.oldest.remove(&(self.entries[e].2, e));
+        self.entries[e].2 = self.ticks;
+        self.oldest.insert((self.ticks, e));
+        self.entries[e].1 += 1;
+        let mut r = self.entries[e].3;
+        while r > 0 && self.entries[self.ranks[r - 1]].1 < self.entries[e].1 {
+            let other = self.ranks[r - 1];
+            self.ranks.swap(r - 1, r);
+            self.entries[other].3 = r;
+            r -= 1;
+        }
+        self.entries[e].3 = r;
+    }
+    /// A block's corrections that were not in the book: the second time, they enter it.
+    fn saw(&mut self, w: Waves) {
+        if !self.waiting.remove(&w) {
+            if self.waiting.len() >= 8192 {
+                self.waiting.clear();
+            }
+            self.waiting.insert(w);
+            return;
+        }
+        let e = if self.entries.len() < BOOK {
+            self.entries.push((w.clone(), 1, self.ticks, self.ranks.len()));
+            self.ranks.push(self.entries.len() - 1);
+            self.entries.len() - 1
+        } else {
+            let (at, e) = *self.oldest.iter().next().unwrap();
+            self.oldest.remove(&(at, e));
+            let old = std::mem::replace(&mut self.entries[e], (w.clone(), 1, self.ticks, 0));
+            self.find.remove(&old.0);
+            self.entries[e].3 = old.3;
+            e
+        };
+        self.find.insert(w, e);
+        self.oldest.insert((self.ticks, e));
+    }
+}
+
+fn waves_of(steps: &[i32; 64]) -> Waves {
+    steps.iter().enumerate().filter(|(_, s)| **s != 0).map(|(i, s)| (i as u8, (*s).clamp(-32767, 32767) as i16)).collect()
+}
+
 /// The steps of one block's waves, coarse to fine: written, or read into `steps`.
-fn block(c: &mut Coder, l: &mut Learned, kind: usize, moved: usize, steps: &mut [i32; 64]) {
+fn block(c: &mut Coder, l: &mut Learned, book: &mut Option<&mut Book>, kind: usize, moved: usize, steps: &mut [i32; 64]) {
     let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
     if !c.bit(&mut l.any[kind * 2 + moved], want > 0) {
         *steps = [0; 64];
         return;
+    }
+    if let Some(book) = book.as_deref_mut() {
+        // Is this block's whole pattern of corrections in the book? Then only its label is kept.
+        book.ticks += 1;
+        book.blocks += 1;
+        let found = if matches!(c, Coder::Write(_)) { book.find.get(&waves_of(steps)).copied() } else { None };
+        if c.bit(&mut book.hit[kind], found.is_some()) {
+            let rank = c.count(&mut book.rank_bits, found.map_or(1, |e| book.entries[e].3 as u32 + 1)) as usize - 1;
+            let e = book.ranks.get(rank).copied().unwrap_or(0);
+            *steps = [0; 64];
+            if let Some(entry) = book.entries.get(e) {
+                for (i, s) in &entry.0 {
+                    steps[*i as usize] = *s as i32;
+                }
+                book.used(e);
+            }
+            book.hits += 1;
+            return;
+        }
     }
     let (mut node, mut end) = (1usize, 0usize);
     for b in (0..6).rev() {
@@ -207,6 +304,9 @@ fn block(c: &mut Coder, l: &mut Learned, kind: usize, moved: usize, steps: &mut 
         let n = c.count(&mut l.size[fine], steps[i].unsigned_abs().clamp(1, 65535)) as i32;
         steps[i] = if negative { -n } else { n };
         before = 1;
+    }
+    if let Some(book) = book.as_deref_mut() {
+        book.saw(waves_of(steps));
     }
 }
 
@@ -345,7 +445,7 @@ fn find_whole(s: &[u8; 256], before: &Pic, x0: i32, y0: i32, range: i32, left: (
 /// One band of tile rows `ty0..ty1`: packed (with `src`) or rebuilt (without).
 /// `bufs` are the band's rows of the three planes as the player has them.
 #[allow(clippy::too_many_arguments)]
-fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, stack: Option<&[u8]>, (range, dead, still): (i32, i32, u32), ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, c: &mut Coder) {
+fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, stack: Option<&[u8]>, (range, dead, still): (i32, i32, u32), ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, mut book: Option<&mut Book>, c: &mut Coder) {
     let at = geo.offsets();
     let mut l = Learned::new();
     let across = geo.width.div_ceil(TILE);
@@ -455,7 +555,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, s
                             *s = v.signum() * ((v.abs() + step / dead) / step);
                         }
                     }
-                    block(c, &mut l, (i > 0) as usize, (vector.is_some() || from_stack) as usize, &mut steps);
+                    block(c, &mut l, &mut book, (i > 0) as usize, (vector.is_some() || from_stack) as usize, &mut steps);
                     let mut back = [0i32; 64];
                     let waves_left = steps.iter().any(|s| *s != 0);
                     if waves_left || !(from_stack || matches!(vector, Some((0, 0)))) {
@@ -533,6 +633,21 @@ fn smooth_seams(geo: &Geometry, frame: &mut [u8], coarse: u8, made: &Marks) {
 }
 
 const FROM_BEFORE: u8 = 2;
+/// The frame's blocks were kept with the book of patterns.
+const BOOKS: u8 = 4;
+
+/// One place for a book (or none) for each band.
+fn slots(books: Option<&mut Vec<Book>>, bands: usize) -> Vec<Option<&mut Book>> {
+    match books {
+        Some(b) => {
+            if b.len() != bands {
+                *b = (0..bands).map(|_| Book::new()).collect();
+            }
+            b.iter_mut().map(Some).collect()
+        }
+        None => (0..bands).map(|_| None).collect(),
+    }
+}
 const HEAD: usize = 5;
 
 pub fn fits(geo: &Geometry) -> bool {
@@ -571,7 +686,8 @@ pub struct How {
 /// Packs a frame in AV1's way. `before` is the frame before as the player
 /// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
 /// length, the bands) and the frame as the player will rebuild it.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How) -> (Vec<u8>, Vec<u8>) {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>) -> (Vec<u8>, Vec<u8>) {
+    let with_books = books.is_some();
     let stack = stack.filter(|s| before.is_some() && s.len() == frame.len());
     // The top frame is what every still tile after it is a copy of: it is kept finer.
     let coarse = if before.is_none() { (coarse / 3).max(1) } else { coarse };
@@ -580,11 +696,14 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
     let tile_rows = geo.height.div_ceil(TILE);
     let mut rebuilt = vec![0u8; geo.frame_len()];
     let made = marks(geo);
-    let done: Vec<Vec<u8>> = cut(geo, &mut rebuilt, rows)
+    let work = cut(geo, &mut rebuilt, rows);
+    let places = slots(books, work.len());
+    let done: Vec<Vec<u8>> = work
         .into_par_iter()
-        .map(|(ty0, bufs)| {
+        .zip(places)
+        .map(|((ty0, bufs), book)| {
             let mut c = Coder::Write(Encoder::new());
-            band(geo, &t, Some(frame), before, stack, (how.range as i32, how.dead.max(1) as i32, how.still), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
+            band(geo, &t, Some(frame), before, stack, (how.range as i32, how.dead.max(1) as i32, how.still), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
             match c {
                 Coder::Write(e) => e.finish(),
                 Coder::Read(_) => unreachable!(),
@@ -592,7 +711,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
         })
         .collect();
     smooth_seams(geo, &mut rebuilt, coarse, &made);
-    let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 }];
+    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -606,7 +725,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
 }
 
 /// The frame as the player rebuilds it.
-pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>) -> Result<Vec<u8>, String> {
+pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, books: &mut Vec<Book>) -> Result<Vec<u8>, String> {
     if payload.len() < HEAD || !fits(geo) {
         return Err("not a frame of blocks".into());
     }
@@ -625,9 +744,10 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Opti
         coded.push(payload.get(data..data + len).ok_or("a frame of blocks is cut")?);
         data += len;
     }
-    work.into_par_iter().zip(coded).for_each(|((ty0, bufs), bytes)| {
+    let places = slots(if payload[0] & BOOKS != 0 { Some(books) } else { None }, work.len());
+    work.into_par_iter().zip(coded).zip(places).for_each(|(((ty0, bufs), bytes), book)| {
         let mut c = Coder::Read(Decoder::new(bytes));
-        band(geo, &t, None, before, stack, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
+        band(geo, &t, None, before, stack, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
     });
     smooth_seams(geo, &mut out, payload[3], &made);
     Ok(out)
@@ -644,11 +764,12 @@ mod tests {
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
         let how = How { range: 7, slope: 32, dead: 12, still: 256 };
-        for coarse in [1u8, 6, 20] {
-            let (first, a2) = pack(&geo, &a, None, None, 3, coarse, &how);
-            assert_eq!(unpack(&geo, &first, None, None).unwrap(), a2);
-            let (second, b2) = pack(&geo, &b, Some(&a2), Some(&a2), 3, coarse, &how);
-            assert_eq!(unpack(&geo, &second, Some(&a2), Some(&a2)).unwrap(), b2);
+        for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
+            let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
+            let (first, a2) = pack(&geo, &a, None, None, 3, coarse, &how, with.then_some(&mut packer));
+            assert_eq!(unpack(&geo, &first, None, None, &mut player).unwrap(), a2);
+            let (second, b2) = pack(&geo, &b, Some(&a2), Some(&a2), 3, coarse, &how, with.then_some(&mut packer));
+            assert_eq!(unpack(&geo, &second, Some(&a2), Some(&a2), &mut player).unwrap(), b2);
         }
     }
 }

@@ -28,6 +28,7 @@ mod fstrike;
 mod block;
 mod bottle;
 mod chop;
+mod dict;
 mod golden;
 mod guess;
 mod motor;
@@ -49,6 +50,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
              [--line]                    exact, but each sample first says whether it stayed what it was
+             [--dictionary]              common bit patterns of the corrections are kept by label
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
@@ -92,6 +94,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     // The Hammer's stack of every frame so far, and one name for all of them (for the brand).
     let mut hammer = guess::Hammer::new();
     let mut so_far = String::new();
+    // The pattern dictionary: every frame's bits go through it, in order.
+    let mut dictionary = dict::Dictionary::new();
+    let mut books: Vec<block::Book> = Vec::new();
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -125,12 +130,16 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             for frame in &frames {
                 let before = carry.as_ref().map(|(f, _)| f.as_slice());
                 let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
-                    (3, block::pack(geo, frame, before, hammer.picture(), rules.bands, rules.coarse, &rules.blocks))
+                    (3, block::pack(geo, frame, before, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books)))
                 } else {
                     (2, guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance))
                 };
                 let mut packed = vec![kind, 0, 0];
                 packed.extend(payload);
+                let leans = pack::leans(&packed);
+                if rules.dictionary {
+                    packed = dictionary.close(packed);
+                }
                 let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
                 let ports = hashes
                     .into_iter()
@@ -142,7 +151,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                     })
                     .collect();
                 let raw = bottle::sha(&rebuilt);
-                nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw: raw.clone(), ports, next: None, leans: pack::leans(&packed) });
+                nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw: raw.clone(), ports, next: None, leans });
                 hammer.strike(&rebuilt);
                 carry = Some((rebuilt, raw));
             }
@@ -185,8 +194,13 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             })
             .collect::<Result<_, String>>()?;
         carry = frames.pop().zip(raws.last().cloned());
-        for (raw, hashes, was_struck, leans) in done {
+        for (raw, mut hashes, was_struck, leans) in done {
             struck += was_struck as usize;
+            if rules.dictionary {
+                let parts: Option<Vec<Vec<u8>>> = hashes.iter().map(|h| bottle::from_nimbus(h)).collect();
+                let kept = dictionary.close(parts.ok_or("a share is not in Nimbus")?.concat());
+                hashes = particle::shares(&kept, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
+            }
             let ports = hashes
                 .into_iter()
                 .map(|h| {
@@ -210,6 +224,26 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
         node.next = (i + 1 < n).then_some(i as u32 + 1);
     }
+    if rules.dictionary {
+        let d = &dictionary;
+        let pieces = (d.hits + d.misses).max(1);
+        println!(
+            "DICT   {} patterns at the end; {} of {} pieces were labels ({:.2} %), covering {:.2} % of the bits; {} of {} frames came out smaller through it; all frames through it would be {} bytes, as they are {}",
+            d.patterns(),
+            d.hits,
+            pieces,
+            100.0 * d.hits as f64 / pieces as f64,
+            100.0 * d.bytes_by_label as f64 / d.bytes_in.max(1) as f64,
+            d.frames_kept,
+            d.frames,
+            d.bytes_through,
+            d.bytes_in
+        );
+    }
+    if !books.is_empty() {
+        let (blocks, hits, patterns) = books.iter().fold((0, 0, 0), |n, b| (n.0 + b.blocks, n.1 + b.hits, n.2 + b.patterns()));
+        println!("BOOK   {patterns} patterns of block corrections at the end (in {} books); {hits} of {blocks} blocks with corrections were in a book ({:.2} %)", books.len(), 100.0 * hits as f64 / blocks.max(1) as f64);
+    }
     println!("GRID   {n} frames as tiles of a {cols} x {rows} grid ({} x {} pixels)", cols * geo.width, rows * geo.height);
     println!("PACK   {} tiles packed, {} struck from Nimbus (already branded); {} lean on the tile before them", n - struck, struck, nodes.iter().filter(|n| n.leans).count());
     let out = out.unwrap_or_else(|| movie_path.with_extension("fbott"));
@@ -226,6 +260,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         species,
         tolerance: rules.tolerance,
         coarse: rules.coarse,
+        dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
         nodes,
         shares: Vec::new(),
     };
@@ -277,6 +312,13 @@ fn verify(b: &Bottle, movie_path: &Path, far: &mut (u8, f64, u64), mended: &mut 
             }
         }
         seen += frames.len();
+    }
+    if let Some(name) = &b.index.dictionary {
+        // The player's dictionary must have ended as the packer's did.
+        if bottle::sha(&chain.dictionary.bytes()) != *name {
+            return Err("the player's dictionary did not end as the packer's did".into());
+        }
+        println!("dictionary: the player's ended as the packer's did ({} patterns, {} of {} frames came through it)", chain.dictionary.patterns(), chain.dictionary.frames_kept, chain.dictionary.frames);
     }
     Ok((same, b.index.nodes.len(), seen))
 }
@@ -333,6 +375,7 @@ fn run() -> Result<(), String> {
             "--for" => profile = it.next().ok_or("--for needs size or play")?.clone(),
             "--explain" => explain = true,
             "--bench" => bench = true,
+            "--dictionary" => rules.dictionary = true,
             "--line" => guess::BY_LINE.store(true, std::sync::atomic::Ordering::Relaxed),
             "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,

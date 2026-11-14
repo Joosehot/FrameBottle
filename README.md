@@ -457,3 +457,53 @@ bigger and further from the movie at every tolerance (tolerance 4:
 49 143 713 bytes at 40.40 dB, against 29 607 960 at 42.74 dB without it).
 A sample that stays is held at an old value until it is a whole tolerance
 off, so the frames the next guesses are made from are worse.
+
+## The pattern dictionary (`--dictionary`, added 2026-11-15)
+
+Two dictionaries, both self-updating, capped, and never stored in the
+bottle: the packer and the player build them in the same order from what
+both have already seen.
+
+**On the bits of the corrections** ([src/dict.rs](src/dict.rs), as
+designed). After a frame's corrections are written, their bits are read
+again a byte at a time. Patterns of 2 to 8 bytes are kept in a dictionary
+of at most 4096; a pattern enters when two pieces have been seen one after
+the other twice, the most used have the lowest ranks (the shortest labels),
+and when it is full the one not used for the longest is dropped. A frame is
+kept through the dictionary only when that is smaller. Every frame so kept
+is checked against 8 bytes of the SHA-256 of the bits it was made from, and
+the dictionary as it stood after the last frame lies in Nimbus under its
+hash, which the bottle's index holds: `verify` fails if the player's
+dictionary ends otherwise.
+
+**On the corrections themselves, before the coder** (`Book` in
+[src/block.rs](src/block.rs)). The same rules, but a pattern is a whole
+8 x 8 block's corrections (which waves are left and their steps). A block
+whose corrections are in the book is kept as the pattern's rank. One book
+of at most 1024 patterns for each band, carried from frame to frame.
+
+Measured on `guitar_10s.mp4`, blocks at coarse 20 (41.18 dB both ways: the
+dictionaries lose nothing):
+
+| | bytes |
+|---|---|
+| before | 3 598 135 |
+| after (`--dictionary`) | 3 493 256 (2.9 % saved) |
+| AV1 at about the same quality (SVT-AV1 crf 60, 40.86 dB) | 258 585 |
+| AV1, crf 55 (42.48 dB) | 435 215 |
+| H.264, crf 30 (41.97 dB) | 1 313 941 |
+
+- **The bit dictionary saved nothing.** Its hit rate was 6.43 % of the
+  pieces (12.4 % of the bits), and not one of the 302 frames came out
+  smaller through it: all of them through it would be 2.1 % bigger. The
+  bits come out of the range coder, which has already taken every pattern
+  out of them; 6.4 % is what 4096 patterns of two bytes hit by chance
+  (4096 of 65 536 is 6.25 %), and a label costs more than the 16 bits it
+  stands for. The same on the exact packing: 6.25 %, no frame smaller.
+- **The book of block patterns saved the 2.9 %.** 76.3 % of the blocks that
+  have corrections were in a book. At coarse 8 (45.44 dB): 9 400 443 to
+  9 239 961 bytes, 1.7 % saved, 68.4 % in a book. A book of 256 saves 2.2 %,
+  one of 4096 saves 3.1 %.
+- The player rebuilds the same bits: the dictionary's end hash matched, and
+  every frame rebuilt from the books has the SHA-256 the packer recorded.
+- Against AV1 at the same quality a bottle is still about 12 times bigger.

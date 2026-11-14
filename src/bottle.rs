@@ -71,6 +71,11 @@ pub struct Index {
     /// Blocks, AV1's way: the length of a wave's step (0: not used; then frames are not exact).
     #[serde(default)]
     pub coarse: u8,
+    /// The bottle's frames went through the pattern dictionary; this is the name (in
+    /// Nimbus) of the dictionary as it stood after the last frame. The dictionary itself
+    /// is not in the bottle: the player makes it again as it goes.
+    #[serde(default)]
+    pub dictionary: Option<String>,
     pub nodes: Vec<Node>,
     pub shares: Vec<Share>,
 }
@@ -154,6 +159,10 @@ pub struct Chain {
     pub at: usize,
     pub before: Option<Vec<u8>>,
     pub hammer: crate::guess::Hammer,
+    /// The pattern dictionary as it stands after the frames so far (for a bottle that has one).
+    pub dictionary: crate::dict::Dictionary,
+    /// The books of block patterns, one for each band (for a bottle of blocks that has them).
+    pub books: Vec<crate::block::Book>,
     /// For a bottle with a tolerance: each frame fed is also mended (what the
     /// tolerance lost put right as far as it can be) and waits here to be shown.
     mending: Option<(Geometry, u8)>,
@@ -162,7 +171,7 @@ pub struct Chain {
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), mending: None, mended: Vec::new() }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new() }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
@@ -272,10 +281,16 @@ impl Bottle {
             }
         }
         let mut waiting: Vec<Option<Vec<u8>>> = Vec::new();
-        let mut out: Vec<Vec<u8>> = (from..to)
+        let mut tiles: Vec<Vec<u8>> = (from..to).into_par_iter().map(|i| self.packed(i)).collect::<Result<_, String>>()?;
+        if self.index.dictionary.is_some() {
+            // In order: each frame's bits come back through the dictionary, which moves on.
+            for t in tiles.iter_mut() {
+                *t = chain.dictionary.open(std::mem::take(t))?;
+            }
+        }
+        let mut out: Vec<Vec<u8>> = tiles
             .into_par_iter()
-            .map(|i| {
-                let packed = self.packed(i)?;
+            .map(|packed| {
                 if crate::pack::guessed(&packed) || crate::pack::blocks(&packed) {
                     return Ok((Vec::new(), Some(packed)));
                 }
@@ -293,7 +308,7 @@ impl Bottle {
             if let Some(packed) = &waiting[i] {
                 // The same guesses as when it was packed, and the corrections added.
                 out[i] = if crate::pack::blocks(packed) {
-                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.picture())?
+                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.picture(), &mut chain.books)?
                 } else {
                     crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
                 };
@@ -312,11 +327,26 @@ impl Bottle {
         Ok(out)
     }
 
+    /// A frame struck from the window is not unpacked, but its bits still go through
+    /// the dictionary, so that it stands where the packer's stood.
+    pub fn pass(&self, node: usize, chain: &mut Chain) -> Result<(), String> {
+        if self.index.dictionary.is_some() {
+            chain.dictionary.open(self.packed(node)?)?;
+        }
+        Ok(())
+    }
+
+    /// Every node's packed tile, in order, out of the dictionary if the bottle has one.
+    fn tiles(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut d = crate::dict::Dictionary::new();
+        (0..self.index.nodes.len()).map(|i| if self.index.dictionary.is_some() { d.open(self.packed(i)?) } else { self.packed(i) }).collect()
+    }
+
     /// (16 x 16 tiles guessed perfectly, tiles) over all guessed frames.
     pub fn guess_tiles(&self) -> Result<(usize, usize), String> {
         let mut n = (0, 0);
-        for i in 0..self.index.nodes.len() {
-            let t = crate::pack::guess_tiles(&self.packed(i)?);
+        for packed in self.tiles()? {
+            let t = crate::pack::guess_tiles(&packed);
             n = (n.0 + t.0, n.1 + t.1);
         }
         Ok(n)
@@ -325,8 +355,7 @@ impl Bottle {
     /// (planes for which Golden's guesser spoke, planes) over all guessed frames.
     pub fn golden_planes(&self) -> Result<(usize, usize), String> {
         let mut n = (0, 0);
-        for i in 0..self.index.nodes.len() {
-            let packed = self.packed(i)?;
+        for packed in self.tiles()? {
             if crate::pack::guessed(&packed) {
                 n = (n.0 + crate::pack::golden_planes(&self.geo, &packed), n.1 + self.geo.planes.len());
             }
@@ -337,8 +366,7 @@ impl Bottle {
     /// How many nodes chose each way of packing.
     pub fn choices(&self) -> Result<Vec<(String, usize)>, String> {
         let mut n: HashMap<String, usize> = HashMap::new();
-        for i in 0..self.index.nodes.len() {
-            let packed = self.packed(i)?;
+        for packed in self.tiles()? {
             if packed.len() >= 3 {
                 *n.entry(crate::pack::choice_name(&packed)).or_default() += 1;
             }

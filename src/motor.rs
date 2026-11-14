@@ -40,6 +40,8 @@ pub struct Rules {
     pub tolerance: u8,
     /// Blocks, AV1's way: how long a wave's step is (0: not used). The command's --coarse sets it.
     pub coarse: u8,
+    /// The pattern dictionary is used (the command's --dictionary).
+    pub dictionary: bool,
     pub blocks: crate::block::How,
 }
 
@@ -121,6 +123,7 @@ impl Rules {
             bands: (num(table("guess")?, "bands", "guess")? as usize).clamp(1, 4096),
             tolerance: 0,
             coarse: 0,
+            dictionary: false,
             blocks: crate::block::How {
                 range: num(table("block")?, "range", "block")? as usize,
                 slope: (num(table("block")?, "slope", "block")? as usize).clamp(1, 255) as u8,

@@ -123,7 +123,8 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
         let have = found.iter().take_while(|f| f.is_some()).count();
         let mut frames: Vec<(Vec<u8>, bool)> = found.into_iter().take(have).flatten().map(|f| (f, true)).collect();
         // The frames struck from the window are laid on the chain too: the next ones lean on them.
-        for f in &frames {
+        for (k, f) in frames.iter().enumerate() {
+            b.pass(start + k, &mut chain)?;
             chain.feed(&f.0);
         }
         if start + have < end {
