@@ -402,6 +402,54 @@ impl Hammer {
     }
 }
 
+/// MEND: what a tolerance lost, put right as far as it can be without one more byte.
+///
+/// A frame rebuilt with a tolerance has every sample within `tol` of the real one, so
+/// the real one lies between `v - tol` and `v + tol`. Which value in that span it was
+/// is not kept, but the samples around it say where it probably was: those of the same
+/// surface (within 2 tol of it) missed to both sides, and their mean is nearer the real
+/// surface than any one of them. The mended sample is that mean, held inside the span.
+/// The player does this to what it shows; the guesses are still made from the frames
+/// as rebuilt, so every player rebuilds the same. (The Hammer's stack was tried here
+/// too and made it worse: it is made of rebuilt frames, whose misses lean the same way.)
+pub fn mend(geo: &Geometry, frame: &[u8], tol: u8) -> Vec<u8> {
+    let mut out = frame.to_vec();
+    if tol == 0 {
+        return out;
+    }
+    let (t, reach) = (tol as i32, 2 * tol as i32);
+    let mut rest = &mut out[..];
+    for (p, at) in geo.planes.iter().zip(geo.offsets()) {
+        let (plane, r) = rest.split_at_mut(p.len());
+        rest = r;
+        if p.bps != 1 {
+            continue;
+        }
+        let (src, stride, px) = (&frame[at..at + p.len()], p.stride(), p.px());
+        plane.par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
+            for (i, o) in row.iter_mut().enumerate() {
+                let v = src[y * stride + i] as i32;
+                let (mut sum, mut n) = (2 * v, 2);
+                for yy in y.saturating_sub(1)..(y + 2).min(p.h) {
+                    for k in [-1i32, 0, 1] {
+                        let ii = i as i32 + k * px as i32;
+                        if ii < 0 || ii >= stride as i32 || (yy == y && k == 0) {
+                            continue;
+                        }
+                        let u = src[yy * stride + ii as usize] as i32;
+                        if (u - v).abs() <= reach {
+                            sum += u;
+                            n += 1;
+                        }
+                    }
+                }
+                *o = ((sum + n / 2) / n).clamp(v - t, v + t).clamp(0, 255) as u8;
+            }
+        });
+    }
+    out
+}
+
 /// One plane of a frame, if there is a frame.
 fn plane_of(frame: Option<&[u8]>, at: usize, len: usize) -> Option<&[u8]> {
     frame.map(|f| &f[at..at + len])
@@ -491,7 +539,7 @@ fn within(tol: u8, g: u8, x: u8) -> (i8, u8) {
 
 /// The sample a correction rebuilds from the guess.
 #[inline(always)]
-fn mend(tol: u8, g: u8, fix: i8) -> u8 {
+fn apply(tol: u8, g: u8, fix: i8) -> u8 {
     if tol == 0 { g.wrapping_add(fix as u8) } else { (g as i32 + fix as i32 * (2 * tol as i32 + 1)).clamp(0, 255) as u8 }
 }
 
@@ -522,7 +570,7 @@ fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Optio
         for (i, x) in row.iter_mut().enumerate() {
             let (g, place) = band.guess(i);
             let fix = if flags[i / tw] { 0 } else { read(d.as_mut().unwrap(), &mut l, &place) as i8 };
-            *x = mend(tol, g, fix);
+            *x = apply(tol, g, fix);
             band.learn(i, *x, fix);
         }
         band.next_row();

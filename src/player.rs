@@ -105,7 +105,8 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
     let spent: [std::sync::atomic::AtomicU64; 4] = Default::default();
     let add = |i: usize, t: Instant| spent[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut prev: Option<Vec<u8>> = None;
-    let mut chain = bottle::Chain::new();
+    let mut chain = bottle::Chain::mending(b);
+    let tolerant = b.index.tolerance > 0;
     let mut closed = false;
     for start in (0..n).step_by(rules.ahead) {
         let t = Instant::now();
@@ -131,6 +132,16 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
             add(0, t);
             frames.extend(unpacked.into_iter().map(|f| (f, false)));
         }
+        if tolerant {
+            // The window keeps the frames as rebuilt (the next ones are guessed from them);
+            // what is shown, and what the frames between are guessed from, is mended.
+            let t = Instant::now();
+            frames[have..].par_iter().enumerate().try_for_each(|(i, f)| bottle::to_nimbus(&f.0, &b.index.nodes[start + have + i].raw))?;
+            add(1, t);
+            for (f, m) in frames.iter_mut().zip(chain.mended.drain(..)) {
+                f.0 = m;
+            }
+        }
         for (i, (_, struck)) in frames.iter().enumerate() {
             if *struck {
                 stats.struck += 1;
@@ -144,6 +155,9 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
         // While the guessed frames are made, the nodes just unpacked go into the window.
         let (kept, guesses) = rayon::join(
             || {
+                if tolerant {
+                    return Ok(());
+                }
                 let t = Instant::now();
                 let kept = frames[have..].par_iter().enumerate().try_for_each(|(i, f)| bottle::to_nimbus(&f.0, &b.index.nodes[start + have + i].raw));
                 add(1, t);

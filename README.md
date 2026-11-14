@@ -273,3 +273,27 @@ With a tolerance of 1 a bottle is smaller than every lossless encode. At
 the quality of the AV1 file (about 40 dB) a bottle is about ten times its
 size: a tolerance spends its bits sample by sample, where AV1 describes a
 block of 64 or more samples with a few numbers.
+
+### Mending what a tolerance lost
+
+The player mends a frame rebuilt with a tolerance before it shows it
+(`guess::mend`): each sample becomes the mean of itself and the samples
+around it that are the same surface (within 2 N of it), held inside
+N of what was rebuilt. It costs no byte: the bottle is the same, and the
+guesses are still made from the frames as rebuilt. `verify` reports both.
+
+Measured on `guitar_10s.mp4`:
+
+| tolerance | bytes | PSNR as rebuilt | PSNR as shown (mended) | furthest sample as shown |
+|---|---|---|---|---|
+| 1 | 69 837 647 | 50.88 dB | 51.31 dB | 2 |
+| 2 | 46 700 754 | 47.20 dB | 48.08 dB | 4 |
+| 4 | 29 556 629 | 42.74 dB | 43.68 dB | 8 |
+| 8 | 17 990 116 | 37.28 dB | 38.10 dB | 16 |
+| 12 | 13 023 181 | 33.93 dB | 34.65 dB | 24 |
+
+Mending brings the frames 0.4 to 0.9 dB nearer on average. A single sample
+can end up further than before (up to 2 N), because the mean is a guess.
+The Hammer's stack was tried as a second witness and made it worse (it is
+made of rebuilt frames, whose misses lean the same way). A step along the
+film takes about 15 ms with mending.

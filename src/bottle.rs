@@ -151,15 +151,28 @@ pub struct Chain {
     pub at: usize,
     pub before: Option<Vec<u8>>,
     pub hammer: crate::guess::Hammer,
+    /// For a bottle with a tolerance: each frame fed is also mended (what the
+    /// tolerance lost put right as far as it can be) and waits here to be shown.
+    mending: Option<(Geometry, u8)>,
+    pub mended: Vec<Vec<u8>>,
 }
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new() }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), mending: None, mended: Vec::new() }
+    }
+    /// A chain that also mends the frames of this bottle, if it has a tolerance.
+    pub fn mending(b: &Bottle) -> Chain {
+        let mut c = Chain::new();
+        c.mending = (b.index.tolerance > 0).then(|| (b.geo.clone(), b.index.tolerance));
+        c
     }
     /// The next frame is known: it becomes the frame before, and is laid on the stack.
     pub fn feed(&mut self, frame: &[u8]) {
         self.hammer.strike(frame);
+        if let Some((geo, tol)) = &self.mending {
+            self.mended.push(crate::guess::mend(geo, frame, *tol));
+        }
         match &mut self.before {
             Some(b) if b.len() == frame.len() => b.copy_from_slice(frame),
             b => *b = Some(frame.to_vec()),
@@ -244,11 +257,14 @@ impl Bottle {
     pub fn frames(&self, from: usize, to: usize, chain: &mut Chain) -> Result<Vec<Vec<u8>>, String> {
         use rayon::prelude::*;
         if chain.at != from {
+            let mending = chain.mending.take();
             *chain = Chain::new();
+            chain.mending = mending;
             let mut at = 0;
             while at < from {
                 let end = (at + 24).min(from);
                 self.frames(at, end, chain)?;
+                chain.mended.clear();
                 at = end;
             }
         }
