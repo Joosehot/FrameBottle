@@ -48,6 +48,7 @@ const USAGE: &str = "\
 fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance N]
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
+             [--line]                    exact, but each sample first says whether it stayed what it was
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
@@ -165,7 +166,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 let before: Option<(&[u8], &str)> = if i > 0 { Some((&frames[i - 1], &raws[i - 1])) } else { carry.as_ref().map(|(f, r)| (f.as_slice(), r.as_str())) };
                 // Only the rules that decide a pack are in its brand (not the smoother's or the player's).
                 let pack_rules = motor::DEFAULT_RULES.split("[smoother]").next().unwrap();
-                let key = pack_key(pack_rules, profile_name, geo, &species, &raw, &names[i]);
+                let by_line = guess::BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
+                let key = pack_key(pack_rules, &format!("{profile_name}{}", if by_line { " line" } else { "" }), geo, &species, &raw, &names[i]);
                 if let Some(text) = bottle::branded("pack", &key) {
                     let mut lines = text.lines();
                     let leans = lines.next() == Some("tile");
@@ -331,6 +333,7 @@ fn run() -> Result<(), String> {
             "--for" => profile = it.next().ok_or("--for needs size or play")?.clone(),
             "--explain" => explain = true,
             "--bench" => bench = true,
+            "--line" => guess::BY_LINE.store(true, std::sync::atomic::Ordering::Relaxed),
             "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,
             "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,

@@ -432,3 +432,21 @@ The coder already knew most of it from the neighbours and from which
 guesser was right. Telling it in 6 steps made the bottle 0.2 % bigger
 (too many cases to learn each from one band), and letting the judge hear
 `still` louder the longer a sample has stood still made it 1.9 % bigger.
+
+### `--line`: each sample first says whether it stayed
+
+Built to get the 0.578 bits a sample measured above: with `--line`, a
+frame says for every sample whether it is exactly what it was in the frame
+before, and the coder learns that from how long the Hammer has seen the
+sample stand still and from whether the samples to its left, above it and
+above to the right stayed. Only a sample that did not stay has a
+correction. Frames still unpack identically.
+
+Measured on `guitar_3s.mp4`: 47 302 091 bytes with `--line`, 40 359 977
+without: 17 % bigger. HotMotor itself turned it down for 39 of the 91
+frames (plain `own+med+xz` was smaller there). The 0.578 bits are the
+price of the map alone; the 42 % of samples that changed still need their
+corrections on top, and they are the costly ones. Without `--line` there
+is no map: one question, "was the mixed guess right?", covers both, and
+the mixed guess is right for many samples that did change. `--line` is
+left in as a switch, off unless asked for.

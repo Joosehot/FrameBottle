@@ -42,7 +42,7 @@ use rayon::prelude::*;
 
 /// The guesser as it is now. A change to how it guesses or codes changes this, so that
 /// the lightning does not strike a pack made by an older guesser.
-pub const VERSION: &str = "guess 21";
+pub const VERSION: &str = "guess 22";
 
 const TOP: u32 = 1 << 24;
 const BITS: u32 = 12;
@@ -166,11 +166,13 @@ struct Learned {
     digits: [u16; 9 * 8],
     /// A tile's flag, by how many of the tiles to its left and above were guessed perfectly.
     tile: [u16; 3],
+    /// Did the sample stay what it was in the frame before? By `Band::line`.
+    stayed: [u16; 48],
 }
 
 impl Learned {
     fn new() -> Learned {
-        Learned { zero: [HALF; STEPS * 5 * 3 * 2], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3] }
+        Learned { zero: [HALF; STEPS * 5 * 3 * 2], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3], stayed: [HALF; 48] }
     }
 }
 
@@ -244,6 +246,9 @@ struct Band<'a> {
     /// The same row of the Hammer's stack, and of how long each sample has stood still.
     stack: Option<&'a [u8]>,
     still: Option<&'a [u8]>,
+    /// Which samples of this row and the one above are exactly what they were in the frame before.
+    stayed: Vec<bool>,
+    stayed_up: Vec<bool>,
     /// Golden's guess for each value a sample had in the frame before; None when it says "the same".
     golden: Option<[u8; 256]>,
     /// The same row of the frame before, and the row above it there.
@@ -266,6 +271,8 @@ impl<'a> Band<'a> {
             wrong_up: [vec![0; n], vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
             stack: None,
             still: None,
+            stayed: vec![false; n],
+            stayed_up: vec![false; n],
             golden,
             before: None,
             before_up: None,
@@ -347,11 +354,30 @@ impl<'a> Band<'a> {
         (mixed, place)
     }
 
+    /// Where sample `i` stands for the question "did it stay what it was in the frame
+    /// before?": how long the Hammer has seen it stand still (6 steps), and whether the
+    /// samples to its left, above it and above to the right stayed.
+    #[inline(always)]
+    fn line(&self, i: usize) -> usize {
+        let long = self.still.map_or(0, |a| match a[i] {
+            0..=2 => a[i] as usize,
+            3..=4 => 3,
+            5..=7 => 4,
+            _ => 5,
+        });
+        let (px, up) = (self.px, self.has_up);
+        let left = i >= px && self.stayed[i - px];
+        let above = up && self.stayed_up[i];
+        let right = up && i + px < self.row.len() && self.stayed_up[i + px];
+        ((long * 2 + left as usize) * 2 + above as usize) * 2 + right as usize
+    }
+
     /// The real sample is known: remember it, the correction, and how wrong each guesser was.
     #[inline(always)]
     fn learn(&mut self, i: usize, real: u8, fix: i8) {
         self.row[i] = real;
         self.fix[i] = fix;
+        self.stayed[i] = self.before.is_some_and(|b| b[i] == real);
         for g in 0..5 {
             self.wrong[g][i] = real.abs_diff(self.offers[g]);
         }
@@ -359,6 +385,7 @@ impl<'a> Band<'a> {
 
     fn next_row(&mut self) {
         std::mem::swap(&mut self.row, &mut self.up);
+        std::mem::swap(&mut self.stayed, &mut self.stayed_up);
         std::mem::swap(&mut self.fix, &mut self.fix_up);
         std::mem::swap(&mut self.wrong, &mut self.wrong_up);
         self.has_up = true;
@@ -495,7 +522,7 @@ fn tile(p: &Plane) -> (usize, usize) {
 /// larger miss is corrected to within it; the band as the player will rebuild it is
 /// returned too (empty without a tolerance: then it is the real band).
 #[allow(clippy::too_many_arguments)]
-fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, still: Option<&[u8]>, golden: Option<[u8; 256]>, tol: u8, y0: usize, y1: usize) -> (Vec<u8>, usize, usize, Vec<u8>) {
+fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, still: Option<&[u8]>, golden: Option<[u8; 256]>, tol: u8, line: bool, y0: usize, y1: usize) -> (Vec<u8>, usize, usize, Vec<u8>) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
@@ -504,6 +531,8 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>,
     let mut fixes: Vec<i8> = Vec::with_capacity((y1 - y0) * stride);
     let mut places: Vec<Place> = Vec::with_capacity((y1 - y0) * stride);
     let mut rebuilt: Vec<u8> = Vec::new();
+    // With `line`: for each sample, where it stands for "did it stay?", and whether it did.
+    let mut lines: Vec<(u8, bool)> = Vec::new();
     for y in y0..y1 {
         band.at_row(before, y, stride);
         band.stack = hammer.map(|h| &h[y * stride..(y + 1) * stride]);
@@ -514,6 +543,9 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>,
             let (fix, value) = within(tol, g, *x);
             fixes.push(fix);
             places.push(place);
+            if line {
+                lines.push((band.line(i) as u8, band.before.is_some_and(|b| b[i] == *x)));
+            }
             // The guesses that follow are made from what the player will have, not from the real sample.
             band.learn(i, value, fix);
             if tol > 0 {
@@ -529,11 +561,22 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>,
     for top in (0..y1 - y0).step_by(th) {
         let rows = top..(top + th).min(y1 - y0);
         let flags: Vec<bool> = (0..across).map(|t| rows.clone().all(|y| fixes[y * stride + t * tw..y * stride + ((t + 1) * tw).min(stride)].iter().all(|f| *f == 0))).collect();
+        perfect += flags.iter().filter(|f| **f).count();
+        tiles += across;
+        if line {
+            // Sample by sample: did it stay what it was? Only one that did not has a correction.
+            for k in rows.start * stride..rows.end * stride {
+                let (ctx, stayed) = lines[k];
+                e.bit(&mut l.stayed[ctx as usize], !stayed);
+                if !stayed {
+                    write(&mut e, &mut l, &places[k], fixes[k] as i32);
+                }
+            }
+            continue;
+        }
         for t in 0..across {
             e.bit(&mut l.tile[above[t] as usize + (t > 0 && flags[t - 1]) as usize], flags[t]);
         }
-        perfect += flags.iter().filter(|f| **f).count();
-        tiles += across;
         for y in rows {
             for i in 0..stride {
                 if !flags[i / tw] {
@@ -571,7 +614,7 @@ fn apply(tol: u8, g: u8, fix: i8) -> u8 {
 /// guesses, and the corrections added where a tile's flag says it has any.
 /// `coded` None means no tile needed one.
 #[allow(clippy::too_many_arguments)]
-fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Option<&[u8]>, still: Option<&[u8]>, golden: Option<[u8; 256]>, tol: u8, y0: usize, y1: usize, out: &mut [u8]) {
+fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Option<&[u8]>, still: Option<&[u8]>, golden: Option<[u8; 256]>, tol: u8, line: bool, y0: usize, y1: usize, out: &mut [u8]) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
@@ -580,7 +623,7 @@ fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Optio
     // Without corrections every tile was guessed perfectly; with them, nothing is above the first row.
     let mut flags = vec![d.is_none(); across];
     for y in y0..y1 {
-        if (y - y0) % th == 0 {
+        if (y - y0) % th == 0 && !line {
             if let Some(d) = d.as_mut() {
                 let above = std::mem::replace(&mut flags, vec![false; across]);
                 for t in 0..across {
@@ -594,7 +637,15 @@ fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Optio
         let row = &mut out[(y - y0) * stride..(y - y0 + 1) * stride];
         for (i, x) in row.iter_mut().enumerate() {
             let (g, place) = band.guess(i);
-            let fix = if flags[i / tw] { 0 } else { read(d.as_mut().unwrap(), &mut l, &place) as i8 };
+            let fix = if line {
+                let (ctx, d) = (band.line(i), d.as_mut().unwrap());
+                // It stayed: the correction is what brings the guess to the sample of the frame before.
+                if d.bit(&mut l.stayed[ctx]) { read(d, &mut l, &place) as i8 } else { band.before.unwrap()[i].wrapping_sub(g) as i8 }
+            } else if flags[i / tw] {
+                0
+            } else {
+                read(d.as_mut().unwrap(), &mut l, &place) as i8
+            };
             *x = apply(tol, g, fix);
             band.learn(i, *x, fix);
         }
@@ -610,6 +661,11 @@ fn band_rows(p: &Plane, bands: usize) -> usize {
 
 const PERFECT: u8 = 1;
 const FROM_BEFORE: u8 = 2;
+/// Sample by sample the frame says first whether the sample stayed what it was.
+const LINE: u8 = 8;
+
+/// Whether frames are packed with `LINE` (the command's --line; an experiment's switch).
+pub static BY_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The whole frame is the frame before it: the `still` guesser alone was right everywhere.
 const STILL: u8 = 4;
 
@@ -717,19 +773,20 @@ pub fn pack_within(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: 
         })
         .collect();
     let at = geo.offsets();
+    let line = tol == 0 && before.is_some() && BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
     let done: Vec<(Vec<u8>, usize, usize, Vec<u8>)> = jobs
         .par_iter()
         .map(|(i, y0, y1)| {
             let p = &geo.planes[*i];
             let part = |f| plane_of(f, at[*i], p.len());
             let still = plane_of(hammer, geo.frame_len() + at[*i], p.len());
-            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), still, golden_table(gains[*i]), tol, *y0, *y1)
+            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), still, golden_table(gains[*i]), tol, line, *y0, *y1)
         })
         .collect();
     let (perfect, tiles) = done.iter().fold((0, 0), |n, d| (n.0 + d.1, n.1 + d.2));
     // A frame keeps its corrections' bytes also when Golden spoke: its fractions are in them.
-    let any = perfect < tiles || gains.iter().any(|g| g.0 != g.1);
-    let mut out = vec![(if any { 0 } else { PERFECT }) | (if before.is_some() { FROM_BEFORE } else { 0 })];
+    let any = perfect < tiles || gains.iter().any(|g| g.0 != g.1) || line;
+    let mut out = vec![(if any { 0 } else { PERFECT }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if line { LINE } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.extend((perfect as u32).to_le_bytes());
     out.extend((tiles as u32).to_le_bytes());
@@ -763,6 +820,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, hammer: Opt
     }
     let bands = u16::from_le_bytes([payload[1], payload[2]]) as usize;
     let tol = payload[11];
+    let line = payload[0] & LINE != 0 && before.is_some();
     let at = geo.offsets();
     let mut out = vec![0u8; geo.frame_len()];
     // Each band's bytes, in the order they were written.
@@ -800,7 +858,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, hammer: Opt
         let y1 = y0 + chunk.len() / p.stride();
         let part = |f| plane_of(f, at[i], p.len());
         let still = plane_of(hammer, geo.frame_len() + at[i], p.len());
-        rebuild(p, coded, part(before), part(hammer), still, golden[i], tol, y0, y1, chunk);
+        rebuild(p, coded, part(before), part(hammer), still, golden[i], tol, line, y0, y1, chunk);
     });
     Ok(out)
 }
@@ -808,6 +866,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, hammer: Opt
 /// For HotMotor's size judge: the sample bands of the tile, guessed and
 /// corrected as a pack would; returns (coded bytes, sample bytes).
 pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, rules: &Rules) -> (usize, usize) {
+    let line = before.is_some() && BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
     let hammer = hammer.filter(|h| before.is_some() && h.len() == 2 * frame.len());
     let at = geo.offsets();
     let mut jobs = Vec::new();
@@ -824,7 +883,7 @@ pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Optio
             let p = &geo.planes[*i];
             let part = |f| plane_of(f, at[*i], p.len());
             let still = plane_of(hammer, geo.frame_len() + at[*i], p.len());
-            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), still, None, 0, *y0, *y1).0.len()
+            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), still, None, 0, line, *y0, *y1).0.len()
         })
         .sum();
     let raw: usize = jobs.iter().map(|(i, y0, y1)| (y1 - y0) * geo.planes[*i].stride()).sum();
@@ -866,6 +925,21 @@ mod tests {
                 assert!(real.iter().zip(got).all(|(x, y)| x.abs_diff(*y) <= tol), "no sample is further than {tol} from the real one");
             }
         }
+    }
+
+    #[test]
+    fn a_frame_comes_back_exactly_line_by_line() {
+        BY_LINE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let geo = Geometry::of("yuv420p", 70, 50).unwrap();
+        let a = noise(geo.frame_len(), 1, true);
+        let mut b = a.clone();
+        for i in (0..b.len()).step_by(5) {
+            b[i] = b[i].wrapping_add(7);
+        }
+        let second = pack(&geo, &b, Some(&a), Some(&twice(&a)), 3);
+        BY_LINE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(second[0] & LINE != 0);
+        assert_eq!(unpack(&geo, &second, Some(&a), Some(&twice(&a))).unwrap(), b);
     }
 
     #[test]
