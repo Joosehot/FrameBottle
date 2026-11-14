@@ -212,8 +212,8 @@ impl Bottle {
     /// UNPACK: the frames of the nodes `from..to`, exactly as they were chopped (each
     /// checked by its hash). `before` is the frame of node `from - 1` if the caller has
     /// it; without it the run starts further back, at a tile that stands on its own.
-    /// The coder's work is done for all nodes at once; a leaning tile then takes the
-    /// frame before it, in order.
+    /// All nodes are unpacked at once; a leaning tile is then put on the frame before
+    /// it, in order.
     pub fn frames(&self, from: usize, to: usize, before: Option<&[u8]>) -> Result<Vec<Vec<u8>>, String> {
         use rayon::prelude::*;
         let mut start = from;
@@ -222,18 +222,20 @@ impl Bottle {
                 start = start.checked_sub(1).ok_or("the first tile leans on nothing")?;
             }
         }
-        let coded: Vec<(Vec<u8>, Vec<u8>)> = (start..to)
+        let mut out: Vec<Vec<u8>> = (start..to)
             .into_par_iter()
             .map(|i| {
                 let packed = self.packed(i)?;
                 let res = crate::pack::uncode(&self.geo, &packed)?;
-                Ok((packed, res))
+                Ok(crate::pack::restore(&self.geo, &packed, &res))
             })
             .collect::<Result<_, String>>()?;
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(coded.len());
-        for (packed, res) in &coded {
-            let prev = out.last().map(|f| f.as_slice()).or(before);
-            out.push(crate::pack::restore(&self.geo, packed, res, prev)?);
+        for i in 0..out.len() {
+            if self.index.nodes[start + i].leans {
+                let (done, rest) = out.split_at_mut(i);
+                let prev = done.last().map(|f| f.as_slice()).or(before).filter(|p| p.len() == rest[0].len());
+                crate::pack::lean_on(&mut rest[0], prev.ok_or("a leaning tile was unpacked without the tile before it")?);
+            }
         }
         out.par_iter().enumerate().try_for_each(|(i, f)| {
             if sha(f) != self.index.nodes[start + i].raw {

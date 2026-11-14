@@ -15,8 +15,6 @@ use crate::smooth;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// What the window holds for one node: its frame, and the guessed frames that lead to it.
@@ -95,25 +93,14 @@ pub fn forget(b: &Bottle) -> usize {
 }
 
 /// Plays the bottle at `smooth` times its own frame rate: `smooth - 1`
-/// guessed frames between each two nodes. With `show` the frames go to a
-/// window on the screen (ffplay); without, they are only made, and timed.
-pub fn play(b: &Bottle, rules: &Rules, smooth: usize, show: bool) -> Result<Stats, String> {
+/// guessed frames between each two nodes. Every frame is handed to `sink`
+/// in order (the window on the screen, or nothing when only timing); the
+/// play stops when the sink says false.
+pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u8>) -> bool) -> Result<Stats, String> {
     let n = b.index.nodes.len();
     let len = b.geo.frame_len();
     let mut stats = Stats::default();
     let mut held: BTreeMap<u32, Held> = std::fs::read_to_string(window_file(b)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let mut screen = None;
-    if show {
-        let rate = format!("{}/{}", b.index.fps.0 * smooth as u64, b.index.fps.1);
-        let size = format!("{}x{}", b.index.width, b.index.height);
-        let mut child = Command::new("ffplay")
-            .args(["-v", "error", "-autoexit", "-window_title", "Frame Bottle", "-f", "rawvideo", "-pixel_format", &b.index.pix_fmt, "-video_size", &size, "-framerate", &rate, "-i", "-"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("ffplay: {e}"))?;
-        let pipe = child.stdin.take().unwrap();
-        screen = Some((child, pipe));
-    }
     let began = Instant::now();
     let spent: [std::sync::atomic::AtomicU64; 4] = Default::default();
     let add = |i: usize, t: Instant| spent[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -210,25 +197,23 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, show: bool) -> Result<Stat
         stats.work += t.elapsed();
         // Node to node: the guessed frames that lead to a node, then the node.
         let mut last = Vec::new();
-        for ((frame, _), g) in frames.into_iter().zip(guesses) {
+        let count = frames.len();
+        for (i, ((frame, _), g)) in frames.into_iter().zip(guesses).enumerate() {
             stats.guessed_frames += g.1.len();
             stats.nodes += 1;
-            if let Some((_, pipe)) = screen.as_mut() {
-                if !closed {
-                    // The window on the screen was closed: stop there.
-                    closed = g.1.iter().chain([&frame]).any(|f| pipe.write_all(f).is_err());
-                }
+            if i + 1 == count {
+                // The next node ahead may lean on this one, and its guessed frames start from it.
+                last = frame.clone();
             }
-            last = frame;
+            for f in g.1.into_iter().chain([frame]) {
+                // The window on the screen was closed: stop there.
+                closed = closed || !sink(f);
+            }
         }
         prev = Some(last);
         if closed {
             break;
         }
-    }
-    if let Some((mut child, pipe)) = screen {
-        drop(pipe);
-        let _ = child.wait();
     }
     stats.wall = began.elapsed();
     for (i, s) in spent.iter().enumerate() {

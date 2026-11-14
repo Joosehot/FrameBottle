@@ -13,17 +13,21 @@ fbottle forget <bottle>                  empty the bottle's window in Nimbus
 fbottle smoother <bottle>                how near a guessed frame comes to a real one
 ```
 
-Build with `cargo build --release`. It needs `ffmpeg`, `ffprobe` and
-`ffplay` on the path, Strike's sources next to this folder (`../Strike`),
+Build with `cargo build --release`. Frame Bottle runs no outside program
+and does not use ffmpeg: Windows' Media Foundation opens the movie, and the
+player has its own window. It needs Strike's sources next to this folder
+(`../Strike`),
 the particle maker's vault (`~/Aurelia/vault`, or `AURELIA_VAULT`) and, for
 the report's numbers, Nuome's `nuome` (`~/Nuome/target/release`, or `NUOME`).
 
 ## The seven steps
 
-1. **CHOP** ([src/chop.rs](src/chop.rs)). ffmpeg gives every frame of the
-   movie, none dropped and none doubled, in the movie's own pixel format
-   (8- and 10-bit YUV, grey, RGB; anything else is taken as RGB or RGBA,
-   and the report says so).
+1. **CHOP** ([src/chop.rs](src/chop.rs)). Windows' Media Foundation
+   decodes the movie (MP4, MOV and what else Windows plays) and hands out
+   every frame, as 8-bit YUV 4:2:0. A GIF is read by the gif reader and
+   drawn frame over frame, as RGBA. Checked from outside on the test
+   clips: the frames are byte for byte the ones ffmpeg decodes. A frame
+   the file itself hides (an edit list) is chopped too.
 2. **GRID.** Every frame is a tile of one grid, the smallest square-ish one
    with a tile for each frame, filled row by row. A node knows its tile's
    column and row. The grid is never laid out as one picture in memory:
@@ -60,8 +64,9 @@ the report's numbers, Nuome's `nuome` (`~/Nuome/target/release`, or `NUOME`).
    memory. The frames live in Nimbus in a **rolling window** around the
    playhead: the nodes a little ahead are unpacked from their particles
    just before they play, and what the playhead has left behind leaves
-   Nimbus. A frame already in the window is struck from it. The frames go
-   to ffplay at the playback rate.
+   Nimbus. A frame already in the window is struck from it. The frames
+   are made ready on one thread and shown by another, each at its time, in
+   the player's own window ([src/screen.rs](src/screen.rs)).
 7. **SMOOTHER** ([src/smooth.rs](src/smooth.rs)). Between node A and node B
    the frame is cut into blocks, and for each block a vector d is found
    such that A at p - d and B at p + d look most alike. A guessed frame at
@@ -116,10 +121,18 @@ went from 50 721 120 to 50 571 840 bytes (5 of 91 tiles chose to lean), the
 25 714. The grain of a picture is new in every frame, and what is kept
 exactly has to keep the grain.
 
+**Without ffmpeg** (added last): the 4K clip was cut again so that it has
+no hidden frames, and has 69 frames now. With `--for play` its bottle is
+230 860 923 bytes, all 69 frames unpack identically and are the ones ffmpeg
+decodes, and a step takes 13.8 ms (72 frames a second). The 1080p clip is
+unchanged: 5.0 ms a step.
+
 ## What it is not, yet
 
 - No sound: a bottle holds the frames only.
 - A frame rate that changes inside a movie is played at its average.
+- 10-bit movies are not chopped yet (the packer and the player know the
+  layouts; the chopper asks Windows for 8-bit frames).
 - The window keeps whole frames in Nimbus: about 95 frames at most, which
   is 1.2 GB for 4K. The packed shares of every bottle made also stay in
   Nimbus (`~/.strike/nimbus`) until they are removed there.

@@ -41,7 +41,7 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// The layout of ffmpeg's raw frame in this pixel format, if Frame Bottle knows it.
+    /// The layout of a raw frame in this pixel format (named as ffmpeg names them), if Frame Bottle knows it.
     pub fn of(pix_fmt: &str, w: usize, h: usize) -> Option<Geometry> {
         let yuv = |sx: u32, sy: u32, bps: usize| {
             let (cw, chh) = ((w + (1 << sx) - 1) >> sx, (h + (1 << sy) - 1) >> sy);
@@ -304,9 +304,9 @@ pub fn uncode(geo: &Geometry, packed: &[u8]) -> Result<Vec<u8>, String> {
     decode(packed[2], &packed[3..], geo.frame_len())
 }
 
-/// The second half: the frame itself, from `res` (what `uncode` gave) and,
-/// for a leaning tile, the frame of the tile before it.
-pub fn restore(geo: &Geometry, packed: &[u8], res: &[u8], before: Option<&[u8]>) -> Result<Vec<u8>, String> {
+/// The second half, which needs no other tile either: the guesses undone. For a tile
+/// that stands on its own this is the frame; for a leaning one, `lean_on` finishes it.
+pub fn restore(geo: &Geometry, packed: &[u8], res: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; res.len()];
     let mut rest = &mut out[..];
     for (p, at) in geo.planes.iter().zip(geo.offsets()) {
@@ -314,13 +314,14 @@ pub fn restore(geo: &Geometry, packed: &[u8], res: &[u8], before: Option<&[u8]>)
         restore_plane(p, &res[at..at + p.len()], packed[1], plane);
         rest = r;
     }
-    if leans(packed) {
-        let before = before.filter(|b| b.len() == out.len()).ok_or("a leaning tile was unpacked without the tile before it")?;
-        for (o, b) in out.iter_mut().zip(before) {
-            *o = o.wrapping_add(*b);
-        }
+    out
+}
+
+/// A leaning tile becomes its frame: what differs, put back on the frame before it.
+pub fn lean_on(tile: &mut [u8], before: &[u8]) {
+    for (o, b) in tile.iter_mut().zip(before) {
+        *o = o.wrapping_add(*b);
     }
-    Ok(out)
 }
 
 pub fn choice_name(packed: &[u8]) -> String {

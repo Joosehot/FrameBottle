@@ -1,6 +1,6 @@
 //! Frame Bottle: a movie as a grid of frames.
 //!
-//! 1. CHOP     the movie into its frames, every one (src/chop.rs)
+//! 1. CHOP     the movie into its frames, every one (src/chop.rs; no outside program)
 //! 2. GRID     every frame is a tile of one grid
 //! 3. PACK     each tile into smaller bytes, HotMotor choosing how (src/motor.rs, src/pack.rs);
 //!             the packed tiles lie in Strike's Nimbus, branded by Strike's lightning
@@ -28,6 +28,7 @@ mod motor;
 mod pack;
 mod particle;
 mod player;
+mod screen;
 mod smooth;
 
 use bottle::{Bottle, Index, Node};
@@ -63,10 +64,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let movie = chop::probe(movie_path)?;
     let geo = &movie.geo;
     let species = particle::choose()?;
-    println!("CHOP   {}: {}x{} {} at {}/{} frames a second", movie_path.display(), geo.width, geo.height, movie.source_pix_fmt, movie.fps.0, movie.fps.1);
-    if movie.source_pix_fmt != geo.pix_fmt {
-        println!("       the frames are taken as {} (ffmpeg's conversion of {})", geo.pix_fmt, movie.source_pix_fmt);
-    }
+    println!("CHOP   {}: {}x{} {} at {}/{} frames a second", movie_path.display(), geo.width, geo.height, geo.pix_fmt, movie.fps.0, movie.fps.1);
     println!(
         "NODES  each node is a copy of the particle {} ({}): {} ports hold the tile, the bond port {} -> port {} of the next (affinity {:.3}) is the link",
         species.id, species.kind, species.k, species.out, species.into, species.affinity
@@ -272,7 +270,24 @@ fn run() -> Result<(), String> {
         }
         Some("play") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
-            let s = player::play(&b, &rules, smooth, !bench)?;
+            let s = if bench {
+                player::play(&b, &rules, smooth, &mut |_| true)?
+            } else {
+                // The frames are made ready on another thread, a window ahead; this one shows each at its time.
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(rules.ahead);
+                let (bottle, rules) = (&b, &rules);
+                std::thread::scope(|scope| {
+                    let made = scope.spawn(move || player::play(bottle, rules, smooth, &mut |f| tx.send(f).is_ok()));
+                    let mut screen = screen::Screen::open(&bottle.geo, (bottle.index.fps.0 * smooth as u64, bottle.index.fps.1))?;
+                    for frame in rx.iter() {
+                        if !screen.show(&bottle.geo, &frame) {
+                            break;
+                        }
+                    }
+                    drop(rx);
+                    made.join().map_err(|_| "the player stopped".to_string())?
+                })?
+            };
             show_play("played", &s);
         }
         Some("forget") => {
@@ -326,8 +341,8 @@ fn run() -> Result<(), String> {
             let (same, nodes, frames) = verify(&b, movie)?;
             let identical = same == frames && nodes == frames;
             player::forget(&b);
-            let first = player::play(&b, &rules, smooth, false)?;
-            let again = player::play(&b, &rules, smooth, false)?;
+            let first = player::play(&b, &rules, smooth, &mut |_| true)?;
+            let again = player::play(&b, &rules, smooth, &mut |_| true)?;
             let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{}: {e}", p.display()));
             let (original, bottled) = (size(movie)?, size(&p.out)?);
             let raw = b.geo.frame_len() as u64 * nodes as u64;
