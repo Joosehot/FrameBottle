@@ -1,0 +1,501 @@
+//! BLOCKS: AV1's way of keeping less than every pixel.
+//!
+//! A frame is cut into the same 16 x 16 tiles. For each tile the packer
+//! looks for the same picture in the frame before, as the player rebuilt
+//! it, a few pixels away in any direction; if it is there, only the vector
+//! to it is kept (`moved`). If it is not, the tile is guessed as one flat
+//! value from the pixels above and to the left of it (`flat`). What the
+//! guess misses is not corrected pixel by pixel: each 8 x 8 block of it is
+//! turned into 64 waves (a cosine transform, in whole numbers so that every
+//! player gets the same), each wave's size is counted in steps (the finer
+//! the wave, the longer its step: `coarse` sets the length), and a wave
+//! smaller than a step is left out. Most waves of most blocks are. The
+//! steps that are left are written with the adaptive range coder.
+//!
+//! The frame the player rebuilds is not the movie's frame; how near it is
+//! is measured and reported (PSNR). Only 8-bit YUV 4:2:0 is cut this way.
+
+use crate::guess::{Decoder, Encoder};
+use crate::pack::Geometry;
+use rayon::prelude::*;
+
+const HALF: u16 = 1 << 11;
+const TILE: usize = 16;
+
+/// One way through the syntax for the packer and the player: the packer
+/// gives the value and it is written; the player gets the value read.
+enum Coder<'a> {
+    Write(Encoder),
+    Read(Decoder<'a>),
+}
+
+impl Coder<'_> {
+    #[inline(always)]
+    fn bit(&mut self, p: &mut u16, v: bool) -> bool {
+        match self {
+            Coder::Write(e) => {
+                e.bit(p, v);
+                v
+            }
+            Coder::Read(d) => d.bit(p),
+        }
+    }
+    /// A whole number from 1 to 65535: how many binary digits, then the digits under the first.
+    fn count(&mut self, p: &mut [u16; 32], n: u32) -> u32 {
+        let want = 32 - n.max(1).leading_zeros() as usize;
+        let mut digits = 1;
+        while digits < 16 && self.bit(&mut p[digits - 1], digits < want) {
+            digits += 1;
+        }
+        let mut value = 1u32;
+        for j in (0..digits - 1).rev() {
+            value = (value << 1) | self.bit(&mut p[16 + j], (n >> j) & 1 == 1) as u32;
+        }
+        value
+    }
+    /// A whole number with a sign.
+    fn signed(&mut self, p: &mut ([u16; 32], [u16; 2]), v: i32) -> i32 {
+        if !self.bit(&mut p.1[0], v != 0) {
+            return 0;
+        }
+        let negative = self.bit(&mut p.1[1], v < 0);
+        let n = self.count(&mut p.0, v.unsigned_abs().min(65535)) as i32;
+        if negative { -n } else { n }
+    }
+}
+
+/// What the coder has learned so far in one band.
+struct Learned {
+    /// Is the tile `moved`? By whether the tile to the left was (2: there is none).
+    moved: [u16; 3],
+    vector: [([u16; 32], [u16; 2]); 2],
+    /// Has the block any wave left? By light or colour, and by flat or moved.
+    any: [u16; 4],
+    /// Where the last wave left is (6 binary digits), by light or colour.
+    last: [[u16; 64]; 2],
+    /// Is this wave left? By light or colour, how fine the wave is, and whether the one before was left.
+    left: [u16; 2 * 6 * 2],
+    sign: [u16; 2],
+    size: [[u16; 32]; 12],
+}
+
+impl Learned {
+    fn new() -> Learned {
+        Learned { moved: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 24], sign: [HALF; 2], size: [[HALF; 32]; 12] }
+    }
+}
+
+/// The fixed tables: the order waves are written in (coarse to fine), the
+/// cosine table, and each wave's step.
+struct Tables {
+    order: [usize; 64],
+    cosine: [[i32; 8]; 8],
+    step: [i32; 64],
+}
+
+impl Tables {
+    fn new(coarse: u8, slope: u8) -> Tables {
+        // The zigzag from the flattest wave to the finest.
+        let mut order = [0usize; 64];
+        let (mut x, mut y) = (0i32, 0i32);
+        for slot in order.iter_mut() {
+            *slot = (y * 8 + x) as usize;
+            if (x + y) % 2 == 0 {
+                if x == 7 { y += 1 } else if y == 0 { x += 1 } else { x += 1; y -= 1 }
+            } else if y == 7 {
+                x += 1
+            } else if x == 0 {
+                y += 1
+            } else {
+                x -= 1;
+                y += 1
+            }
+        }
+        // cos(k pi / 16) in 4096ths, k = 0..8; row 0 is the mean (1 / sqrt 2).
+        const C: [i32; 9] = [4096, 4017, 3784, 3406, 2896, 2276, 1567, 799, 0];
+        let mut cosine = [[0i32; 8]; 8];
+        for (k, row) in cosine.iter_mut().enumerate() {
+            for (n, v) in row.iter_mut().enumerate() {
+                let t = ((2 * n + 1) * k) % 32;
+                let t = if t > 16 { 32 - t } else { t };
+                *v = if k == 0 { 2896 } else if t <= 8 { C[t] } else { -C[16 - t] };
+            }
+        }
+        // A finer wave has a longer step (the eye misses it least); `slope` says how much longer.
+        let mut step = [1i32; 64];
+        for (i, s) in step.iter_mut().enumerate() {
+            let (u, v) = (order[i] % 8, order[i] / 8);
+            *s = (coarse as i32 * (slope.max(1) as i32 + u as i32 + v as i32) / slope.max(1) as i32).max(1);
+        }
+        Tables { order, cosine, step }
+    }
+
+    /// 64 samples into 64 waves.
+    fn waves(&self, x: &[i32; 64]) -> [i32; 64] {
+        let (t, mut mid, mut out) = (&self.cosine, [0i32; 64], [0i32; 64]);
+        for r in 0..8 {
+            for k in 0..8 {
+                mid[r * 8 + k] = ((0..8).map(|n| t[k][n] * x[r * 8 + n]).sum::<i32>() + 4096) >> 13;
+            }
+        }
+        for c in 0..8 {
+            for k in 0..8 {
+                out[k * 8 + c] = ((0..8).map(|n| t[k][n] * mid[n * 8 + c]).sum::<i32>() + 4096) >> 13;
+            }
+        }
+        out
+    }
+
+    /// 64 waves back into 64 samples.
+    fn samples(&self, y: &[i32; 64]) -> [i32; 64] {
+        let (t, mut mid, mut out) = (&self.cosine, [0i32; 64], [0i32; 64]);
+        for c in 0..8 {
+            for n in 0..8 {
+                mid[n * 8 + c] = ((0..8).map(|k| t[k][n] * y[k * 8 + c]).sum::<i32>() + 4096) >> 13;
+            }
+        }
+        for r in 0..8 {
+            for n in 0..8 {
+                out[r * 8 + n] = ((0..8).map(|k| t[k][n] * mid[r * 8 + k]).sum::<i32>() + 4096) >> 13;
+            }
+        }
+        out
+    }
+}
+
+/// The steps of one block's waves, coarse to fine: written, or read into `steps`.
+fn block(c: &mut Coder, l: &mut Learned, kind: usize, moved: usize, steps: &mut [i32; 64]) {
+    let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
+    if !c.bit(&mut l.any[kind * 2 + moved], want > 0) {
+        *steps = [0; 64];
+        return;
+    }
+    let (mut node, mut end) = (1usize, 0usize);
+    for b in (0..6).rev() {
+        let bit = c.bit(&mut l.last[kind][node], (want.wrapping_sub(1) >> b) & 1 == 1);
+        node = (node * 2 + bit as usize) & 63;
+        end = end * 2 + bit as usize;
+    }
+    let end = end + 1;
+    let mut before = 1usize;
+    for i in 0..64 {
+        if i >= end {
+            steps[i] = 0;
+            continue;
+        }
+        let fine = kind * 6 + l_fine(i);
+        // The last wave left is left: that is what "last" said.
+        if i + 1 < end && !c.bit(&mut l.left[fine * 2 + before], steps[i] != 0) {
+            steps[i] = 0;
+            before = 0;
+            continue;
+        }
+        let negative = c.bit(&mut l.sign[kind], steps[i] < 0);
+        let n = c.count(&mut l.size[fine], steps[i].unsigned_abs().clamp(1, 65535)) as i32;
+        steps[i] = if negative { -n } else { n };
+        before = 1;
+    }
+}
+
+#[inline(always)]
+fn l_fine(i: usize) -> usize {
+    match i {
+        0 => 0,
+        1..=2 => 1,
+        3..=5 => 2,
+        6..=14 => 3,
+        15..=35 => 4,
+        _ => 5,
+    }
+}
+
+/// A plane: its samples, width and height.
+#[derive(Clone, Copy)]
+struct Pic<'a> {
+    data: &'a [u8],
+    w: usize,
+    h: usize,
+}
+
+impl Pic<'_> {
+    #[inline(always)]
+    fn at(&self, x: i32, y: i32) -> u8 {
+        self.data[y.clamp(0, self.h as i32 - 1) as usize * self.w + x.clamp(0, self.w as i32 - 1) as usize]
+    }
+}
+
+/// Plane `i` of a frame.
+fn pic<'a>(geo: &Geometry, at: &[usize], f: &'a [u8], i: usize) -> Pic<'a> {
+    Pic { data: &f[at[i]..at[i] + geo.planes[i].len()], w: geo.planes[i].w, h: geo.planes[i].h }
+}
+
+/// How unlike the 16 x 16 tile `s` and the frame before at (x, y) are; stops counting past `limit`.
+fn unlike(s: &[u8; 256], before: &Pic, x: i32, y: i32, limit: u32) -> u32 {
+    let mut sum = 0u32;
+    let inside = x >= 0 && x as usize + 16 <= before.w;
+    for j in 0..16 {
+        let row = (y + j).clamp(0, before.h as i32 - 1) as usize * before.w;
+        if inside {
+            let b = &before.data[row + x as usize..][..16];
+            sum += s[j as usize * 16..][..16].iter().zip(b).map(|(p, q)| p.abs_diff(*q) as u32).sum::<u32>();
+        } else {
+            for i in 0..16 {
+                sum += s[(j * 16 + i) as usize].abs_diff(before.at(x + i, y + j)) as u32;
+            }
+        }
+        if sum > limit {
+            return sum;
+        }
+    }
+    sum
+}
+
+/// Where in the frame before the tile is: the vector, and how unlike it still is.
+fn find(s: &[u8; 256], before: &Pic, x0: i32, y0: i32, range: i32, left: (i32, i32)) -> (i32, i32, u32) {
+    let mut best = (0, 0, unlike(s, before, x0, y0, u32::MAX));
+    // A tile that is where it was (within one step of grey a pixel) is not looked for.
+    if best.2 <= 256 {
+        return best;
+    }
+    let look = |dx: i32, dy: i32, best: &mut (i32, i32, u32)| {
+        let u = unlike(s, before, x0 + dx, y0 + dy, best.2);
+        if u < best.2 {
+            *best = (dx, dy, u);
+        }
+    };
+    look(left.0, left.1, &mut best);
+    for dy in -range..=range {
+        for dx in -range..=range {
+            if (dx, dy) != (0, 0) {
+                look(dx, dy, &mut best);
+            }
+        }
+    }
+    best
+}
+
+/// One band of tile rows `ty0..ty1`: packed (with `src`) or rebuilt (without).
+/// `bufs` are the band's rows of the three planes as the player has them.
+#[allow(clippy::too_many_arguments)]
+fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (range, dead): (i32, i32), ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], c: &mut Coder) {
+    let at = geo.offsets();
+    let mut l = Learned::new();
+    let across = geo.width.div_ceil(TILE);
+    for ty in ty0..ty1 {
+        let mut left: Option<(i32, i32)> = None;
+        let mut any_left = false;
+        for tx in 0..across {
+            let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
+            // The packer decides: is the tile somewhere in the frame before, or flat?
+            let mut want: Option<(i32, i32)> = None;
+            if let (Some(src), Some(before)) = (src, before) {
+                let (sp, bp) = (pic(geo, &at, src, 0), pic(geo, &at, before, 0));
+                let mut s = [0u8; 256];
+                for j in 0..16 {
+                    for i in 0..16 {
+                        s[j * 16 + i] = sp.at(x0 + i as i32, y0 + j as i32);
+                    }
+                }
+                let (dx, dy, moved) = find(&s, &bp, x0, y0, range, left.unwrap_or((0, 0)));
+                let mean = (s.iter().map(|v| *v as u32).sum::<u32>() + 128) / 256;
+                let flat: u32 = s.iter().map(|v| (*v as u32).abs_diff(mean)).sum();
+                if moved <= flat {
+                    want = Some((dx, dy));
+                }
+            }
+            let mut vector: Option<(i32, i32)> = None;
+            if before.is_some() {
+                let ctx = if !any_left { 2 } else { left.is_some() as usize };
+                if c.bit(&mut l.moved[ctx], want.is_some()) {
+                    let (from, w) = (left.unwrap_or((0, 0)), want.unwrap_or((0, 0)));
+                    vector = Some((from.0 + c.signed(&mut l.vector[0], w.0 - from.0), from.1 + c.signed(&mut l.vector[1], w.1 - from.1)));
+                }
+            }
+            for i in 0..3 {
+                let p = &geo.planes[i];
+                let size = TILE >> p.sx;
+                let (px0, py0) = (tx * size, ty * size);
+                if px0 >= p.w || py0 >= p.h {
+                    continue;
+                }
+                let band_top = ty0 * (TILE >> p.sy);
+                let buf = &mut *bufs[i];
+                // The flat guess: the mean of the row above the tile and the column to its left.
+                let flat = {
+                    let (mut sum, mut n) = (0u32, 0u32);
+                    if py0 > band_top {
+                        for x in px0..(px0 + size).min(p.w) {
+                            sum += buf[(py0 - 1 - band_top) * p.w + x] as u32;
+                            n += 1;
+                        }
+                    }
+                    if px0 > 0 {
+                        for y in py0..(py0 + size).min(p.h) {
+                            sum += buf[(y - band_top) * p.w + px0 - 1] as u32;
+                            n += 1;
+                        }
+                    }
+                    if n == 0 { 128 } else { ((sum + n / 2) / n) as i32 }
+                };
+                let from = vector.map(|(dx, dy)| (pic(geo, &at, before.unwrap(), i), dx >> p.sx, dy >> p.sy));
+                for b in 0..(size / 8) * (size / 8) {
+                    let (bx, by) = (px0 + (b % (size / 8)) * 8, py0 + (b / (size / 8)) * 8);
+                    if bx >= p.w || by >= p.h {
+                        continue;
+                    }
+                    let mut guess = [flat; 64];
+                    if let Some((bp, dx, dy)) = &from {
+                        for j in 0..8 {
+                            for k in 0..8 {
+                                guess[j * 8 + k] = bp.at((bx + k) as i32 + dx, (by + j) as i32 + dy) as i32;
+                            }
+                        }
+                    }
+                    let mut steps = [0i32; 64];
+                    if let Some(src) = src {
+                        let sp = pic(geo, &at, src, i);
+                        let mut miss = [0i32; 64];
+                        for j in 0..8 {
+                            for k in 0..8 {
+                                miss[j * 8 + k] = sp.at((bx + k) as i32, (by + j) as i32) as i32 - guess[j * 8 + k];
+                            }
+                        }
+                        let w = t.waves(&miss);
+                        for (n, s) in steps.iter_mut().enumerate() {
+                            // A wave is counted in whole steps, rounded down but for `dead`: one
+                            // that is not nearly a step long is grain more often than picture.
+                            let (v, step) = (w[t.order[n]], t.step[n]);
+                            *s = v.signum() * ((v.abs() + step / dead) / step);
+                        }
+                    }
+                    block(c, &mut l, (i > 0) as usize, vector.is_some() as usize, &mut steps);
+                    let mut back = [0i32; 64];
+                    if steps.iter().any(|s| *s != 0) {
+                        let mut w = [0i32; 64];
+                        for (n, s) in steps.iter().enumerate() {
+                            w[t.order[n]] = s * t.step[n];
+                        }
+                        back = t.samples(&w);
+                    }
+                    for j in 0..8.min(p.h - by) {
+                        for k in 0..8.min(p.w - bx) {
+                            buf[(by + j - band_top) * p.w + bx + k] = (guess[j * 8 + k] + back[j * 8 + k]).clamp(0, 255) as u8;
+                        }
+                    }
+                }
+            }
+            left = vector;
+            any_left = true;
+        }
+    }
+}
+
+const FROM_BEFORE: u8 = 2;
+const HEAD: usize = 5;
+
+pub fn fits(geo: &Geometry) -> bool {
+    geo.planes.len() == 3 && geo.planes.iter().all(|p| p.bps == 1 && p.ch == 1) && geo.planes[1].sx == 1 && geo.planes[1].sy == 1
+}
+
+pub fn from_before(payload: &[u8]) -> bool {
+    payload.first().is_some_and(|f| f & FROM_BEFORE != 0)
+}
+
+/// The luma rows of a band: a whole number of rows of tiles.
+fn band_rows(geo: &Geometry, bands: usize) -> usize {
+    geo.height.div_ceil(bands.max(1)).max(1).div_ceil(TILE) * TILE
+}
+
+/// The frame as three planes cut into bands, each with its first row of tiles.
+fn cut<'a>(geo: &Geometry, out: &'a mut [u8], rows: usize) -> Vec<(usize, [&'a mut [u8]; 3])> {
+    let (py, pu) = (&geo.planes[0], &geo.planes[1]);
+    let (y, rest) = out.split_at_mut(py.len());
+    let (u, v) = rest.split_at_mut(pu.len());
+    y.chunks_mut(rows * py.w).zip(u.chunks_mut(rows / 2 * pu.w)).zip(v.chunks_mut(rows / 2 * pu.w)).enumerate().map(|(k, ((y, u), v))| (k * rows / TILE, [y, u, v])).collect()
+}
+
+/// The packer's numbers from rules.toml: how far a tile is looked for, how much longer a
+/// finer wave's step is (kept in the bottle: the player needs it), and the dead zone.
+#[derive(Clone, Debug)]
+pub struct How {
+    pub range: usize,
+    pub slope: u8,
+    pub dead: u8,
+}
+
+/// Packs a frame in AV1's way. `before` is the frame before as the player
+/// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
+/// length, the bands) and the frame as the player will rebuild it.
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, coarse: u8, how: &How) -> (Vec<u8>, Vec<u8>) {
+    let t = Tables::new(coarse, how.slope);
+    let rows = band_rows(geo, bands);
+    let tile_rows = geo.height.div_ceil(TILE);
+    let mut rebuilt = vec![0u8; geo.frame_len()];
+    let done: Vec<Vec<u8>> = cut(geo, &mut rebuilt, rows)
+        .into_par_iter()
+        .map(|(ty0, bufs)| {
+            let mut c = Coder::Write(Encoder::new());
+            band(geo, &t, Some(frame), before, (how.range as i32, how.dead.max(1) as i32), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &mut c);
+            match c {
+                Coder::Write(e) => e.finish(),
+                Coder::Read(_) => unreachable!(),
+            }
+        })
+        .collect();
+    let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 }];
+    out.extend((bands as u16).to_le_bytes());
+    out.push(coarse);
+    out.push(how.slope);
+    for d in &done {
+        out.extend((d.len() as u32).to_le_bytes());
+    }
+    for d in &done {
+        out.extend(d);
+    }
+    (out, rebuilt)
+}
+
+/// The frame as the player rebuilds it.
+pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    if payload.len() < HEAD || !fits(geo) {
+        return Err("not a frame of blocks".into());
+    }
+    let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
+    let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
+    let rows = band_rows(geo, bands);
+    let tile_rows = geo.height.div_ceil(TILE);
+    let mut out = vec![0u8; geo.frame_len()];
+    let work = cut(geo, &mut out, rows);
+    let mut data = HEAD + 4 * work.len();
+    let mut coded = Vec::new();
+    for i in 0..work.len() {
+        let len = payload.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a frame of blocks is cut")?;
+        coded.push(payload.get(data..data + len).ok_or("a frame of blocks is cut")?);
+        data += len;
+    }
+    work.into_par_iter().zip(coded).for_each(|((ty0, bufs), bytes)| {
+        let mut c = Coder::Read(Decoder::new(bytes));
+        band(geo, &t, None, before, (0, 1), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &mut c);
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_player_rebuilds_what_the_packer_did() {
+        let geo = Geometry::of("yuv420p", 70, 50).unwrap();
+        let mut s = 7u32;
+        let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
+        let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
+        let how = How { range: 7, slope: 32, dead: 12 };
+        for coarse in [1u8, 6, 20] {
+            let (first, a2) = pack(&geo, &a, None, 3, coarse, &how);
+            assert_eq!(unpack(&geo, &first, None).unwrap(), a2);
+            let (second, b2) = pack(&geo, &b, Some(&a2), 3, coarse, &how);
+            assert_eq!(unpack(&geo, &second, Some(&a2)).unwrap(), b2);
+        }
+    }
+}

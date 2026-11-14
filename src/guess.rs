@@ -49,7 +49,7 @@ const BITS: u32 = 12;
 const HALF: u16 = 1 << (BITS - 1);
 const MOVE: u32 = 5;
 
-struct Encoder {
+pub(crate) struct Encoder {
     low: u64,
     range: u32,
     cache: u8,
@@ -58,7 +58,7 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new() -> Encoder {
+    pub(crate) fn new() -> Encoder {
         Encoder { low: 0, range: u32::MAX, cache: 0, pending: 1, out: Vec::new() }
     }
     fn shift(&mut self) {
@@ -79,7 +79,7 @@ impl Encoder {
         self.low = (self.low & 0x00FF_FFFF) << 8;
     }
     #[inline(always)]
-    fn bit(&mut self, p: &mut u16, bit: bool) {
+    pub(crate) fn bit(&mut self, p: &mut u16, bit: bool) {
         let bound = (self.range >> BITS) * *p as u32;
         if !bit {
             self.range = bound;
@@ -94,7 +94,7 @@ impl Encoder {
             self.shift();
         }
     }
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         for _ in 0..5 {
             self.shift();
         }
@@ -102,7 +102,7 @@ impl Encoder {
     }
 }
 
-struct Decoder<'a> {
+pub(crate) struct Decoder<'a> {
     data: &'a [u8],
     at: usize,
     code: u32,
@@ -110,7 +110,7 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
-    fn new(data: &'a [u8]) -> Decoder<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Decoder<'a> {
         let mut d = Decoder { data, at: 1, code: 0, range: u32::MAX };
         for _ in 0..4 {
             d.code = (d.code << 8) | d.next() as u32;
@@ -124,7 +124,7 @@ impl<'a> Decoder<'a> {
         b
     }
     #[inline(always)]
-    fn bit(&mut self, p: &mut u16) -> bool {
+    pub(crate) fn bit(&mut self, p: &mut u16) -> bool {
         let bound = (self.range >> BITS) * *p as u32;
         let bit = if self.code < bound {
             self.range = bound;

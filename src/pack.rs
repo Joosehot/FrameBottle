@@ -307,7 +307,12 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<
 
 /// Does this packed tile lean on the tile before it?
 pub fn leans(packed: &[u8]) -> bool {
-    packed.first() == Some(&1) || (guessed(packed) && crate::guess::from_before(&packed[3..]))
+    packed.first() == Some(&1) || (guessed(packed) && crate::guess::from_before(&packed[3..])) || (blocks(packed) && crate::block::from_before(&packed[3..]))
+}
+
+/// Is this packed tile a frame of blocks (AV1's way, not exact)?
+pub fn blocks(packed: &[u8]) -> bool {
+    packed.len() > 3 && packed[0] == 3
 }
 
 /// Is this packed tile a guess with its corrections?
@@ -361,6 +366,9 @@ pub fn lean_on(tile: &mut [u8], before: &[u8]) {
 pub fn choice_name(packed: &[u8]) -> String {
     if guessed(packed) {
         return if perfect(packed) { "guess, perfect".into() } else { "guess".into() };
+    }
+    if blocks(packed) {
+        return "blocks".into();
     }
     format!("{}+{}+{}", FROMS[packed[0] as usize], PREDICTS[packed[1] as usize], CODERS[packed[2] as usize])
 }

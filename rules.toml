@@ -60,6 +60,15 @@ band_rows = 16
 [guess]
 bands = 16
 
+# Blocks (--coarse): how far a tile is looked for in the frame before, in pixels each way.
+[block]
+range = 7
+# How much longer a finer wave's step is: the finest is (slope + 14) / slope times the flattest.
+slope = 32
+# A wave is counted in whole steps, rounded down but for a step's 1/dead (what is not
+# nearly a step long is grain more often than picture).
+dead = 12
+
 # The smoother: vectors between node A and node B.
 [smoother]
 # A vector is found per block of this many pixels.

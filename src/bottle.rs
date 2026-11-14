@@ -68,6 +68,9 @@ pub struct Index {
     /// How far a sample may be from the movie's (0: every frame is exact).
     #[serde(default)]
     pub tolerance: u8,
+    /// Blocks, AV1's way: the length of a wave's step (0: not used; then frames are not exact).
+    #[serde(default)]
+    pub coarse: u8,
     pub nodes: Vec<Node>,
     pub shares: Vec<Share>,
 }
@@ -273,7 +276,7 @@ impl Bottle {
             .into_par_iter()
             .map(|i| {
                 let packed = self.packed(i)?;
-                if crate::pack::guessed(&packed) {
+                if crate::pack::guessed(&packed) || crate::pack::blocks(&packed) {
                     return Ok((Vec::new(), Some(packed)));
                 }
                 let res = crate::pack::uncode(&self.geo, &packed)?;
@@ -289,7 +292,11 @@ impl Bottle {
         for i in 0..out.len() {
             if let Some(packed) = &waiting[i] {
                 // The same guesses as when it was packed, and the corrections added.
-                out[i] = crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?;
+                out[i] = if crate::pack::blocks(packed) {
+                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref())?
+                } else {
+                    crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
+                };
             } else if self.index.nodes[from + i].leans {
                 let prev = chain.before.as_deref().filter(|p| p.len() == out[i].len());
                 crate::pack::lean_on(&mut out[i], prev.ok_or("a leaning tile was unpacked without the tile before it")?);

@@ -38,6 +38,9 @@ pub struct Rules {
     /// How wrong a guess may be and still be left uncorrected (0: every frame comes back
     /// exactly). Not in rules.toml: the command's --tolerance sets it.
     pub tolerance: u8,
+    /// Blocks, AV1's way: how long a wave's step is (0: not used). The command's --coarse sets it.
+    pub coarse: u8,
+    pub blocks: crate::block::How,
 }
 
 pub const DEFAULT_RULES: &str = include_str!("../rules.toml");
@@ -117,6 +120,12 @@ impl Rules {
             behind: num(player, "behind", "player")? as usize,
             bands: (num(table("guess")?, "bands", "guess")? as usize).clamp(1, 4096),
             tolerance: 0,
+            coarse: 0,
+            blocks: crate::block::How {
+                range: num(table("block")?, "range", "block")? as usize,
+                slope: (num(table("block")?, "slope", "block")? as usize).clamp(1, 255) as u8,
+                dead: (num(table("block")?, "dead", "block")? as usize).clamp(1, 255) as u8,
+            },
         })
     }
 }

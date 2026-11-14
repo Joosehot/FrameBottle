@@ -25,6 +25,7 @@ mod lightning;
 #[path = "../../Strike/src/fstrike.rs"]
 mod fstrike;
 
+mod block;
 mod bottle;
 mod chop;
 mod golden;
@@ -46,6 +47,7 @@ use std::time::Instant;
 const USAGE: &str = "\
 fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance N]
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
+             [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
@@ -69,6 +71,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let profile = *rules.profiles.get(profile_name).ok_or(format!("--for {profile_name}: rules.toml has no such profile"))?;
     let movie = chop::probe(movie_path)?;
     let geo = &movie.geo;
+    if rules.coarse > 0 && !block::fits(geo) {
+        return Err(format!("--coarse cuts 8-bit YUV 4:2:0 only; this movie's frames are {}", geo.pix_fmt));
+    }
     let species = particle::choose()?;
     println!("CHOP   {}: {}x{} {} at {}/{} frames a second", movie_path.display(), geo.width, geo.height, geo.pix_fmt, movie.fps.0, movie.fps.1);
     println!(
@@ -111,14 +116,19 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
-        if rules.tolerance > 0 {
-            // Guesses wrong by no more than the tolerance are left as they are. Each frame is
-            // guessed from the frames as the player will have them, so one frame at a time
-            // (its bands side by side).
+        if rules.tolerance > 0 || rules.coarse > 0 {
+            // Not exact: with a tolerance, guesses wrong by no more than it are left as they
+            // are; with --coarse, a frame is kept as blocks, vectors and waves. Either way each
+            // frame is made from the frames as the player will have them, so one frame at a
+            // time (its bands side by side).
             for frame in &frames {
                 let before = carry.as_ref().map(|(f, _)| f.as_slice());
-                let (payload, rebuilt) = guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance);
-                let mut packed = vec![2, 0, 0];
+                let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
+                    (3, block::pack(geo, frame, before, rules.bands, rules.coarse, &rules.blocks))
+                } else {
+                    (2, guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance))
+                };
+                let mut packed = vec![kind, 0, 0];
                 packed.extend(payload);
                 let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
                 let ports = hashes
@@ -213,6 +223,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         rows: rows as u32,
         species,
         tolerance: rules.tolerance,
+        coarse: rules.coarse,
         nodes,
         shares: Vec::new(),
     };
@@ -266,7 +277,8 @@ fn verify(b: &Bottle, movie_path: &Path, far: &mut (u8, f64, u64), mended: &mut 
 fn nearness(far: &(u8, f64, u64), tolerance: u8) -> String {
     let mean = far.1 / far.2.max(1) as f64;
     let psnr = if mean == 0.0 { "no difference at all".to_string() } else { format!("PSNR {:.2} dB", 10.0 * (255.0f64 * 255.0 / mean).log10()) };
-    format!("tolerance {tolerance}: the sample furthest from the movie's is {} away; {psnr}", far.0)
+    let asked = if tolerance > 0 { format!("tolerance {tolerance}: ") } else { String::new() };
+    format!("{asked}the sample furthest from the movie's is {} away; {psnr}", far.0)
 }
 
 fn exact(question: &str, places: usize) -> String {
@@ -313,6 +325,7 @@ fn run() -> Result<(), String> {
             "--for" => profile = it.next().ok_or("--for needs size or play")?.clone(),
             "--explain" => explain = true,
             "--bench" => bench = true,
+            "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,
             "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,
             _ => paths.push(PathBuf::from(a)),
@@ -329,7 +342,10 @@ fn run() -> Result<(), String> {
             let (mut far, mut mended) = ((0, 0.0, 0), (0, 0.0, 0));
             let (same, nodes, frames) = verify(&b, path(1, "the movie")?, &mut far, &mut mended)?;
             println!("{same} of {frames} frames unpack identically ({nodes} nodes): {}", if same == frames && nodes == frames { "identical" } else { "NOT identical" });
-            let close = b.index.tolerance > 0 && nodes == frames && far.0 <= b.index.tolerance;
+            let close = nodes == frames && (b.index.coarse > 0 || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
+            if b.index.coarse > 0 {
+                println!("blocks, coarse {}: {}", b.index.coarse, nearness(&far, 0));
+            }
             if b.index.tolerance > 0 {
                 println!("as rebuilt  {}", nearness(&far, b.index.tolerance));
                 println!("as shown    {} (mended by the player, no byte more)", nearness(&mended, b.index.tolerance));
@@ -411,7 +427,7 @@ fn run() -> Result<(), String> {
             let (mut far, mut mended) = ((0, 0.0, 0), (0, 0.0, 0));
             let (same, nodes, frames) = verify(&b, movie, &mut far, &mut mended)?;
             let identical = same == frames && nodes == frames;
-            let close = b.index.tolerance > 0 && nodes == frames && far.0 <= b.index.tolerance;
+            let close = nodes == frames && (b.index.coarse > 0 || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
             player::forget(&b);
             let first = player::play(&b, &rules, smooth, &mut |_| true)?;
             let again = player::play(&b, &rules, smooth, &mut |_| true)?;
@@ -439,7 +455,10 @@ fn run() -> Result<(), String> {
             println!("  frames unpacked     {raw} bytes; unpacked / bottle = {}", exact(&format!("What is {raw} / {bottled}?"), 4));
             println!("  original FPS        {}", exact(&format!("What is {} / {}?", i.fps.0, i.fps.1), 3));
             println!("  playback FPS        {} ({} guessed between each two nodes)", exact(&format!("What is {} * {smooth} / {}?", i.fps.0, i.fps.1), 3), smooth - 1);
-            println!("  frames identical    {} ({same} of {frames})", if identical { "yes" } else if close { "no: a tolerance was asked for" } else { "NO" });
+            println!("  frames identical    {} ({same} of {frames})", if identical { "yes" } else if close { "no: they were not asked to be" } else { "NO" });
+            if b.index.coarse > 0 {
+                println!("                      blocks, coarse {}: {}", b.index.coarse, nearness(&far, 0));
+            }
             if b.index.tolerance > 0 {
                 println!("                      as rebuilt  {}", nearness(&far, b.index.tolerance));
                 println!("                      as shown    {} (mended by the player, no byte more)", nearness(&mended, b.index.tolerance));

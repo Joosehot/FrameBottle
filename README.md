@@ -297,3 +297,57 @@ can end up further than before (up to 2 N), because the mean is a guess.
 The Hammer's stack was tried as a second witness and made it worse (it is
 made of rebuilt frames, whose misses lean the same way). A step along the
 film takes about 15 ms with mending.
+
+## Blocks: against AV1 (`--coarse N`, added 2026-11-14)
+
+[src/block.rs](src/block.rs) keeps a frame the way AV1 and H.264 do, in
+its simplest form. A frame is cut into the same 16 x 16 tiles. For each
+tile the packer looks for the same picture in the frame before, as the
+player rebuilt it, up to 7 pixels away; if it is there, only the vector is
+kept. If not, the tile is guessed as one flat value from the pixels above
+and to its left. What the guess misses is turned, 8 x 8 samples at a time,
+into 64 waves (a cosine transform in whole numbers, so that every player
+gets the same); each wave is counted in steps of length N (a little longer
+for finer waves) and a wave shorter than a step is left out. The steps
+left are written with the adaptive range coder. Every number is in
+[rules.toml](rules.toml) under `[block]`. Only 8-bit YUV 4:2:0 is cut this
+way. Frames are not exact; `verify` reports how near they are.
+
+Measured on `guitar_10s.mp4` (1920 x 1080, 302 frames). PSNR is over all
+samples against the MP4's own frames, for every row; the other encodes
+were made with ffmpeg outside Frame Bottle (x264 preset medium, SVT-AV1
+preset 8):
+
+| | bytes | PSNR |
+|---|---|---|
+| Frame Bottle, exact | 128 886 416 | exact |
+| the MP4 itself | 15 281 386 | the reference |
+| Frame Bottle, tolerance 4 | 29 556 629 | 42.74 dB |
+| Frame Bottle, blocks, coarse 6 | 15 890 099 | 45.67 dB |
+| Frame Bottle, blocks, coarse 10 | 8 863 029 | 42.88 dB |
+| **Frame Bottle, blocks, coarse 15** | **5 864 947** | **41.03 dB** |
+| H.264, crf 22 | 4 621 893 | 40.66 dB |
+| Frame Bottle, blocks, coarse 22 | 4 065 939 | 39.01 dB |
+| AV1, crf 24 | 3 394 188 | 40.70 dB |
+| Frame Bottle, blocks, coarse 32 | 2 980 600 | 37.24 dB |
+| H.264, crf 26 | 2 334 877 | 40.05 dB |
+| AV1, crf 30 | 2 159 426 | 40.56 dB |
+| AV1, crf 36 | 1 450 315 | 40.37 dB |
+| H.264, crf 30 | 1 313 941 | 39.15 dB |
+
+- Against the tolerance: at about 42.8 dB blocks take 8.9 MB where a
+  tolerance takes 29.6 MB.
+- Against H.264 at about 40.7 dB: a bottle is about 5.5 MB, H.264 4.6 MB.
+- Against AV1 at about 40.6 dB: a bottle is about 5.5 MB, AV1 2.2 MB
+  (2.5 times smaller) and still 40.4 dB at 1.5 MB.
+- Both of them lose almost nothing when they are squeezed (40.7 to
+  39.1 dB from 4.6 to 1.3 MB); a bottle loses fast (41.0 to 37.2 dB from
+  5.9 to 3.0 MB). Below about 40 dB a bottle is far behind.
+- Packing takes 8 seconds for the 10 seconds; a step along the film about
+  5 ms.
+
+What AV1 has that this does not, most telling first: vectors to a part of
+a pixel, guesses of a tile from its neighbours in many directions (here
+one flat value), a filter that smooths block edges inside the loop, tiles
+of many sizes, frames guessed from a later frame as well, and a packer that
+weighs bytes against loss for every choice.
