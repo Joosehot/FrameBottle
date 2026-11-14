@@ -414,3 +414,21 @@ A stack that settles more slowly (1/16, 1/32 of the way a frame) was tried
 too: 0.03 dB nearer for 0.4 % more bytes. Where the picture stands still, a
 tile is already a copy of the tile before it, miss and all, so every frame
 in the stack carries the same miss and stacking them evens nothing out.
+
+### How long a pixel has stood still
+
+Measured on `guitar_10s.mp4`: 58.3 % of the samples of a frame are exactly
+what they were in the frame before (85.0 % within 1, 94.1 % within 4), but
+they lie scattered: only 2.7 % of the 16 x 16 tiles are the same all over.
+Which samples stay is what costs: with nothing known, 0.98 bits a sample.
+A sample's own line through the frames helps (one that has stood still
+for 8 frames stays again 89 times in 100, one that just changed 37 times
+in 100): 0.855 bits. Its line and its two neighbours together: 0.578 bits.
+
+The Hammer's stack now keeps, for each sample, how many frames in a row it
+has stood still, and the coder is told whether that is 8 or more.
+Result: 0.03 % smaller on the 3 s clip (40 371 157 to 40 359 977 bytes).
+The coder already knew most of it from the neighbours and from which
+guesser was right. Telling it in 6 steps made the bottle 0.2 % bigger
+(too many cases to learn each from one band), and letting the judge hear
+`still` louder the longer a sample has stood still made it 1.9 % bigger.
