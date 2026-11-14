@@ -42,7 +42,7 @@ use rayon::prelude::*;
 
 /// The guesser as it is now. A change to how it guesses or codes changes this, so that
 /// the lightning does not strike a pack made by an older guesser.
-pub const VERSION: &str = "guess 22";
+pub const VERSION: &str = "guess 23";
 
 const TOP: u32 = 1 << 24;
 const BITS: u32 = 12;
@@ -540,11 +540,14 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>,
         let row = &real[y * stride..(y + 1) * stride];
         for (i, x) in row.iter().enumerate() {
             let (g, place) = band.guess(i);
-            let (fix, value) = within(tol, g, *x);
+            // With `line`, a sample within the tolerance of what it was in the frame before
+            // stays exactly that (with no tolerance: only when it is the same).
+            let stays = line && band.before.is_some_and(|b| b[i].abs_diff(*x) <= tol);
+            let (fix, value) = if stays && tol > 0 { (0, band.before.unwrap()[i]) } else { within(tol, g, *x) };
             fixes.push(fix);
             places.push(place);
             if line {
-                lines.push((band.line(i) as u8, band.before.is_some_and(|b| b[i] == *x)));
+                lines.push((band.line(i) as u8, stays));
             }
             // The guesses that follow are made from what the player will have, not from the real sample.
             band.learn(i, value, fix);
@@ -637,16 +640,23 @@ fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Optio
         let row = &mut out[(y - y0) * stride..(y - y0 + 1) * stride];
         for (i, x) in row.iter_mut().enumerate() {
             let (g, place) = band.guess(i);
+            let mut stays = false;
             let fix = if line {
                 let (ctx, d) = (band.line(i), d.as_mut().unwrap());
-                // It stayed: the correction is what brings the guess to the sample of the frame before.
-                if d.bit(&mut l.stayed[ctx]) { read(d, &mut l, &place) as i8 } else { band.before.unwrap()[i].wrapping_sub(g) as i8 }
+                if d.bit(&mut l.stayed[ctx]) {
+                    read(d, &mut l, &place) as i8
+                } else {
+                    // It stayed: the sample is the frame before's (exactly: the correction is
+                    // what brings the guess there; with a tolerance it is taken as it is).
+                    stays = true;
+                    if tol > 0 { 0 } else { band.before.unwrap()[i].wrapping_sub(g) as i8 }
+                }
             } else if flags[i / tw] {
                 0
             } else {
                 read(d.as_mut().unwrap(), &mut l, &place) as i8
             };
-            *x = apply(tol, g, fix);
+            *x = if stays && tol > 0 { band.before.unwrap()[i] } else { apply(tol, g, fix) };
             band.learn(i, *x, fix);
         }
         band.next_row();
@@ -773,7 +783,7 @@ pub fn pack_within(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: 
         })
         .collect();
     let at = geo.offsets();
-    let line = tol == 0 && before.is_some() && BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
+    let line = before.is_some() && BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
     let done: Vec<(Vec<u8>, usize, usize, Vec<u8>)> = jobs
         .par_iter()
         .map(|(i, y0, y1)| {

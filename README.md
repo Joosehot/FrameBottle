@@ -450,3 +450,10 @@ corrections on top, and they are the costly ones. Without `--line` there
 is no map: one question, "was the mixed guess right?", covers both, and
 the mixed guess is right for many samples that did change. `--line` is
 left in as a switch, off unless asked for.
+
+`--line` with a tolerance (a sample within the tolerance of what it was in
+the frame before stays exactly that) was measured too, on `guitar_10s.mp4`:
+bigger and further from the movie at every tolerance (tolerance 4:
+49 143 713 bytes at 40.40 dB, against 29 607 960 at 42.74 dB without it).
+A sample that stays is held at an old value until it is a whole tolerance
+off, so the frames the next guesses are made from are worse.
