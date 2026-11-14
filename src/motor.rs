@@ -68,7 +68,7 @@ impl Rules {
             profiles.insert(name.clone(), axes(p, &format!("profile.{name}"))?);
         }
         // The decisions Frame Bottle knows how to turn into a packed tile, in order.
-        let known = ["predict", "coder"];
+        let known = ["from", "predict", "coder"];
         let mut rules = Vec::new();
         for name in known {
             let at = format!("rule.{name}");
@@ -77,7 +77,11 @@ impl Rules {
             for v in r.get("variants").and_then(|v| v.as_array()).ok_or(format!("rules.toml: {at} has no variants"))? {
                 let v = v.as_table().ok_or(format!("rules.toml: a variant of {at} is not a table"))?;
                 let value = v.get("value").and_then(|x| x.as_str()).ok_or(format!("rules.toml: a variant of {at} has no value"))?;
-                let known_values: &[&str] = if name == "predict" { &crate::pack::PREDICTS } else { &crate::pack::CODERS };
+                let known_values: &[&str] = match name {
+                    "from" => &crate::pack::FROMS,
+                    "predict" => &crate::pack::PREDICTS,
+                    _ => &crate::pack::CODERS,
+                };
                 if !known_values.contains(&value) {
                     return Err(format!("rules.toml: {at} has the unknown value {value} (known: {})", known_values.join(", ")));
                 }

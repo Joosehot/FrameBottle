@@ -16,7 +16,16 @@ size = 0.4
 
 # One rule per decision. Each variant says how it scores on the axes (0 to 1).
 
-# What a pixel is told apart from, inside its own tile only (never another frame).
+# What a tile is told apart from: nothing (it stands on its own), or the tile before it
+# on the grid (only what differs from that tile is packed; it unpacks after that tile).
+[rule.from]
+weight = 0.2
+variants = [
+  { value = "own",  pack = 1.0, play = 1.0, size = 0.5 },
+  { value = "tile", pack = 0.9, play = 0.6, size = 0.5 },
+]
+
+# What a pixel is guessed from, inside the tile.
 [rule.predict]
 weight = 0.3
 variants = [

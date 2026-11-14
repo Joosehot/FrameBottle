@@ -53,8 +53,8 @@ struct Packed {
     seconds: f64,
 }
 
-fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str) -> String {
-    bottle::sha(format!("fbottle pack 1\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}", geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
+fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str, before: &str) -> String {
+    bottle::sha(format!("fbottle pack 2\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}\n{before}", geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
 }
 
 fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bool, rules: &Rules) -> Result<Packed, String> {
@@ -77,6 +77,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let mut share_ids: HashMap<String, u32> = HashMap::new();
     let mut share_hashes: Vec<String> = Vec::new();
     let (mut struck, mut explained) = (0usize, !explain);
+    // The tile before the next one on the grid: the last frame of the batch before.
+    let mut carry: Option<(Vec<u8>, String)> = None;
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -91,33 +93,45 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         if !explained {
             explained = true;
             println!("PACK   HotMotor on the first tile (--for {profile_name}), best first:");
-            for c in pack::choose(geo, &frames[0], rules, &profile) {
+            let second = frames.len() > 1;
+            if second {
+                println!("       (the second tile is shown: the first has no tile before it)");
+            }
+            let shown = if second { pack::choose(geo, &frames[1], Some(&frames[0]), rules, &profile) } else { pack::choose(geo, &frames[0], None, rules, &profile) };
+            for c in shown {
                 let name: Vec<&str> = c.choice.iter().map(|(_, v)| v.as_str()).collect();
                 println!("         {:14} {:.3} = {:.3} by the rules {:+.3} judged   {}", name.join("+"), c.score(), c.local, c.judged, c.notes.join("; "));
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
-        let done: Vec<(String, Vec<String>, bool)> = frames
+        let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
+        let done: Vec<(String, Vec<String>, bool, bool)> = frames
             .par_iter()
-            .map(|frame| -> Result<_, String> {
-                let raw = bottle::sha(frame);
+            .enumerate()
+            .map(|(i, frame)| -> Result<_, String> {
+                let raw = raws[i].clone();
+                let before: Option<(&[u8], &str)> = if i > 0 { Some((&frames[i - 1], &raws[i - 1])) } else { carry.as_ref().map(|(f, r)| (f.as_slice(), r.as_str())) };
                 // Only the rules that decide a pack are in its brand (not the smoother's or the player's).
                 let pack_rules = motor::DEFAULT_RULES.split("[smoother]").next().unwrap();
-                let key = pack_key(pack_rules, profile_name, geo, &species, &raw);
+                let key = pack_key(pack_rules, profile_name, geo, &species, &raw, before.map_or("", |b| b.1));
                 if let Some(text) = bottle::branded("pack", &key) {
-                    let hashes: Vec<String> = text.lines().map(str::to_string).collect();
+                    let mut lines = text.lines();
+                    let leans = lines.next() == Some("tile");
+                    let hashes: Vec<String> = lines.map(str::to_string).collect();
                     if hashes.len() == species.k && hashes.iter().all(|h| bottle::in_nimbus(h)) {
-                        return Ok((raw, hashes, true));
+                        return Ok((raw, hashes, true, leans));
                     }
                 }
-                let best = pack::choose(geo, frame, rules, &profile).remove(0);
-                let packed = pack::pack(geo, frame, &best.choice);
+                let best = pack::choose(geo, frame, before.map(|b| b.0), rules, &profile).remove(0);
+                let packed = pack::pack(geo, frame, before.map(|b| b.0), &best.choice);
+                let leans = pack::leans(&packed);
                 let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
-                bottle::brand("pack", &key, &hashes.join("\n"));
-                Ok((raw, hashes, false))
+                bottle::brand("pack", &key, &format!("{}\n{}", if leans { "tile" } else { "own" }, hashes.join("\n")));
+                Ok((raw, hashes, false, leans))
             })
             .collect::<Result<_, String>>()?;
-        for (raw, hashes, was_struck) in done {
+        carry = frames.pop().zip(raws.last().cloned());
+        for (raw, hashes, was_struck, leans) in done {
             struck += was_struck as usize;
             let ports = hashes
                 .into_iter()
@@ -128,7 +142,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                     })
                 })
                 .collect();
-            nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw, ports, next: None });
+            nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw, ports, next: None, leans });
         }
     }
     let n = nodes.len();
@@ -143,10 +157,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         node.next = (i + 1 < n).then_some(i as u32 + 1);
     }
     println!("GRID   {n} frames as tiles of a {cols} x {rows} grid ({} x {} pixels)", cols * geo.width, rows * geo.height);
-    println!("PACK   {} tiles packed, {} struck from Nimbus (already branded)", n - struck, struck);
+    println!("PACK   {} tiles packed, {} struck from Nimbus (already branded); {} lean on the tile before them", n - struck, struck, nodes.iter().filter(|n| n.leans).count());
     let out = out.unwrap_or_else(|| movie_path.with_extension("fbott"));
     let index = Index {
-        format: "frame-bottle/1".into(),
+        format: "frame-bottle/2".into(),
         source: movie_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
         pix_fmt: geo.pix_fmt.clone(),
         source_pix_fmt: movie.source_pix_fmt.clone(),
@@ -170,6 +184,7 @@ fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String
     let mut reader = chop::frames(movie_path, &b.geo)?;
     let batch = rayon::current_num_threads() * 2;
     let (mut same, mut seen) = (0usize, 0usize);
+    let mut carry: Option<Vec<u8>> = None;
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -182,7 +197,12 @@ fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String
             break;
         }
         let nodes = b.index.nodes.len();
-        same += frames.par_iter().enumerate().filter(|(i, f)| seen + i < nodes && b.frame(seen + i).is_ok_and(|u| u == **f)).count();
+        let to = (seen + frames.len()).min(nodes);
+        if seen < to {
+            let unpacked = b.frames(seen, to, carry.as_deref())?;
+            same += unpacked.iter().zip(&frames).filter(|(u, f)| u == f).count();
+            carry = unpacked.into_iter().last();
+        }
         seen += frames.len();
     }
     Ok((same, b.index.nodes.len(), seen))
@@ -271,14 +291,15 @@ fn run() -> Result<(), String> {
                 let e: f64 = x[..luma].iter().zip(&y[..luma]).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / luma as f64;
                 if e == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / e).log10() }
             };
-            let triples: Vec<usize> = (0..b.index.nodes.len().saturating_sub(2)).step_by(2).take(24).collect();
+            let all = b.frames(0, b.index.nodes.len().min(50), None)?;
+            let triples: Vec<usize> = (0..all.len().saturating_sub(2)).step_by(2).take(24).collect();
             let scores: Vec<(f64, f64)> = triples
                 .par_iter()
                 .map(|i| -> Result<(f64, f64), String> {
-                    let (a, real, c) = (b.frame(*i)?, b.frame(i + 1)?, b.frame(i + 2)?);
-                    let v = smooth::vectors(&b.geo, &a, &c, &rules);
+                    let (a, real, c) = (&all[*i], &all[i + 1], &all[i + 2]);
+                    let v = smooth::vectors(&b.geo, a, c, &rules);
                     let still = smooth::Vectors { block: v.block, bw: v.bw, bh: v.bh, d: vec![(0, 0); v.d.len()] };
-                    Ok((psnr(&smooth::between(&b.geo, &a, &c, &v, 1, 2), &real), psnr(&smooth::between(&b.geo, &a, &c, &still, 1, 2), &real)))
+                    Ok((psnr(&smooth::between(&b.geo, a, c, &v, 1, 2), real), psnr(&smooth::between(&b.geo, a, c, &still, 1, 2), real)))
                 })
                 .collect::<Result<_, String>>()?;
             let n = scores.len().max(1) as f64;

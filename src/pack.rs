@@ -1,6 +1,8 @@
 //! PACK: one tile of the grid (one frame) into smaller bytes, and back,
-//! exactly. A tile is told apart only from its own pixels: no other frame
-//! is read, so every node unpacks on its own.
+//! exactly. A tile stands on its own, or leans on the tile before it on
+//! the grid: then only what differs from that tile is packed, and it
+//! unpacks after that tile. Either way every frame is kept and comes back
+//! byte for byte.
 
 use crate::motor::{self, Choice, Rules};
 use std::collections::HashMap;
@@ -80,6 +82,7 @@ impl Geometry {
     }
 }
 
+pub const FROMS: [&str; 2] = ["own", "tile"];
 pub const PREDICTS: [&str; 5] = ["none", "left", "up", "paeth", "med"];
 pub const CODERS: [&str; 3] = ["deflate", "zstd", "xz"];
 
@@ -233,14 +236,27 @@ fn entropy(data: &[u8]) -> f64 {
         .sum()
 }
 
+/// What differs between a tile and the tile before it, byte by byte.
+fn differ(frame: &[u8], before: &[u8]) -> Vec<u8> {
+    frame.iter().zip(before).map(|(a, b)| a.wrapping_sub(*b)).collect()
+}
+
 /// HotMotor chooses how this tile is packed. The size judge reads the tile:
-/// with only the guess chosen it scores how few bits the sample would need,
+/// until the coder is chosen it scores how few bits the sample would need,
 /// with the coder chosen too it packs the sample and scores what it saved.
-pub fn choose(geo: &Geometry, frame: &[u8], rules: &Rules, profile: &[f64; 3]) -> Vec<motor::Candidate> {
-    let mut samples: HashMap<u8, Vec<u8>> = HashMap::new();
+/// `before` is the tile before this one on the grid, if there is one.
+pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules, profile: &[f64; 3]) -> Vec<motor::Candidate> {
+    let leaning: Option<Vec<u8>> = before.map(|b| differ(frame, b));
+    let mut samples: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
     let mut judge = |choice: &Choice| {
-        let predict = id(&PREDICTS, motor::get(choice, "predict").unwrap());
-        let s = samples.entry(predict).or_insert_with(|| sample(geo, frame, predict, rules));
+        let from = id(&FROMS, motor::get(choice, "from").unwrap());
+        let data: &[u8] = match (from, &leaning) {
+            (0, _) => frame,
+            (_, Some(d)) => d,
+            (_, None) => return (-1e9, vec!["there is no tile before this one".to_string()]),
+        };
+        let predict = motor::get(choice, "predict").map_or(0, |p| id(&PREDICTS, p));
+        let s = samples.entry((from, predict)).or_insert_with(|| sample(geo, data, predict, rules));
         let (share, how) = match motor::get(choice, "coder") {
             None => (entropy(s) / 8.0, "by how often each byte occurs"),
             Some(c) => (encode(id(&CODERS, c), s).len() as f64 / s.len().max(1) as f64, "packed"),
@@ -251,8 +267,16 @@ pub fn choose(geo: &Geometry, frame: &[u8], rules: &Rules, profile: &[f64; 3]) -
     motor::search(rules, profile, &mut judge)
 }
 
-/// The tile packed by this choice: the guess, the coder, the coder's bytes.
-pub fn pack(geo: &Geometry, frame: &[u8], choice: &Choice) -> Vec<u8> {
+/// The tile packed by this choice: what it leans on, the guess, the coder, the coder's bytes.
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, choice: &Choice) -> Vec<u8> {
+    let from = id(&FROMS, motor::get(choice, "from").unwrap());
+    let leaning;
+    let frame: &[u8] = if from == 1 {
+        leaning = differ(frame, before.expect("a leaning tile has a tile before it"));
+        &leaning
+    } else {
+        frame
+    };
     let predict = id(&PREDICTS, motor::get(choice, "predict").unwrap());
     let coder = id(&CODERS, motor::get(choice, "coder").unwrap());
     let mut res = Vec::with_capacity(frame.len());
@@ -262,26 +286,43 @@ pub fn pack(geo: &Geometry, frame: &[u8], choice: &Choice) -> Vec<u8> {
             residual_row(p, data, y, predict, &mut res);
         }
     }
-    let mut out = vec![predict, coder];
+    let mut out = vec![from, predict, coder];
     out.extend(encode(coder, &res));
     out
 }
 
-pub fn unpack(geo: &Geometry, packed: &[u8]) -> Result<Vec<u8>, String> {
-    if packed.len() < 2 || packed[0] as usize >= PREDICTS.len() {
+/// Does this packed tile lean on the tile before it?
+pub fn leans(packed: &[u8]) -> bool {
+    packed.first() == Some(&1)
+}
+
+/// The first half of unpacking, which needs no other tile: the coder's bytes back.
+pub fn uncode(geo: &Geometry, packed: &[u8]) -> Result<Vec<u8>, String> {
+    if packed.len() < 3 || packed[0] as usize >= FROMS.len() || packed[1] as usize >= PREDICTS.len() {
         return Err("not a packed tile".into());
     }
-    let res = decode(packed[1], &packed[2..], geo.frame_len())?;
+    decode(packed[2], &packed[3..], geo.frame_len())
+}
+
+/// The second half: the frame itself, from `res` (what `uncode` gave) and,
+/// for a leaning tile, the frame of the tile before it.
+pub fn restore(geo: &Geometry, packed: &[u8], res: &[u8], before: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; res.len()];
     let mut rest = &mut out[..];
     for (p, at) in geo.planes.iter().zip(geo.offsets()) {
         let (plane, r) = rest.split_at_mut(p.len());
-        restore_plane(p, &res[at..at + p.len()], packed[0], plane);
+        restore_plane(p, &res[at..at + p.len()], packed[1], plane);
         rest = r;
+    }
+    if leans(packed) {
+        let before = before.filter(|b| b.len() == out.len()).ok_or("a leaning tile was unpacked without the tile before it")?;
+        for (o, b) in out.iter_mut().zip(before) {
+            *o = o.wrapping_add(*b);
+        }
     }
     Ok(out)
 }
 
 pub fn choice_name(packed: &[u8]) -> String {
-    format!("{}+{}", PREDICTS[packed[0] as usize], CODERS[packed[1] as usize])
+    format!("{}+{}+{}", FROMS[packed[0] as usize], PREDICTS[packed[1] as usize], CODERS[packed[2] as usize])
 }

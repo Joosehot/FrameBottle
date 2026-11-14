@@ -41,6 +41,8 @@ pub struct Node {
     pub ports: Vec<u32>,
     /// The node this one's bond leads to: the next frame.
     pub next: Option<u32>,
+    /// The tile leans on the tile before it on the grid, and unpacks after it.
+    pub leans: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,7 +179,7 @@ impl Bottle {
         // The chain of bonds must pass every node once, in frame order.
         for (i, n) in index.nodes.iter().enumerate() {
             let want = (i + 1 < index.nodes.len()).then_some(i as u32 + 1);
-            if n.next != want || n.ports.len() != index.species.k {
+            if n.next != want || n.ports.len() != index.species.k || (i == 0 && n.leans) {
                 return Err(format!("{}: node {i} is not bonded as a film is", path.display()));
             }
         }
@@ -207,13 +209,39 @@ impl Bottle {
         Ok(out)
     }
 
-    /// UNPACK: the node's frame, exactly as it was chopped (checked by its hash).
-    pub fn frame(&self, node: usize) -> Result<Vec<u8>, String> {
-        let frame = crate::pack::unpack(&self.geo, &self.packed(node)?)?;
-        if sha(&frame) != self.index.nodes[node].raw {
-            return Err(format!("node {node} did not unpack to its frame"));
+    /// UNPACK: the frames of the nodes `from..to`, exactly as they were chopped (each
+    /// checked by its hash). `before` is the frame of node `from - 1` if the caller has
+    /// it; without it the run starts further back, at a tile that stands on its own.
+    /// The coder's work is done for all nodes at once; a leaning tile then takes the
+    /// frame before it, in order.
+    pub fn frames(&self, from: usize, to: usize, before: Option<&[u8]>) -> Result<Vec<Vec<u8>>, String> {
+        use rayon::prelude::*;
+        let mut start = from;
+        if before.is_none() {
+            while self.index.nodes[start].leans {
+                start = start.checked_sub(1).ok_or("the first tile leans on nothing")?;
+            }
         }
-        Ok(frame)
+        let coded: Vec<(Vec<u8>, Vec<u8>)> = (start..to)
+            .into_par_iter()
+            .map(|i| {
+                let packed = self.packed(i)?;
+                let res = crate::pack::uncode(&self.geo, &packed)?;
+                Ok((packed, res))
+            })
+            .collect::<Result<_, String>>()?;
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(coded.len());
+        for (packed, res) in &coded {
+            let prev = out.last().map(|f| f.as_slice()).or(before);
+            out.push(crate::pack::restore(&self.geo, packed, res, prev)?);
+        }
+        out.par_iter().enumerate().try_for_each(|(i, f)| {
+            if sha(f) != self.index.nodes[start + i].raw {
+                return Err(format!("node {} did not unpack to its frame", start + i));
+            }
+            Ok(())
+        })?;
+        Ok(out.split_off(from - start))
     }
 
     /// How many nodes chose each way of packing.
@@ -221,7 +249,7 @@ impl Bottle {
         let mut n: HashMap<String, usize> = HashMap::new();
         for node in &self.index.nodes {
             let first = self.share(node.ports[0])?;
-            if first.len() >= 2 {
+            if first.len() >= 3 {
                 *n.entry(crate::pack::choice_name(&first)).or_default() += 1;
             }
         }

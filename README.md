@@ -29,10 +29,12 @@ the report's numbers, Nuome's `nuome` (`~/Nuome/target/release`, or `NUOME`).
    column and row. The grid is never laid out as one picture in memory:
    two seconds of 4K are a 30 720 x 17 280 grid.
 3. **PACK** ([src/pack.rs](src/pack.rs), [src/motor.rs](src/motor.rs)).
-   Each tile is packed on its own, from its own pixels only: no tile is
-   told apart from another frame, so every node unpacks alone. **HotMotor**
-   chooses how, per tile: one rule for what a pixel is guessed from (none,
-   left, up, paeth, med), one for the coder (deflate, zstd, xz), a beam
+   A tile stands on its own, or leans on the tile before it on the grid:
+   then only what differs from that tile is packed, and it unpacks after
+   it. Every frame is still kept and comes back byte for byte. **HotMotor**
+   chooses how, per tile: one rule for what the tile leans on (own, tile),
+   one for what a pixel is guessed from (none, left, up, paeth, med), one
+   for the coder (deflate, zstd, xz), a beam
    over them, and a size judge that packs a sample of the tile itself with
    each choice. Every number is in [rules.toml](rules.toml). `--explain`
    shows the finalists for the first tile.
@@ -106,6 +108,13 @@ The smoother, checked by hiding every second frame and guessing it from its
 neighbours (`fbottle smoother`): 38.89 dB with vectors against 36.46 dB for
 a plain mix on the 4K clip (nearer in 24 of 24), 34.11 dB against 33.90 dB
 on the guitar clip. Its numbers were tuned on these two clips.
+
+**Leaning on the tile before** (added after the table above was measured)
+made almost no difference on filmed or rendered video: the 1080p bottle
+went from 50 721 120 to 50 571 840 bytes (5 of 91 tiles chose to lean), the
+4K one did not change (no tile chose to), the GIF went from 26 355 to
+25 714. The grain of a picture is new in every frame, and what is kept
+exactly has to keep the grain.
 
 ## What it is not, yet
 

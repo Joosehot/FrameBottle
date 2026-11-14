@@ -129,22 +129,21 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, show: bool) -> Result<Stat
             leave(&held.remove(&k).unwrap(), &mut stats);
         }
         // The nodes ahead: struck from the window, or unpacked from their particles into it.
-        let frames: Vec<(Vec<u8>, bool)> = (start..end)
-            .into_par_iter()
-            .map(|i| {
-                let raw = &b.index.nodes[i].raw;
-                if let Some(f) = bottle::from_nimbus(raw).filter(|f| f.len() == len) {
-                    return Ok((f, true));
-                }
-                let t = Instant::now();
-                let f = b.frame(i)?;
-                add(0, t);
-                let t = Instant::now();
-                bottle::to_nimbus(&f, raw)?;
-                add(1, t);
-                Ok((f, false))
-            })
-            .collect::<Result<_, String>>()?;
+        let found: Vec<Option<Vec<u8>>> = (start..end).into_par_iter().map(|i| bottle::from_nimbus(&b.index.nodes[i].raw).filter(|f| f.len() == len)).collect();
+        // Only the unbroken run from the start is struck: what follows a gap is unpacked in order.
+        let have = found.iter().take_while(|f| f.is_some()).count();
+        let mut frames: Vec<(Vec<u8>, bool)> = found.into_iter().take(have).flatten().map(|f| (f, true)).collect();
+        if start + have < end {
+            // A leaning tile takes the frame before it: the one just struck, or the last one played.
+            let t = Instant::now();
+            let before = frames.last().map(|f| f.0.as_slice()).or(prev.as_deref());
+            let unpacked = b.frames(start + have, end, before)?;
+            add(0, t);
+            let t = Instant::now();
+            unpacked.par_iter().enumerate().try_for_each(|(i, f)| bottle::to_nimbus(f, &b.index.nodes[start + have + i].raw))?;
+            add(1, t);
+            frames.extend(unpacked.into_iter().map(|f| (f, false)));
+        }
         for (i, (_, struck)) in frames.iter().enumerate() {
             if *struck {
                 stats.struck += 1;
