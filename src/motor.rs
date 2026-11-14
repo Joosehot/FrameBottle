@@ -35,6 +35,9 @@ pub struct Rules {
     pub ahead: usize,
     pub behind: usize,
     pub bands: usize,
+    /// How wrong a guess may be and still be left uncorrected (0: every frame comes back
+    /// exactly). Not in rules.toml: the command's --tolerance sets it.
+    pub tolerance: u8,
 }
 
 pub const DEFAULT_RULES: &str = include_str!("../rules.toml");
@@ -113,6 +116,7 @@ impl Rules {
             ahead: (num(player, "ahead", "player")? as usize).max(1),
             behind: num(player, "behind", "player")? as usize,
             bands: (num(table("guess")?, "bands", "guess")? as usize).clamp(1, 4096),
+            tolerance: 0,
         })
     }
 }

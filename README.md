@@ -242,3 +242,34 @@ Measured on `guitar_10s.mp4`: 128 886 416 bytes, 1.6465 bits per pixel
 the way was the best of a half, a quarter and an eighth. A step along the
 film takes about 12.2 ms now (about 10 before): five guessers are asked
 for every sample.
+
+### A tolerance: the wrong guesses that are left as they are
+
+`--tolerance N`: a guess that is wrong by N or less is not corrected, and a
+larger miss is corrected to within N. No sample of any frame is further
+than N from the movie's (checked by `verify`). The guesses that follow are
+made from the samples as the player will have them, so nothing drifts;
+each frame is packed after the one before it. With `--tolerance 0` (the
+default) nothing changes: every frame comes back exactly. Leaving every
+wrong guess uncorrected is not offered: a bottle would then hold nothing of
+any frame after the first.
+
+Measured on `guitar_10s.mp4` (PSNR over all samples, against the MP4's own
+frames):
+
+| | bytes | furthest sample | PSNR |
+|---|---|---|---|
+| tolerance 0 (exact) | 128 886 416 | 0 | exact |
+| H.264 lossless | 102 477 615 | 0 | exact |
+| tolerance 1 | 69 837 647 | 1 | 50.88 dB |
+| tolerance 2 | 46 700 754 | 2 | 47.20 dB |
+| tolerance 4 | 29 556 629 | 4 | 42.74 dB |
+| tolerance 8 | 17 990 116 | 8 | 37.28 dB |
+| the MP4 itself (H.264) | 15 281 386 | | (it is the reference) |
+| tolerance 12 | 13 023 181 | 12 | 33.93 dB |
+| AV1 (SVT-AV1, crf 30) | 2 159 426 | | 40.56 dB |
+
+With a tolerance of 1 a bottle is smaller than every lossless encode. At
+the quality of the AV1 file (about 40 dB) a bottle is about ten times its
+size: a tolerance spends its bits sample by sample, where AV1 describes a
+block of 64 or more samples with a few numbers.

@@ -44,10 +44,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const USAGE: &str = "\
-fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain]
+fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance N]
+                                         N: a guess wrong by N or less is left uncorrected (0: exact)
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
-fbottle test <movie> [--smooth N] [--for size|play]   pack, verify, play twice without a window, report
+fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
 fbottle info <bottle>
 fbottle forget <bottle>                  empty the bottle's window in Nimbus
 fbottle smoother <bottle>                how near a guessed frame comes to a real one";
@@ -110,6 +111,32 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
+        if rules.tolerance > 0 {
+            // Guesses wrong by no more than the tolerance are left as they are. Each frame is
+            // guessed from the frames as the player will have them, so one frame at a time
+            // (its bands side by side).
+            for frame in &frames {
+                let before = carry.as_ref().map(|(f, _)| f.as_slice());
+                let (payload, rebuilt) = guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance);
+                let mut packed = vec![2, 0, 0];
+                packed.extend(payload);
+                let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
+                let ports = hashes
+                    .into_iter()
+                    .map(|h| {
+                        *share_ids.entry(h.clone()).or_insert_with(|| {
+                            share_hashes.push(h);
+                            share_hashes.len() as u32 - 1
+                        })
+                    })
+                    .collect();
+                let raw = bottle::sha(&rebuilt);
+                nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw: raw.clone(), ports, next: None, leans: pack::leans(&packed) });
+                hammer.strike(&rebuilt);
+                carry = Some((rebuilt, raw));
+            }
+            continue;
+        }
         let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
         // The stack as it stands before each frame of the batch, top frame first.
         let mut stacks: Vec<Option<Vec<u8>>> = Vec::new();
@@ -185,6 +212,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         cols: cols as u32,
         rows: rows as u32,
         species,
+        tolerance: rules.tolerance,
         nodes,
         shares: Vec::new(),
     };
@@ -195,7 +223,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
 
 /// Every node unpacked from the bottle itself and compared, byte by byte,
 /// with the movie's frames chopped again. Returns (frames alike, nodes, frames in the movie).
-fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String> {
+/// `far` gathers how far the unpacked samples are from the movie's: the worst, the sum of squares, the samples.
+fn verify(b: &Bottle, movie_path: &Path, far: &mut (u8, f64, u64)) -> Result<(usize, usize, usize), String> {
     let mut reader = chop::frames(movie_path, &b.geo)?;
     let batch = rayon::current_num_threads() * 2;
     let (mut same, mut seen) = (0usize, 0usize);
@@ -216,10 +245,21 @@ fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String
         if seen < to {
             let unpacked = b.frames(seen, to, &mut chain)?;
             same += unpacked.iter().zip(&frames).filter(|(u, f)| u == f).count();
+            for (u, f) in unpacked.iter().zip(&frames) {
+                let (worst, squares) = u.par_iter().zip(f.par_iter()).map(|(a, b)| (a.abs_diff(*b), (a.abs_diff(*b) as u64).pow(2))).reduce(|| (0, 0), |x, y| (x.0.max(y.0), x.1 + y.1));
+                *far = (far.0.max(worst), far.1 + squares as f64, far.2 + u.len() as u64);
+            }
         }
         seen += frames.len();
     }
     Ok((same, b.index.nodes.len(), seen))
+}
+
+/// How near the unpacked frames are to the movie's, in words.
+fn nearness(far: &(u8, f64, u64), tolerance: u8) -> String {
+    let mean = far.1 / far.2.max(1) as f64;
+    let psnr = if mean == 0.0 { "no difference at all".to_string() } else { format!("PSNR {:.2} dB", 10.0 * (255.0f64 * 255.0 / mean).log10()) };
+    format!("tolerance {tolerance}: the sample furthest from the movie's is {} away; {psnr}", far.0)
 }
 
 fn exact(question: &str, places: usize) -> String {
@@ -256,7 +296,7 @@ fn show_play(label: &str, s: &player::Stats) {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let rules = Rules::parse(motor::DEFAULT_RULES)?;
+    let mut rules = Rules::parse(motor::DEFAULT_RULES)?;
     let mut paths: Vec<PathBuf> = Vec::new();
     let (mut out, mut profile, mut explain, mut smooth, mut bench) = (None, "size".to_string(), false, 2usize, false);
     let mut it = args.iter().skip(1);
@@ -266,6 +306,7 @@ fn run() -> Result<(), String> {
             "--for" => profile = it.next().ok_or("--for needs size or play")?.clone(),
             "--explain" => explain = true,
             "--bench" => bench = true,
+            "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,
             "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,
             _ => paths.push(PathBuf::from(a)),
         }
@@ -278,9 +319,14 @@ fn run() -> Result<(), String> {
         }
         Some("verify") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
-            let (same, nodes, frames) = verify(&b, path(1, "the movie")?)?;
+            let mut far = (0, 0.0, 0);
+            let (same, nodes, frames) = verify(&b, path(1, "the movie")?, &mut far)?;
             println!("{same} of {frames} frames unpack identically ({nodes} nodes): {}", if same == frames && nodes == frames { "identical" } else { "NOT identical" });
-            if same != frames || nodes != frames {
+            let close = b.index.tolerance > 0 && nodes == frames && far.0 <= b.index.tolerance;
+            if b.index.tolerance > 0 {
+                println!("{}", nearness(&far, b.index.tolerance));
+            }
+            if (same != frames || nodes != frames) && !close {
                 return Err("the bottle does not hold the movie's frames".into());
             }
         }
@@ -354,8 +400,10 @@ fn run() -> Result<(), String> {
             let movie = path(0, "the movie")?;
             let p = pack(movie, out, &profile, explain, &rules)?;
             let b = Bottle::open(&p.out)?;
-            let (same, nodes, frames) = verify(&b, movie)?;
+            let mut far = (0, 0.0, 0);
+            let (same, nodes, frames) = verify(&b, movie, &mut far)?;
             let identical = same == frames && nodes == frames;
+            let close = b.index.tolerance > 0 && nodes == frames && far.0 <= b.index.tolerance;
             player::forget(&b);
             let first = player::play(&b, &rules, smooth, &mut |_| true)?;
             let again = player::play(&b, &rules, smooth, &mut |_| true)?;
@@ -383,14 +431,17 @@ fn run() -> Result<(), String> {
             println!("  frames unpacked     {raw} bytes; unpacked / bottle = {}", exact(&format!("What is {raw} / {bottled}?"), 4));
             println!("  original FPS        {}", exact(&format!("What is {} / {}?", i.fps.0, i.fps.1), 3));
             println!("  playback FPS        {} ({} guessed between each two nodes)", exact(&format!("What is {} * {smooth} / {}?", i.fps.0, i.fps.1), 3), smooth - 1);
-            println!("  frames identical    {} ({same} of {frames})", if identical { "yes" } else { "NO" });
+            println!("  frames identical    {} ({same} of {frames})", if identical { "yes" } else if close { "no: a tolerance was asked for" } else { "NO" });
+            if b.index.tolerance > 0 {
+                println!("                      {}", nearness(&far, b.index.tolerance));
+            }
             println!("  packing             {:.1} s, {} tiles struck from Nimbus", p.seconds, p.struck);
             for (name, n) in b.choices()? {
                 println!("                      {n} tiles packed as {name}");
             }
             show_play("  first play", &first);
             show_play("  play again", &again);
-            if !identical {
+            if !identical && !close {
                 return Err("the bottle does not hold the movie's frames".into());
             }
         }

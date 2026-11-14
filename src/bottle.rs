@@ -65,6 +65,9 @@ pub struct Index {
     pub cols: u32,
     pub rows: u32,
     pub species: Species,
+    /// How far a sample may be from the movie's (0: every frame is exact).
+    #[serde(default)]
+    pub tolerance: u8,
     pub nodes: Vec<Node>,
     pub shares: Vec<Share>,
 }
