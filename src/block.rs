@@ -104,6 +104,8 @@ struct Learned {
     /// Each by whether the tile to the left was.
     split: [u16; 2],
     between: [u16; 2],
+    /// Is a tile that is neither from the frame after (for a frame between two)?
+    after: u16,
     vector: [([u16; 32], [u16; 2]); 2],
     /// Has the block any wave left? By light or colour, and by flat or moved.
     any: [u16; 4],
@@ -119,7 +121,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -644,6 +646,8 @@ enum Kind {
     /// Between the frame before and the frame after: the mean of the frame before one
     /// vector back and the frame after the same vector on.
     Between((i32, i32)),
+    /// The frame after, by one vector (for a frame between two).
+    After((i32, i32)),
 }
 
 /// The frames a tile may be guessed from, as the player has them.
@@ -697,6 +701,14 @@ fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, 
                     // Which quarter of the tile the sample is in.
                     let q = if i == 0 { ((by - py0) / 8) * 2 + (bx - px0) / 8 } else { (j / 4) * 2 + k / 4 };
                     guess[j * 8 + k] = sample(&bp, bx + k, by + j, v[q].0, v[q].1);
+                }
+            }
+        }
+        Kind::After(v) => {
+            let ap = pic(geo, at, f.after.unwrap(), i);
+            for j in 0..8 {
+                for k in 0..8 {
+                    guess[j * 8 + k] = sample(&ap, bx + k, by + j, v.0, v.1);
                 }
             }
         }
@@ -860,8 +872,11 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                             ways.push((Kind::Moved(vs, true), bits));
                         }
                         if let Some(after) = f.after {
-                            let d = find_between(&s, &bp, &pic(geo, &at, after, 0), x0, y0);
+                            let ap = pic(geo, &at, after, 0);
+                            let d = find_between(&s, &bp, &ap, x0, y0);
                             ways.push((Kind::Between(d), 3 + vector_bits(d)));
+                            let (ax, ay, _) = find(&s, 16, &ap, x0, y0, (how.range as i32, how.still), (-dx, -dy));
+                            ways.push((Kind::After((ax, ay)), 4 + vector_bits((ax, ay))));
                         }
                         if f.stack.is_some() {
                             ways.push((Kind::Stack, 3));
@@ -898,6 +913,9 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_))) {
                     let wd = if let Kind::Between(d) = want { d } else { (0, 0) };
                     kind = Kind::Between((c.signed(&mut l.vector[0], wd.0), c.signed(&mut l.vector[1], wd.1)));
+                } else if f.after.is_some() && c.bit(&mut l.after, matches!(want, Kind::After(_))) {
+                    let wv = if let Kind::After(v) = want { v } else { (0, 0) };
+                    kind = Kind::After((c.signed(&mut l.vector[0], wv.0), c.signed(&mut l.vector[1], wv.1)));
                 } else if f.stack.is_some() && c.bit(&mut l.stack[left_stack as usize], want == Kind::Stack) {
                     kind = Kind::Stack;
                 }
@@ -1018,7 +1036,12 @@ fn slots(books: Option<&mut Vec<Book>>, bands: usize, four: bool) -> Vec<Option<
         None => (0..bands).map(|_| None).collect(),
     }
 }
-const HEAD: usize = 5;
+const HEAD: usize = 7;
+
+/// For a frame between two: how many frames back and how many frames on the two lie.
+pub fn refs(payload: &[u8]) -> (usize, usize) {
+    (payload.get(5).copied().unwrap_or(0) as usize, payload.get(6).copied().unwrap_or(0) as usize)
+}
 
 pub fn fits(geo: &Geometry) -> bool {
     geo.planes.len() == 3 && geo.planes.iter().all(|p| p.bps == 1 && p.ch == 1) && geo.planes[1].sx == 1 && geo.planes[1].sy == 1
@@ -1056,13 +1079,16 @@ pub struct How {
     pub weigh: f64,
     /// How much longer the steps of a frame between two are.
     pub between: f64,
+    /// With --between: how many frames a group is. The last of a group is guessed from
+    /// the last of the group before; the others lie between two, the middle one first.
+    pub group: usize,
 }
 
 /// Packs a frame in AV1's way. `before` is the frame before as the player
 /// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
 /// length, the bands) and the frame as the player will rebuild it.
 #[allow(clippy::too_many_arguments)]
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>) -> (Vec<u8>, Vec<u8>) {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>, refs: (u8, u8)) -> (Vec<u8>, Vec<u8>) {
     let after = after.filter(|_| before.is_some());
     let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()) };
     let plain = PLAIN_BITS.load(Ordering::Relaxed);
@@ -1096,6 +1122,8 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
+    out.push(refs.0);
+    out.push(refs.1);
     for d in &done {
         out.extend((d.len() as u32).to_le_bytes());
     }
@@ -1113,7 +1141,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
     let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
     let after = if between(payload) { Some(after.filter(|a| a.len() == geo.frame_len()).ok_or("a frame between two was rebuilt without the frame after it")?) } else { None };
     let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()) };
-    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0 };
+    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1 };
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
@@ -1146,16 +1174,17 @@ mod tests {
         let mut s = 7u32;
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
-        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0 };
+        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2 };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
-            let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer));
+            let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer), (0, 0));
             assert_eq!(unpack(&geo, &first, None, None, None, &mut player).unwrap(), a2);
-            let (second, b2) = pack(&geo, &b, Some(&a2), None, Some(&a2), 3, coarse, &how, with.then_some(&mut packer));
+            let (second, b2) = pack(&geo, &b, Some(&a2), None, Some(&a2), 3, coarse, &how, with.then_some(&mut packer), (0, 0));
             assert_eq!(unpack(&geo, &second, Some(&a2), None, Some(&a2), &mut player).unwrap(), b2);
             // A frame between the two: it is guessed from both.
             let m: Vec<u8> = a.iter().zip(&b).map(|(x, y)| ((*x as u16 + *y as u16) / 2) as u8).collect();
-            let (third, m2) = pack(&geo, &m, Some(&a2), Some(&b2), Some(&b2), 3, coarse, &how, with.then_some(&mut packer));
+            let (third, m2) = pack(&geo, &m, Some(&a2), Some(&b2), Some(&b2), 3, coarse, &how, with.then_some(&mut packer), (1, 1));
+            assert_eq!(refs(&third), (1, 1));
             assert!(between(&third));
             assert_eq!(unpack(&geo, &third, Some(&a2), Some(&b2), Some(&b2), &mut player).unwrap(), m2);
         }

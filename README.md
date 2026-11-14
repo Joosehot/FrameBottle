@@ -646,3 +646,35 @@ banding; noise laid on before packing would make the frames harder to pack).
   falls from 45.94 to 44.17 dB and VMAF from 94.58 to 94.36, as they must
   when grain that is not the movie's own is laid on. Whether it looks
   better is for the eye, not for these two numbers.
+
+### Groups of frames (2026-11-15, later)
+
+Where the bytes were, coarse 8 with one frame between two: the first frame
+277 kB, each frame guessed from the one before 27.9 kB, each frame between
+two 8.8 kB. So frames are now packed in groups of four (`group` in
+rules.toml): the last of a group is guessed from the last of the group
+before it, the middle one from those two, the rest between their two
+nearest. A tile of a frame between two can come from the frame before,
+from the frame after (AV1's choice among its frames), or from both mixed.
+A frame others are guessed from has steps the square root of `between`
+longer, a frame nothing is guessed from `between` (2.1) times longer. The
+player rebuilds the frames in the packer's order, each when it is first
+needed, and keeps the last few at hand.
+
+| `guitar_10s.mp4`, `--between` | bytes | PSNR | VMAF |
+|---|---|---|---|
+| groups of 2, a tile from before or from both (as it was) | 5 882 135 | 45.94 dB | 94.58 |
+| groups of 2, a tile also from the frame after | 5 680 574 | 46.09 dB | |
+| groups of 4, steps 1.7 times longer | 5 269 614 | 45.94 dB | |
+| groups of 8 | 5 277 455 | 45.74 dB | |
+| **groups of 4, steps 2.1 times longer, coarse 8, with the book** | **4 852 084** | **45.71 dB** | **94.33** |
+| the same, coarse 7 | 5 600 295 | 46.28 dB | 94.97 |
+| AV1, crf 30 | 2 159 426 | 45.76 dB | 94.59 |
+| H.264, crf 22 | 4 621 893 | 46.33 dB | 94.90 |
+
+Groups of eight were worse than groups of four (the frames in the middle
+lie too far from their two), and before a tile could come from the frame
+after alone, groups of four were no better than groups of two. At VMAF 94.6
+a bottle is now about 5.15 MB against AV1's 2.16 MB (2.4 times); H.264 is
+about 16 % smaller than a bottle at VMAF 94.9. A step along the film:
+about 10 ms. The book of block patterns saves only 0.3 % now.

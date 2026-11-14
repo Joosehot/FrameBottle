@@ -146,6 +146,7 @@ impl Rules {
                 still: num(table("block")?, "still", "block")? as u32,
                 weigh: num(table("block")?, "weigh", "block")?,
                 between: num(table("block")?, "between", "block")?,
+                group: (num(table("block")?, "group", "block")? as usize).clamp(1, 32),
             },
         })
     }

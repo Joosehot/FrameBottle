@@ -95,6 +95,42 @@ fn keep(mut packed: Vec<u8>, rebuilt: &[u8], dictionary: Option<&mut dict::Dicti
     Ok(())
 }
 
+/// A group of frames packed as blocks. The last frame of the group is guessed from the
+/// last frame kept before it (`carry`); then the middle one from those two, and so on
+/// inward, each between the two nearest frames already packed. Returns each frame's
+/// bytes and the frame as the player will rebuild it, in the frames' own order.
+fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &mut Option<Vec<u8>>, hammer: &mut guess::Hammer, books: &mut Vec<block::Book>, sizes: &mut [usize; 3]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let m = frames.len();
+    let mut done: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None; m];
+    let last = block::pack(geo, &frames[m - 1], carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), (0, 0));
+    hammer.strike(&last.1);
+    sizes[if carry.is_none() { 0 } else { 1 }] += last.0.len();
+    done[m - 1] = Some(last);
+    // Spans between two packed frames (-1 is the frame kept before the group); the left half first.
+    let mut spans: Vec<(isize, usize)> = vec![(-1, m - 1)];
+    while let Some((lo, hi)) = spans.pop() {
+        if hi as isize - lo < 2 {
+            continue;
+        }
+        let k = ((lo + hi as isize) / 2) as usize;
+        // Nothing is guessed from a frame with no frame left between it and its two: its steps are longest.
+        let leaf = k as isize - lo < 2 && hi - k < 2;
+        let longer = if leaf { rules.blocks.between } else { rules.blocks.between.sqrt() };
+        let coarse = ((rules.coarse as f64 * longer).round() as u8).max(rules.coarse);
+        let packed = {
+            let before: &[u8] = if lo < 0 { carry.as_deref().expect("a group after the first frame") } else { &done[lo as usize].as_ref().unwrap().1 };
+            let after = &done[hi].as_ref().unwrap().1;
+            block::pack(geo, &frames[k], Some(before), Some(after), hammer.picture(), rules.bands, coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), ((k as isize - lo) as u8, (hi - k) as u8))
+        };
+        sizes[2] += packed.0.len();
+        done[k] = Some(packed);
+        spans.push((k as isize, hi));
+        spans.push((lo, k));
+    }
+    *carry = Some(done[m - 1].as_ref().unwrap().1.clone());
+    done.into_iter().map(Option::unwrap).collect()
+}
+
 fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str, before: &str) -> String {
     bottle::sha(format!("fbottle pack 3 {}\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}\n{before}", guess::VERSION, geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
 }
@@ -136,14 +172,29 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     // For the packings that are not exact: the last frame as the player will have it, the
     // frame that waits to be guessed from both sides, and how many frames have come.
     let mut carry: Option<Vec<u8>> = None;
-    let mut held: Option<Vec<u8>> = None;
-    let mut lossy_seen = 0usize;
+    let mut group: Vec<Vec<u8>> = Vec::new();
+    // Bytes of the first frame, of the frames guessed from the one before, of the frames between two.
+    let mut sizes = [0usize; 3];
     // The Hammer's stack of every frame so far, and one name for all of them (for the brand).
     let mut hammer = guess::Hammer::new();
     let mut so_far = String::new();
     // The pattern dictionary: every frame's bits go through it, in order.
     let mut dictionary = dict::Dictionary::holding(rules.patterns);
     let mut books: Vec<block::Book> = Vec::new();
+    // A group of frames is packed as blocks and its frames become nodes, in their own order.
+    macro_rules! finish_group {
+        () => {{
+            let frames_of_group = std::mem::take(&mut group);
+            let packed = pack_group(geo, rules, &frames_of_group, &mut carry, &mut hammer, &mut books, &mut sizes);
+            for ((payload, rebuilt), frame) in packed.into_iter().zip(&frames_of_group) {
+                if rules.grain {
+                    grain_squares += far_light(frame, &rebuilt);
+                    grain_samples += light_len as f64;
+                }
+                keep([vec![3, 0, 0], payload].concat(), &rebuilt, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+            }
+        }};
+    }
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -176,37 +227,29 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
-        if rules.tolerance > 0 || rules.coarse > 0 {
-            // Not exact: with a tolerance, guesses wrong by no more than it are left as they
-            // are; with --coarse, a frame is kept as blocks, vectors and waves. Either way each
-            // frame is made from the frames as the player will have them, so one frame at a
-            // time (its bands side by side).
+        if rules.coarse > 0 {
+            // Blocks: frames are packed in groups (one frame a group without --between, and
+            // the first frame always alone), each from the frames as the player will have them.
             for frame in std::mem::take(&mut frames) {
-                let odd = lossy_seen % 2 == 1;
-                lossy_seen += 1;
-                // With --between every second frame waits for the one after it.
-                if rules.coarse > 0 && rules.between && odd && held.is_none() {
-                    held = Some(frame);
-                    continue;
+                group.push(frame);
+                let full = if carry.is_none() || !rules.between { 1 } else { rules.blocks.group.max(1) };
+                if group.len() >= full {
+                    finish_group!();
                 }
-                let before = carry.as_ref().map(|f| f.as_slice());
-                let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
-                    (3, block::pack(geo, &frame, before, None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books)))
-                } else {
-                    (2, guess::pack_within(geo, &frame, before, hammer.guess(), rules.bands, rules.tolerance))
-                };
+            }
+            continue;
+        }
+        if rules.tolerance > 0 {
+            // A tolerance: guesses wrong by no more than it are left as they are. Each frame
+            // is guessed from the frames as the player will have them, so one at a time.
+            for frame in std::mem::take(&mut frames) {
+                let (payload, rebuilt) = guess::pack_within(geo, &frame, carry.as_deref(), hammer.guess(), rules.bands, rules.tolerance);
                 hammer.strike(&rebuilt);
                 if rules.grain {
                     grain_squares += far_light(&frame, &rebuilt);
                     grain_samples += light_len as f64;
                 }
-                if let Some(waited) = held.take() {
-                    // The frame that waited lies between the last one kept and this one.
-                    let coarser = ((rules.coarse as f64 * rules.blocks.between).round() as u8).max(rules.coarse);
-                    let (p, r) = block::pack(geo, &waited, before, Some(&rebuilt), hammer.picture(), rules.bands, coarser, &rules.blocks, rules.dictionary.then_some(&mut books));
-                    keep([vec![3, 0, 0], p].concat(), &r, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
-                }
-                keep([vec![kind, 0, 0], payload].concat(), &rebuilt, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+                keep([vec![2, 0, 0], payload].concat(), &rebuilt, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
                 carry = Some(rebuilt);
             }
             continue;
@@ -274,10 +317,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw, ports, next: None, leans });
         }
     }
-    if let Some(waited) = held.take() {
-        // The last frame waited for one that never came: it is kept as the others are.
-        let (p, r) = block::pack(geo, &waited, carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books));
-        keep([vec![3, 0, 0], p].concat(), &r, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+    // The frames left over at the end are a last, shorter group.
+    if !group.is_empty() {
+        finish_group!();
     }
     let n = nodes.len();
     if n == 0 {
@@ -289,6 +331,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     for (i, node) in nodes.iter_mut().enumerate() {
         (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
         node.next = (i + 1 < n).then_some(i as u32 + 1);
+    }
+    if sizes[0] > 0 {
+        println!("SIZES  the first frame {} bytes; the frames guessed from the one before {} bytes; the frames between two {} bytes", sizes[0], sizes[1], sizes[2]);
     }
     if let Some(l) = &light {
         println!("LIGHT  brightness kept as level numbers: {} of {} frames store a grid, the others use the one before", l.stored, l.frames);

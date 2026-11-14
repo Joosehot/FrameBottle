@@ -77,7 +77,12 @@ still = 256
 weigh = 0.1
 # With --between, every second frame is guessed from the frame before it and the frame
 # after it. Nothing is guessed from such a frame, so its steps may be this much longer.
-between = 1.7
+between = 2.1
+# With --between frames are packed in groups of this many. The last frame of a group is
+# guessed from the last of the group before it; the middle one from those two; and so on
+# inward. A frame that others are guessed from has steps only the square root of
+# `between` longer.
+group = 4
 
 # The smoother: vectors between node A and node B.
 [smoother]

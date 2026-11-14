@@ -248,11 +248,16 @@ pub struct Chain {
     grid: Option<Vec<u8>>,
     /// A frame rebuilt before its turn (the one after a frame between two), with its node.
     pub ahead: Option<(usize, Vec<u8>)>,
+    /// For a bottle with frames between two: the frames rebuilt so far (the last few),
+    /// the tiles opened but not yet rebuilt, and how many tiles have been opened.
+    cache: std::collections::BTreeMap<usize, Vec<u8>>,
+    tiles: std::collections::BTreeMap<usize, Vec<u8>>,
+    opened: usize,
 }
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), grid: None, ahead: None }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), grid: None, ahead: None, cache: Default::default(), tiles: Default::default(), opened: 0 }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
@@ -394,6 +399,9 @@ impl Bottle {
                 at = end;
             }
         }
+        if self.index.between {
+            return self.frames_between(from, to, chain);
+        }
         // A frame that was rebuilt early (the one after a frame between two) is already here.
         let ready = chain.ahead.take().filter(|(k, _)| *k == from);
         let first = from + ready.is_some() as usize;
@@ -493,6 +501,64 @@ impl Bottle {
             chain.show(from + i, f, grids[i].take());
         }
         Ok(out)
+    }
+
+    /// The frames of a bottle with frames between two. A frame between two is rebuilt
+    /// after the two it lies between, whichever way they lie, so the frames are rebuilt
+    /// in the order the packer made them, each when it is first needed; the last few
+    /// are kept at hand. The tiles are still opened in the order they lie in the bottle.
+    fn frames_between(&self, from: usize, to: usize, chain: &mut Chain) -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::with_capacity(to - from);
+        for i in from..to {
+            out.push(self.frame_of(i, chain)?);
+        }
+        chain.at = to;
+        let keep = to.saturating_sub(64);
+        chain.cache.retain(|k, _| *k >= keep);
+        for (i, f) in out.iter().enumerate() {
+            chain.show(from + i, f, None);
+        }
+        Ok(out)
+    }
+
+    fn frame_of(&self, i: usize, chain: &mut Chain) -> Result<Vec<u8>, String> {
+        if let Some(f) = chain.cache.get(&i) {
+            return Ok(f.clone());
+        }
+        if i >= self.index.nodes.len() {
+            return Err(format!("a frame leans on node {i}, which the bottle does not have"));
+        }
+        while chain.opened <= i {
+            let mut tile = self.packed(chain.opened)?;
+            if self.index.dictionary.is_some() {
+                tile = chain.dictionary.open(tile)?;
+            }
+            chain.tiles.insert(chain.opened, crate::light::strip(tile).1);
+            chain.opened += 1;
+        }
+        let tile = chain.tiles.remove(&i).ok_or(format!("node {i} was already rebuilt and is no longer at hand"))?;
+        if !crate::pack::blocks(&tile) {
+            return Err("a bottle with frames between two holds frames of blocks only".into());
+        }
+        let p = &tile[3..];
+        let frame = if crate::block::between(p) {
+            let (back, on) = crate::block::refs(p);
+            if back == 0 || on == 0 || back > i {
+                return Err(format!("node {i} does not say which two frames it lies between"));
+            }
+            let (before, after) = (self.frame_of(i - back, chain)?, self.frame_of(i + on, chain)?);
+            crate::block::unpack(&self.geo, p, Some(&before), Some(&after), chain.hammer.picture(), &mut chain.books)?
+        } else {
+            let f = crate::block::unpack(&self.geo, p, chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books)?;
+            chain.hammer.strike(&f);
+            chain.refer(&f);
+            f
+        };
+        if sha(&frame) != self.index.nodes[i].raw {
+            return Err(format!("node {i} did not unpack to its frame"));
+        }
+        chain.cache.insert(i, frame.clone());
+        Ok(frame)
     }
 
     /// One node's frame finished from what the chain holds: a guessed tile or a tile of
