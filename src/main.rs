@@ -52,6 +52,8 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--line]                    exact, but each sample first says whether it stayed what it was
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
+             [--dictionary-first]        with --coarse: the corrections as plain bits, the dictionary does the final packing
+             [--patterns N]              the most patterns the bit dictionary holds (4096)
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
@@ -96,7 +98,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let mut hammer = guess::Hammer::new();
     let mut so_far = String::new();
     // The pattern dictionary: every frame's bits go through it, in order.
-    let mut dictionary = dict::Dictionary::new();
+    let mut dictionary = dict::Dictionary::holding(rules.patterns);
     let mut books: Vec<block::Book> = Vec::new();
     loop {
         let mut frames = Vec::new();
@@ -241,6 +243,11 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             d.bytes_in
         );
     }
+    if rules.dictionary && std::env::var_os("FBOTT_PATTERNS").is_some() {
+        for (bits, used) in dictionary.commonest(8) {
+            println!("bit pattern {bits}: used {used} times");
+        }
+    }
     if !books.is_empty() {
         let (blocks, hits, patterns) = books.iter().fold((0, 0, 0), |n, b| (n.0 + b.blocks, n.1 + b.hits, n.2 + b.patterns()));
         println!("BOOK   {patterns} patterns of block corrections at the end (in {} books); {hits} of {blocks} blocks with corrections were in a book ({:.2} %)", books.len(), 100.0 * hits as f64 / blocks.max(1) as f64);
@@ -278,6 +285,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         tolerance: rules.tolerance,
         coarse: rules.coarse,
         dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
+        patterns: rules.patterns,
         nodes,
         shares: Vec::new(),
     };
@@ -393,6 +401,11 @@ fn run() -> Result<(), String> {
             "--explain" => explain = true,
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
+            "--dictionary-first" => {
+                rules.dictionary = true;
+                block::PLAIN_BITS.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            "--patterns" => rules.patterns = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--patterns needs a whole number, 1 or more")?,
             "--four" => {
                 rules.dictionary = true;
                 block::FOUR_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -465,7 +478,7 @@ fn run() -> Result<(), String> {
                 let e: f64 = x[..luma].iter().zip(&y[..luma]).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / luma as f64;
                 if e == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / e).log10() }
             };
-            let all = b.frames(0, b.index.nodes.len().min(50), &mut bottle::Chain::new())?;
+            let all = b.frames(0, b.index.nodes.len().min(50), &mut bottle::Chain::mending(&b))?;
             let triples: Vec<usize> = (0..all.len().saturating_sub(2)).step_by(2).take(24).collect();
             let scores: Vec<(f64, f64)> = triples
                 .par_iter()

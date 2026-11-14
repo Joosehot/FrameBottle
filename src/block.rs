@@ -38,6 +38,10 @@ const TILE: usize = 16;
 enum Coder<'a> {
     Write(Encoder),
     Read(Decoder<'a>),
+    /// The corrections as plain bits, one after the other, nothing learned and nothing
+    /// squeezed: what the pattern dictionary is given when it comes before the final packing.
+    Bits(Vec<u8>, usize),
+    ReadBits(&'a [u8], usize),
 }
 
 impl Coder<'_> {
@@ -49,6 +53,21 @@ impl Coder<'_> {
                 v
             }
             Coder::Read(d) => d.bit(p),
+            Coder::Bits(bytes, n) => {
+                if *n % 8 == 0 {
+                    bytes.push(0);
+                }
+                if v {
+                    *bytes.last_mut().unwrap() |= 0x80 >> (*n % 8);
+                }
+                *n += 1;
+                v
+            }
+            Coder::ReadBits(bytes, n) => {
+                let bit = bytes.get(*n / 8).is_some_and(|b| b & (0x80 >> (*n % 8)) != 0);
+                *n += 1;
+                bit
+            }
         }
     }
     /// A whole number from 1 to 65535: how many binary digits, then the digits under the first.
@@ -663,6 +682,12 @@ const FROM_BEFORE: u8 = 2;
 const BOOKS: u8 = 4;
 /// The books hold four ready-made patterns and learn no others.
 const FOUR: u8 = 8;
+/// The bands are plain bits (for the pattern dictionary to work on), not coded.
+const PLAIN: u8 = 16;
+
+/// Frames are packed as plain bits, and the dictionary does the final packing
+/// (the command's --dictionary-first).
+pub static PLAIN_BITS: AtomicBool = AtomicBool::new(false);
 
 /// One place for a book (or none) for each band.
 fn slots(books: Option<&mut Vec<Book>>, bands: usize, four: bool) -> Vec<Option<&mut Book>> {
@@ -715,6 +740,8 @@ pub struct How {
 /// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
 /// length, the bands) and the frame as the player will rebuild it.
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>) -> (Vec<u8>, Vec<u8>) {
+    let plain = PLAIN_BITS.load(Ordering::Relaxed);
+    let books = if plain { None } else { books };
     let with_books = books.is_some();
     let four = with_books && FOUR_ONLY.load(Ordering::Relaxed);
     let stack = stack.filter(|s| before.is_some() && s.len() == frame.len());
@@ -731,16 +758,17 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
         .into_par_iter()
         .zip(places)
         .map(|((ty0, bufs), book)| {
-            let mut c = Coder::Write(Encoder::new());
+            let mut c = if plain { Coder::Bits(Vec::new(), 0) } else { Coder::Write(Encoder::new()) };
             band(geo, &t, Some(frame), before, stack, (how.range as i32, how.dead.max(1) as i32, how.still), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
             match c {
                 Coder::Write(e) => e.finish(),
-                Coder::Read(_) => unreachable!(),
+                Coder::Bits(bytes, _) => bytes,
+                _ => unreachable!(),
             }
         })
         .collect();
     smooth_seams(geo, &mut rebuilt, coarse, &made);
-    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 })];
+    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -775,7 +803,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Opti
     }
     let places = slots(if payload[0] & BOOKS != 0 { Some(books) } else { None }, work.len(), payload[0] & FOUR != 0);
     work.into_par_iter().zip(coded).zip(places).for_each(|(((ty0, bufs), bytes), book)| {
-        let mut c = Coder::Read(Decoder::new(bytes));
+        let mut c = if payload[0] & PLAIN != 0 { Coder::ReadBits(bytes, 0) } else { Coder::Read(Decoder::new(bytes)) };
         band(geo, &t, None, before, stack, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
     });
     smooth_seams(geo, &mut out, payload[3], &made);

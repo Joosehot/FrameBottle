@@ -86,6 +86,8 @@ pub struct Dictionary {
     oldest: BTreeSet<(u64, usize)>,
     /// Pairs seen together once.
     waiting: HashMap<Pattern, ()>,
+    /// The most patterns this dictionary holds.
+    cap: usize,
     pieces: u64,
     // What the coder has learned.
     hit: [u16; 2],
@@ -104,7 +106,14 @@ pub struct Dictionary {
 
 impl Dictionary {
     pub fn new() -> Dictionary {
+        Dictionary::holding(CAP)
+    }
+
+    /// A dictionary of at most `cap` patterns (0: the usual 4096).
+    pub fn holding(cap: usize) -> Dictionary {
         Dictionary {
+            // A label is a rank of at most 15 binary digits.
+            cap: if cap == 0 { CAP } else { cap.min(32767) },
             entries: Vec::new(),
             find: HashMap::new(),
             ranks: Vec::new(),
@@ -154,7 +163,7 @@ impl Dictionary {
             return;
         }
         let entry = Entry { pattern: both, used: 1, at: self.pieces, rank: self.ranks.len() };
-        let e = if self.entries.len() < CAP {
+        let e = if self.entries.len() < self.cap {
             self.entries.push(entry);
             self.ranks.push(self.entries.len() - 1);
             self.entries.len() - 1
@@ -307,6 +316,13 @@ impl Dictionary {
 
     pub fn patterns(&self) -> usize {
         self.entries.len()
+    }
+    /// The patterns as bits, the most used first, with how often each was used.
+    pub fn commonest(&self, n: usize) -> Vec<(String, u32)> {
+        self.ranks.iter().take(n).map(|e| {
+            let p = self.entries[*e].pattern;
+            ((0..p.1).rev().map(|k| format!("{:08b}", (p.0 >> (8 * k as u32)) as u8)).collect::<Vec<_>>().join(" "), self.entries[*e].used)
+        }).collect()
     }
 }
 

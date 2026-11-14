@@ -527,3 +527,41 @@ but they are the cheapest third: a block with one wave one step long took
 only a few bits before, since the coder had already learned that such
 blocks are common. The bytes are in the blocks with many waves, and those
 are all different.
+
+### The dictionary before the final packing (`--dictionary-first`)
+
+With `--coarse` and `--dictionary-first` the corrections are not coded at
+all at first: every yes/no of a frame (is the tile moved, is a wave left,
+each digit of a step) is written as one plain bit. The pattern dictionary
+of [src/dict.rs](src/dict.rs) then goes through those bits, and what it
+writes (labels and the bytes in no pattern) is the final packing.
+`--patterns N` sets how many patterns it may hold (4096; at most 32 767,
+which is what a label can name).
+
+Measured on `guitar_10s.mp4`, coarse 20, 41.18 dB in every row; the frames
+rebuilt are the same, and the player's dictionary ended as the packer's:
+
+| | the frames' bytes | the bottle |
+|---|---|---|
+| the corrections as plain bits, nothing else | 6 035 976 | |
+| dictionary first, 4 patterns | 4 614 984 | 4 794 030 |
+| dictionary first, 4096 patterns | 4 147 857 | 4 326 749 |
+| dictionary first, 32 767 patterns | 3 971 963 | 4 150 740 |
+| the coder (as before, no dictionary) | 3 314 639 | 3 598 135 |
+| the coder with the book of block patterns | | 3 493 256 |
+
+- Here the dictionary does find patterns: with 4096 of them 52.6 % of the
+  pieces are labels, covering 75.5 % of the bits; with 32 767, 79.9 % and
+  91.8 %. The commonest is "1 and eight 0s", over and over: a tile that
+  stands still (moved: yes, vector: none, six blocks with no wave left).
+- Against the plain bits it saves 31 % (4096 patterns) to 34 % (32 767).
+- Against the coder it replaces it is 25 % bigger (4096) or 20 % (32 767):
+  the coder learns for each yes/no how likely it is where it stands (which
+  wave, what the neighbour did), and a pattern of whole bytes cannot.
+- With only 4 patterns almost nothing is a label (3.2 % of the pieces);
+  what it saves comes from the bytes themselves being uneven.
+- A step along the film: 5.6 ms (plain bits are quick to read).
+
+Seen on the way: the bottle is about 280 000 bytes bigger than its frames'
+bytes at this size (8 %). That is the index: for each of the 3322 shares
+its SHA-256 as 64 letters, its place and length, and each node's ports.

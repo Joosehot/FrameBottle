@@ -76,6 +76,9 @@ pub struct Index {
     /// is not in the bottle: the player makes it again as it goes.
     #[serde(default)]
     pub dictionary: Option<String>,
+    /// The most patterns the dictionary holds (0: the usual 4096).
+    #[serde(default)]
+    pub patterns: usize,
     pub nodes: Vec<Node>,
     pub shares: Vec<Share>,
 }
@@ -177,6 +180,7 @@ impl Chain {
     pub fn mending(b: &Bottle) -> Chain {
         let mut c = Chain::new();
         c.mending = (b.index.tolerance > 0).then(|| (b.geo.clone(), b.index.tolerance));
+        c.dictionary = crate::dict::Dictionary::holding(b.index.patterns);
         c
     }
     /// The next frame is known: it becomes the frame before, and is laid on the stack.
@@ -272,6 +276,7 @@ impl Bottle {
             let mending = chain.mending.take();
             *chain = Chain::new();
             chain.mending = mending;
+            chain.dictionary = crate::dict::Dictionary::holding(self.index.patterns);
             let mut at = 0;
             while at < from {
                 let end = (at + 24).min(from);
@@ -338,7 +343,7 @@ impl Bottle {
 
     /// Every node's packed tile, in order, out of the dictionary if the bottle has one.
     fn tiles(&self) -> Result<Vec<Vec<u8>>, String> {
-        let mut d = crate::dict::Dictionary::new();
+        let mut d = crate::dict::Dictionary::holding(self.index.patterns);
         (0..self.index.nodes.len()).map(|i| if self.index.dictionary.is_some() { d.open(self.packed(i)?) } else { self.packed(i) }).collect()
     }
 
