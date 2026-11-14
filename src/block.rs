@@ -33,6 +33,33 @@ fn marks(geo: &Geometry) -> Marks {
 const HALF: u16 = 1 << 11;
 const TILE: usize = 16;
 
+/// What the packer spent on the frame it packed last, for the breakdown: thousandths of
+/// a bit on tile kinds and flags, on vectors, on waves, on labels of the book; then
+/// blocks, blocks with no wave left, tiles, and tiles that are only the same picture
+/// from another frame with nothing put right (skipped).
+pub static SPENT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// Whether the spending is counted (the command's --breakdown).
+pub static COUNTING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// What the bits written now are for (an index into SPENT).
+    static WHAT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn spending(what: usize) {
+    WHAT.with(|w| w.set(what));
+}
+
+fn count(what: usize, n: u64) {
+    if COUNTING.load(Ordering::Relaxed) {
+        SPENT[what].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// The spending of the last frame packed, and the counters set back to nothing.
+pub fn spent() -> [u64; 8] {
+    std::array::from_fn(|i| SPENT[i].swap(0, Ordering::Relaxed))
+}
+
 /// One way through the syntax for the packer and the player: the packer
 /// gives the value and it is written; the player gets the value read.
 enum Coder<'a> {
@@ -49,6 +76,12 @@ impl Coder<'_> {
     fn bit(&mut self, p: &mut u16, v: bool) -> bool {
         match self {
             Coder::Write(e) => {
+                if COUNTING.load(Ordering::Relaxed) {
+                    // What this yes/no costs: the fewer bits, the surer the coder was of it.
+                    let no = *p as f64 / 4096.0;
+                    let bits = -(if v { 1.0 - no } else { no }).log2();
+                    SPENT[WHAT.with(|w| w.get())].fetch_add((bits * 1000.0) as u64, Ordering::Relaxed);
+                }
                 e.bit(p, v);
                 v
             }
@@ -377,11 +410,15 @@ fn waves_of(steps: &[i32; 64]) -> Waves {
 /// The steps of one block's waves, coarse to fine: written, or read into `steps`.
 fn block(c: &mut Coder, l: &mut Learned, t: &Tables, book: &mut Option<&mut Book>, kind: usize, moved: usize, steps: &mut [i32; 64]) {
     let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
+    spending(2);
+    count(4, 1);
     if !c.bit(&mut l.any[kind * 2 + moved], want > 0) {
         *steps = [0; 64];
+        count(5, 1);
         return;
     }
     if let Some(book) = book.as_deref_mut() {
+        spending(3);
         // Is this block's whole pattern of corrections in the book? Then only its label is kept.
         book.ticks += 1;
         book.blocks += 1;
@@ -399,6 +436,7 @@ fn block(c: &mut Coder, l: &mut Learned, t: &Tables, book: &mut Option<&mut Book
             book.hits += 1;
             return;
         }
+        spending(2);
     }
     let (mut node, mut end) = (1usize, 0usize);
     for b in (0..6).rev() {
@@ -1127,6 +1165,8 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 }
             }
             // The tile's kind and vectors: written, or read.
+            spending(0);
+            let mut tile_waves = false;
             let mut kind = Kind::Flat(0);
             if f.before.is_some() {
                 let ctx = if !any_left { 2 } else { left.is_some() as usize };
@@ -1134,20 +1174,26 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     let (wv, wsplit) = if let Kind::Moved(v, s) = want { (v, s) } else { ([(0, 0); 4], false) };
                     let split = c.bit(&mut l.split[left_split as usize], wsplit);
                     let (mut vs, mut last) = ([(0, 0); 4], from);
+                    spending(1);
                     for q in 0..if split { 4 } else { 1 } {
                         vs[q] = (last.0 + c.signed(&mut l.vector[0], wv[q].0 - last.0), last.1 + c.signed(&mut l.vector[1], wv[q].1 - last.1));
                         last = vs[q];
                     }
+                    spending(0);
                     if !split {
                         vs = [vs[0]; 4];
                     }
                     kind = Kind::Moved(vs, split);
                 } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_))) {
                     let wd = if let Kind::Between(d) = want { d } else { (0, 0) };
+                    spending(1);
                     kind = Kind::Between((c.signed(&mut l.vector[0], wd.0), c.signed(&mut l.vector[1], wd.1)));
+                    spending(0);
                 } else if f.after.is_some() && c.bit(&mut l.after, matches!(want, Kind::After(_))) {
                     let wv = if let Kind::After(v) = want { v } else { (0, 0) };
+                    spending(1);
                     kind = Kind::After((c.signed(&mut l.vector[0], wv.0), c.signed(&mut l.vector[1], wv.1)));
+                    spending(0);
                 } else if f.stack.is_some() && c.bit(&mut l.stack[left_stack as usize], want == Kind::Stack) {
                     kind = Kind::Stack;
                 }
@@ -1161,6 +1207,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             }
             // The light of a whole tile guessed from another frame: as one block of 16 x 16?
             let whole_tile = x0 as usize + TILE <= geo.width && y0 as usize + TILE <= geo.height;
+            spending(0);
             let big = !matches!(kind, Kind::Flat(_)) && whole_tile && c.bit(&mut l.big[left_big as usize], kept_big.is_some());
             if big {
                 let (p, band_top) = (&geo.planes[0], ty0 * TILE);
@@ -1173,8 +1220,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     }
                 }
                 let mut steps = kept_big.map_or([0i32; 256], |k| *k);
+                spending(2);
                 block16(c, &mut l, t, &mut steps);
                 let waves_left = steps.iter().any(|s| *s != 0);
+                tile_waves |= waves_left;
                 let same = match kind {
                     Kind::Stack => true,
                     Kind::Moved(v, _) => v.iter().all(|v| *v == (0, 0)),
@@ -1209,6 +1258,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 let mut steps = kept.as_ref().map_or([0i32; 64], |k| k[n]);
                 block(c, &mut l, t, &mut book, (i > 0) as usize, !matches!(kind, Kind::Flat(_)) as usize, &mut steps);
                 let waves_left = steps.iter().any(|s| *s != 0);
+                tile_waves |= waves_left;
                 // A block that is only the same block of the frame before is not made anew.
                 let same = match kind {
                     Kind::Stack => true,
@@ -1229,6 +1279,12 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             left = if let Kind::Moved(v, _) = kind { Some(v[1]) } else { None };
             left_split = matches!(kind, Kind::Moved(_, true));
             left_stack = kind == Kind::Stack;
+            if src.is_some() {
+                count(6, 1);
+                if !tile_waves && !matches!(kind, Kind::Flat(_)) {
+                    count(7, 1);
+                }
+            }
             left_between = matches!(kind, Kind::Between(_));
             left_big = big;
             any_left = true;

@@ -54,6 +54,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--light N]                 exact packing of dimmed light: N brightness levels on a curve (64, 96, 128)
              [--grid N]                  the same with a grid of N levels made for each frame
              [--grain]                   with --coarse or --tolerance: fake film grain on what is shown
+             [--breakdown]               with --coarse: what every frame's bytes are spent on
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
@@ -99,10 +100,13 @@ fn keep(mut packed: Vec<u8>, rebuilt: &[u8], dictionary: Option<&mut dict::Dicti
 /// last frame kept before it (`carry`); then the middle one from those two, and so on
 /// inward, each between the two nearest frames already packed. Returns each frame's
 /// bytes and the frame as the player will rebuild it, in the frames' own order.
-fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &mut Option<Vec<u8>>, hammer: &mut guess::Hammer, books: &mut Vec<block::Book>, sizes: &mut [usize; 3]) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &mut Option<Vec<u8>>, hammer: &mut guess::Hammer, books: &mut Vec<block::Book>, sizes: &mut [usize; 3], spent: &mut Vec<[u64; 8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let m = frames.len();
     let mut done: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None; m];
+    let mut spent_of = vec![[0u64; 8]; m];
+    block::spent();
     let last = block::pack(geo, &frames[m - 1], carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), (0, 0));
+    spent_of[m - 1] = block::spent();
     hammer.strike(&last.1);
     sizes[if carry.is_none() { 0 } else { 1 }] += last.0.len();
     done[m - 1] = Some(last);
@@ -122,12 +126,14 @@ fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &m
             let after = &done[hi].as_ref().unwrap().1;
             block::pack(geo, &frames[k], Some(before), Some(after), hammer.picture(), rules.bands, coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), ((k as isize - lo) as u8, (hi - k) as u8))
         };
+        spent_of[k] = block::spent();
         sizes[2] += packed.0.len();
         done[k] = Some(packed);
         spans.push((k as isize, hi));
         spans.push((lo, k));
     }
     *carry = Some(done[m - 1].as_ref().unwrap().1.clone());
+    spent.extend(spent_of);
     done.into_iter().map(Option::unwrap).collect()
 }
 
@@ -173,6 +179,11 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     // frame that waits to be guessed from both sides, and how many frames have come.
     let mut carry: Option<Vec<u8>> = None;
     let mut group: Vec<Vec<u8>> = Vec::new();
+    // For --breakdown: what each frame's bits were spent on, and each frame's bytes
+    // (with whether it stores levels to put right, and whether it lies between two).
+    let mut spent: Vec<[u64; 8]> = Vec::new();
+    let mut payload_bytes: Vec<(usize, bool, bool)> = Vec::new();
+    block::COUNTING.store(rules.breakdown, std::sync::atomic::Ordering::Relaxed);
     // Bytes of the first frame, of the frames guessed from the one before, of the frames between two.
     let mut sizes = [0usize; 3];
     // The Hammer's stack of every frame so far, and one name for all of them (for the brand).
@@ -185,8 +196,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     macro_rules! finish_group {
         () => {{
             let frames_of_group = std::mem::take(&mut group);
-            let packed = pack_group(geo, rules, &frames_of_group, &mut carry, &mut hammer, &mut books, &mut sizes);
+            let packed = pack_group(geo, rules, &frames_of_group, &mut carry, &mut hammer, &mut books, &mut sizes, &mut spent);
             for ((payload, rebuilt), frame) in packed.into_iter().zip(&frames_of_group) {
+                payload_bytes.push((payload.len(), payload[0] & 64 != 0, payload[0] & 32 != 0));
                 if rules.grain {
                     grain_squares += far_light(frame, &rebuilt);
                     grain_samples += light_len as f64;
@@ -408,6 +420,40 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     };
     let size = bottle::glue(&out, index, &share_hashes)?;
     println!("GLUE   {} shares struck from Nimbus into {} ({size} bytes)", share_hashes.len(), out.display());
+    if rules.breakdown && !spent.is_empty() {
+        // Where the bytes are: per frame, then in all.
+        let bytes = |millibits: u64| millibits as f64 / 8000.0;
+        let mut all = [0f64; 6];
+        let (mut blocks, mut empty, mut tiles, mut skipped) = (0u64, 0u64, 0u64, 0u64);
+        println!("BREAKDOWN, bytes per frame: frame, kind, in all | vectors | waves | tile kinds and flags | book labels | levels put right | lengths, header and the coder's rounding | blocks with no wave | tiles skipped");
+        for (i, (s, (len, levels, between))) in spent.iter().zip(&payload_bytes).enumerate() {
+            let (vectors, waves, kinds, labels) = (bytes(s[1]), bytes(s[2]), bytes(s[0]), bytes(s[3]));
+            let levels = if *levels { 96.0 } else { 0.0 };
+            let rest = *len as f64 - vectors - waves - kinds - labels - levels;
+            println!(
+                "  {i:4} {} {len:7} | {vectors:7.0} | {waves:7.0} | {kinds:6.0} | {labels:5.0} | {levels:3.0} | {rest:5.0} | {:5.1} % | {:5.1} %",
+                if i == 0 { "first  " } else if *between { "between" } else { "before " },
+                100.0 * s[5] as f64 / s[4].max(1) as f64,
+                100.0 * s[7] as f64 / s[6].max(1) as f64
+            );
+            for (a, v) in all.iter_mut().zip([*len as f64, vectors, waves, kinds, labels, levels]) {
+                *a += v;
+            }
+            (blocks, empty, tiles, skipped) = (blocks + s[4], empty + s[5], tiles + s[6], skipped + s[7]);
+        }
+        let file = size as f64;
+        let share = |v: f64| format!("{:9.0} bytes {:5.1} %", v, 100.0 * v / file);
+        println!("BREAKDOWN, the whole bottle ({size} bytes):");
+        println!("  waves (the corrections)          {}", share(all[2]));
+        println!("  vectors                          {}", share(all[1]));
+        println!("  tile kinds and flags             {}", share(all[3]));
+        println!("  labels of the book               {}", share(all[4]));
+        println!("  levels put right                 {}", share(all[5]));
+        println!("  light grid                       {}  (the blocks keep no light grid)", share(0.0));
+        println!("  lengths, headers, coder rounding {}", share(all[0] - all[1] - all[2] - all[3] - all[4] - all[5]));
+        println!("  the index and the bottle's ends  {}", share(file - all[0]));
+        println!("  blocks with no wave left: {:.1} % of {blocks}; tiles skipped (the same picture from another frame, nothing put right): {:.1} % of {tiles}", 100.0 * empty as f64 / blocks.max(1) as f64, 100.0 * skipped as f64 / tiles.max(1) as f64);
+    }
     Ok(Packed { out, frames: n, struck, seconds: began.elapsed().as_secs_f64() })
 }
 
@@ -519,6 +565,7 @@ fn run() -> Result<(), String> {
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
             "--between" => rules.between = true,
+            "--breakdown" => rules.breakdown = true,
             "--grain" => rules.grain = true,
             "--light" => rules.light = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--light needs a number of levels from 2 to 256")?,
             "--grid" => rules.grid = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--grid needs a number of levels from 2 to 256")?,

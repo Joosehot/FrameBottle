@@ -44,6 +44,8 @@ pub struct Rules {
     pub dictionary: bool,
     /// Every second frame is guessed from the frames on both sides (the command's --between).
     pub between: bool,
+    /// What every frame's bytes are spent on is printed (the command's --breakdown).
+    pub breakdown: bool,
     /// Dimmed light: the number of brightness levels on the film's curve (0: not used).
     pub light: usize,
     /// A light grid for each frame: its number of levels (0: not used).
@@ -135,6 +137,7 @@ impl Rules {
             coarse: 0,
             dictionary: false,
             between: false,
+            breakdown: false,
             light: 0,
             grid: 0,
             grain: false,
