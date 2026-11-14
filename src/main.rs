@@ -272,7 +272,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     println!("PACK   {} tiles packed, {} struck from Nimbus (already branded); {} lean on the tile before them", n - struck, struck, nodes.iter().filter(|n| n.leans).count());
     let out = out.unwrap_or_else(|| movie_path.with_extension("fbott"));
     let index = Index {
-        format: "frame-bottle/2".into(),
+        format: "frame-bottle/3".into(),
         source: movie_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
         pix_fmt: geo.pix_fmt.clone(),
         source_pix_fmt: movie.source_pix_fmt.clone(),

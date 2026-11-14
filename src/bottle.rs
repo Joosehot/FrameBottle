@@ -4,6 +4,12 @@
 //! "FBOTTLE1" | every share once, as it lies in Nimbus | the index, deflated | its length (u64) | "1ELTTOBF"
 //! ```
 //!
+//! The index is kept tight: what is said once (the grid, the species, the settings) as
+//! text, then a table of the shares (the first 8 bytes of each one's SHA-256 and its
+//! length; where it lies follows from the lengths) and a table of the nodes (the
+//! frame's SHA-256, whether it leans, and its ports). A node's place on the grid and
+//! the node its bond leads to follow from its number, and are not written.
+//!
 //! The index holds the grid, the particle species and the nodes. A node is
 //! one frame: its tile's place on the grid, the hash of the frame as it was
 //! chopped, the share each of its particle's ports holds, and the node its
@@ -79,8 +85,64 @@ pub struct Index {
     /// The most patterns the dictionary holds (0: the usual 4096).
     #[serde(default)]
     pub patterns: usize,
+    /// Kept in the tables after the text, not in it.
+    #[serde(skip)]
     pub nodes: Vec<Node>,
+    #[serde(skip)]
     pub shares: Vec<Share>,
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap_or(0)).collect()
+}
+
+/// The index as bytes: the text, the table of shares, the table of nodes.
+fn index_bytes(index: &Index) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec(index).map_err(|e| e.to_string())?;
+    let mut out = (json.len() as u32).to_le_bytes().to_vec();
+    out.extend(json);
+    out.extend((index.shares.len() as u32).to_le_bytes());
+    for s in &index.shares {
+        out.extend(&unhex(&s.sha256)[..8]);
+        out.extend((s.len as u32).to_le_bytes());
+    }
+    out.extend((index.nodes.len() as u32).to_le_bytes());
+    for n in &index.nodes {
+        out.extend(unhex(&n.raw));
+        out.push(n.leans as u8);
+        for p in &n.ports {
+            out.extend(p.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn index_from(bytes: &[u8]) -> Result<Index, String> {
+    let cut = || "the index is cut".to_string();
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Result<&[u8], String> {
+        let part = bytes.get(at..at + n).ok_or_else(cut)?;
+        at += n;
+        Ok(part)
+    };
+    let word = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap()) as usize;
+    let json_len = word(take(4)?);
+    let mut index: Index = serde_json::from_slice(take(json_len)?).map_err(|e| e.to_string())?;
+    let mut offset = MAGIC.len() as u64;
+    for _ in 0..word(take(4)?) {
+        let sha256 = hex(take(8)?);
+        let len = word(take(4)?) as u64;
+        index.shares.push(Share { offset, len, sha256 });
+        offset += len;
+    }
+    let (count, k, cols) = (word(take(4)?), index.species.k, index.cols.max(1));
+    for i in 0..count {
+        let raw = hex(take(32)?);
+        let leans = take(1)?[0] != 0;
+        let ports = (0..k).map(|_| take(4).map(|b| word(b) as u32)).collect::<Result<Vec<u32>, String>>()?;
+        index.nodes.push(Node { frame: i as u32, col: i as u32 % cols, row: i as u32 / cols, raw, ports, next: (i + 1 < count).then_some(i as u32 + 1), leans });
+    }
+    Ok(index)
 }
 
 /// Where Frame Bottle keeps its brands and its window, in Strike's home.
@@ -144,7 +206,7 @@ pub fn glue(out: &Path, mut index: Index, share_hashes: &[String]) -> Result<u64
         index.shares.push(Share { offset: at, len: bytes.len() as u64, sha256: hash.clone() });
         at += bytes.len() as u64;
     }
-    let json = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+    let json = index_bytes(&index)?;
     let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
     z.write_all(&json).unwrap();
     let z = z.finish().unwrap();
@@ -230,7 +292,7 @@ impl Bottle {
         f.read_exact(&mut z).map_err(err)?;
         let mut json = Vec::new();
         flate2::read::ZlibDecoder::new(&z[..]).read_to_end(&mut json).map_err(err)?;
-        let index: Index = serde_json::from_slice(&json).map_err(|e| format!("{}: {e}", path.display()))?;
+        let index: Index = index_from(&json).map_err(|e| format!("{}: {e}", path.display()))?;
         let geo = Geometry::of(&index.pix_fmt, index.width, index.height).ok_or(format!("unknown pixel format {}", index.pix_fmt))?;
         // The chain of bonds must pass every node once, in frame order.
         for (i, n) in index.nodes.iter().enumerate() {
@@ -250,7 +312,8 @@ impl Bottle {
             f.seek(SeekFrom::Start(s.offset)).map_err(|e| e.to_string())?;
             f.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         }
-        if sha(&bytes) != s.sha256 {
+        // The index holds the first 8 bytes of the share's name.
+        if !sha(&bytes).starts_with(&s.sha256) {
             return Err(format!("the share {} in the bottle is not what its name says", s.sha256));
         }
         Ok(bytes)
