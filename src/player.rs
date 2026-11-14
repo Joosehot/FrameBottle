@@ -126,9 +126,6 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
             let before = frames.last().map(|f| f.0.as_slice()).or(prev.as_deref());
             let unpacked = b.frames(start + have, end, before)?;
             add(0, t);
-            let t = Instant::now();
-            unpacked.par_iter().enumerate().try_for_each(|(i, f)| bottle::to_nimbus(f, &b.index.nodes[start + have + i].raw))?;
-            add(1, t);
             frames.extend(unpacked.into_iter().map(|f| (f, false)));
         }
         for (i, (_, struck)) in frames.iter().enumerate() {
@@ -141,7 +138,16 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
         }
         // The frames between each node and the one before it, guessed now.
         type Guessed = (Vec<(String, String)>, Vec<Vec<u8>>, bool, usize, usize);
-        let guesses: Vec<Guessed> = (start..end)
+        // While the guessed frames are made, the nodes just unpacked go into the window.
+        let (kept, guesses) = rayon::join(
+            || {
+                let t = Instant::now();
+                let kept = frames[have..].par_iter().enumerate().try_for_each(|(i, f)| bottle::to_nimbus(&f.0, &b.index.nodes[start + have + i].raw));
+                add(1, t);
+                kept
+            },
+            || -> Result<Vec<Guessed>, String> {
+                (start..end)
             .into_par_iter()
             .map(|i| -> Result<Guessed, String> {
                 if i == 0 || smooth < 2 {
@@ -179,7 +185,11 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
                 }
                 Ok((names, made, false, v.moving(), v.d.len()))
             })
-            .collect::<Result<_, String>>()?;
+            .collect()
+            },
+        );
+        kept?;
+        let guesses = guesses?;
         for (i, g) in guesses.iter().enumerate() {
             if g.2 {
                 stats.guesses_struck += g.1.len();

@@ -82,7 +82,7 @@ impl Geometry {
     }
 }
 
-pub const FROMS: [&str; 2] = ["own", "tile"];
+pub const FROMS: [&str; 3] = ["own", "tile", "guess"];
 pub const PREDICTS: [&str; 5] = ["none", "left", "up", "paeth", "med"];
 pub const CODERS: [&str; 3] = ["deflate", "zstd", "xz"];
 
@@ -248,8 +248,16 @@ fn differ(frame: &[u8], before: &[u8]) -> Vec<u8> {
 pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules, profile: &[f64; 3]) -> Vec<motor::Candidate> {
     let leaning: Option<Vec<u8>> = before.map(|b| differ(frame, b));
     let mut samples: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
+    let mut guessed: Option<(usize, usize)> = None;
     let mut judge = |choice: &Choice| {
         let from = id(&FROMS, motor::get(choice, "from").unwrap());
+        if from == 2 {
+            // A guessed tile: the sample is guessed and corrected as the pack would be.
+            let (coded, raw) = *guessed.get_or_insert_with(|| crate::guess::sample(geo, frame, before, rules));
+            let share = coded as f64 / raw.max(1) as f64;
+            let bonus = rules.judge_size * profile[2] * (1.0 - share);
+            return (bonus, vec![format!("+{bonus:.2} size: the sample guessed and corrected is {:.1}% of itself", share * 100.0)]);
+        }
         let data: &[u8] = match (from, &leaning) {
             (0, _) => frame,
             (_, Some(d)) => d,
@@ -268,8 +276,13 @@ pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules
 }
 
 /// The tile packed by this choice: what it leans on, the guess, the coder, the coder's bytes.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, choice: &Choice) -> Vec<u8> {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, choice: &Choice, rules: &Rules) -> Vec<u8> {
     let from = id(&FROMS, motor::get(choice, "from").unwrap());
+    if from == 2 {
+        let mut out = vec![2, 0, 0];
+        out.extend(crate::guess::pack(geo, frame, before, rules.bands));
+        return out;
+    }
     let leaning;
     let frame: &[u8] = if from == 1 {
         leaning = differ(frame, before.expect("a leaning tile has a tile before it"));
@@ -293,7 +306,22 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, choice: &Choice
 
 /// Does this packed tile lean on the tile before it?
 pub fn leans(packed: &[u8]) -> bool {
-    packed.first() == Some(&1)
+    packed.first() == Some(&1) || (guessed(packed) && crate::guess::from_before(&packed[3..]))
+}
+
+/// Is this packed tile a guess with its corrections?
+pub fn guessed(packed: &[u8]) -> bool {
+    packed.len() > 3 && packed[0] == 2
+}
+
+/// (16 x 16 tiles guessed perfectly, tiles) of a guessed frame; (0, 0) for any other.
+pub fn guess_tiles(packed: &[u8]) -> (usize, usize) {
+    if guessed(packed) { crate::guess::tiles(&packed[3..]) } else { (0, 0) }
+}
+
+/// Was this tile guessed perfectly (it holds no correction at all)?
+pub fn perfect(packed: &[u8]) -> bool {
+    guessed(packed) && crate::guess::perfect(&packed[3..])
 }
 
 /// The first half of unpacking, which needs no other tile: the coder's bytes back.
@@ -325,5 +353,8 @@ pub fn lean_on(tile: &mut [u8], before: &[u8]) {
 }
 
 pub fn choice_name(packed: &[u8]) -> String {
+    if guessed(packed) {
+        return if perfect(packed) { "guess, perfect".into() } else { "guess".into() };
+    }
     format!("{}+{}+{}", FROMS[packed[0] as usize], PREDICTS[packed[1] as usize], CODERS[packed[2] as usize])
 }

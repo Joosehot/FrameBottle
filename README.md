@@ -142,3 +142,57 @@ unchanged: 5.0 ms a step.
 
 The clips are not in the repository. The 4K one is two seconds of *Big Buck
 Bunny* (c) Blender Foundation, CC BY 3.0, peach.blender.org.
+
+## Guess the frame (the lossless packer, added 2026-11-14)
+
+HotMotor's rule `from` has a third variant, `guess`
+([src/guess.rs](src/guess.rs)); with `--for size` HotMotor chooses it for
+every frame of filmed video.
+
+1. **GUESS.** A frame is cut into tiles of 16 x 16 pixels. Each sample is
+   guessed from what the player will have too: the frame before, whole,
+   and the samples of this frame already rebuilt to the left and above.
+   Three guessers offer a value: `still` (the same sample of the frame
+   before), `moved` (the frame before, changed as the neighbours changed)
+   and `near` (this frame's neighbours alone; the first frame has only
+   this). A judge weighs them by how wrong each was on the four
+   neighbours just rebuilt, and the guess is their mix.
+2. **CORRECT.** Only what the real sample differs by is kept. A tile whose
+   every correction is zero keeps one flag. A frame equal to the frame
+   before keeps eleven bytes.
+3. **PACK.** The corrections go through an adaptive range coder that
+   learns, per context (how large the corrections nearby were, which
+   guesser was best), how likely a zero, a sign and a size are. The bytes
+   lie in Strike's Nimbus, and Strike's lightning brands the pack. The
+   coder itself is Frame Bottle's own code: Strike has none.
+4. **UNPACK.** The player makes the same guesses and adds the corrections.
+   Every frame is checked against the SHA-256 of the frame as chopped. A
+   plane is cut into 16 bands of rows that are rebuilt side by side.
+
+Nuome's Golden Answer works out the report's numbers. It takes no part in
+the guess: it cannot be asked once for every sample.
+
+Measured on `guitar_10s.mp4` (1920 x 1080, 302 frames, 10 seconds; the
+other encodes were made with ffmpeg outside Frame Bottle):
+
+| | bytes | bits per pixel | every frame exact |
+|---|---|---|---|
+| raw RGB | | 24 | |
+| raw YUV 4:2:0 (the movie's own layout) | 939 340 800 | 12 | |
+| FFV1 | 141 083 635 | 1.802 | yes |
+| **Frame Bottle, guess** | **129 237 300** | **1.651** | **yes, 302 of 302** |
+| AV1 lossless (libaom) | 119 672 759 | 1.529 | yes |
+| H.264 lossless (x264) | 102 477 615 | 1.309 | yes |
+| the MP4 itself (H.264, lossy) | 15 281 386 | 0.195 | |
+| AV1, lossy (SVT-AV1, crf 30) | 2 159 426 | 0.028 | no |
+
+- Frames guessed perfectly: 0 of 302. Tiles guessed perfectly: 1 544 296
+  of 7 392 960 (20.9 %; a tile is 16 x 16 pixels of light or 8 x 8 of
+  colour).
+- Every frame unpacks identically (SHA-256 per frame, and byte for byte
+  against the frames ffmpeg decodes).
+- Packing: 0.1 s a frame. A step along the film at twice the frame rate:
+  about 8.6 ms with nothing in the window (the timings vary from run to
+  run, 6.5 to 11.6 ms were seen).
+- The guessers read the frame before only at the same place: nothing
+  follows motion yet. That is the main thing the two that beat it do.

@@ -34,6 +34,7 @@ pub struct Rules {
     pub poor_match: f64,
     pub ahead: usize,
     pub behind: usize,
+    pub bands: usize,
 }
 
 pub const DEFAULT_RULES: &str = include_str!("../rules.toml");
@@ -111,6 +112,7 @@ impl Rules {
             poor_match: num(smoother, "poor_match", "smoother")?,
             ahead: (num(player, "ahead", "player")? as usize).max(1),
             behind: num(player, "behind", "player")? as usize,
+            bands: (num(table("guess")?, "bands", "guess")? as usize).clamp(1, 4096),
         })
     }
 }

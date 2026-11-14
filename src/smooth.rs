@@ -165,8 +165,22 @@ pub fn between(geo: &Geometry, a: &[u8], b: &[u8], v: &Vectors, k: usize, n: usi
                     let (ax, ay) = ((-2 * dx * ka / n as i32) >> p.sx, (-2 * dy * ka / n as i32) >> p.sy);
                     let (bx_, by_) = ((2 * dx * kb / n as i32) >> p.sx, (2 * dy * kb / n as i32) >> p.sy);
                     let (ra, rb) = (cl(y + ay, p.h) * stride, cl(y + by_, p.h) * stride);
-                    let x_end = ((bx + 1) * bw_px).min(p.w);
-                    for x in bx * bw_px..x_end {
+                    let (x0, x_end) = (bx * bw_px, ((bx + 1) * bw_px).min(p.w));
+                    if x0 >= x_end {
+                        continue;
+                    }
+                    // The whole run of the block lies inside both frames: mixed slice by slice.
+                    let inside = |o: i32| x0 as i32 + o >= 0 && (x_end as i32 + o) as usize <= p.w;
+                    if bps == 1 && inside(ax) && inside(bx_) {
+                        let n = (x_end - x0) * px;
+                        let sa = &pa[ra + (x0 as i32 + ax) as usize * px..][..n];
+                        let sb = &pb[rb + (x0 as i32 + bx_) as usize * px..][..n];
+                        for ((o, a), b) in row[x0 * px..][..n].iter_mut().zip(sa).zip(sb) {
+                            *o = ((*a as u32 * wa + *b as u32 * wb + 128) >> 8) as u8;
+                        }
+                        continue;
+                    }
+                    for x in x0..x_end {
                         let (sa, sb) = (ra + cl(x as i32 + ax, p.w) * px, rb + cl(x as i32 + bx_, p.w) * px);
                         let o = x * px;
                         if bps == 1 {

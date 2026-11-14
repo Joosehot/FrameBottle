@@ -24,6 +24,7 @@ mod fstrike;
 mod bottle;
 mod chop;
 mod golden;
+mod guess;
 mod motor;
 mod pack;
 mod particle;
@@ -55,7 +56,7 @@ struct Packed {
 }
 
 fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str, before: &str) -> String {
-    bottle::sha(format!("fbottle pack 2\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}\n{before}", geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
+    bottle::sha(format!("fbottle pack 3 {}\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}\n{before}", guess::VERSION, geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
 }
 
 fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bool, rules: &Rules) -> Result<Packed, String> {
@@ -121,7 +122,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                     }
                 }
                 let best = pack::choose(geo, frame, before.map(|b| b.0), rules, &profile).remove(0);
-                let packed = pack::pack(geo, frame, before.map(|b| b.0), &best.choice);
+                let packed = pack::pack(geo, frame, before.map(|b| b.0), &best.choice, rules);
                 let leans = pack::leans(&packed);
                 let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
                 bottle::brand("pack", &key, &format!("{}\n{}", if leans { "tile" } else { "own" }, hashes.join("\n")));
@@ -353,6 +354,13 @@ fn run() -> Result<(), String> {
             println!("  original size       {original} bytes");
             println!("  Frame Bottle size   {bottled} bytes");
             println!("  compression ratio   original / bottle = {}", exact(&format!("What is {original} / {bottled}?"), 4));
+            println!("  bits per pixel      {} (raw RGB is 24, the movie's own YUV 4:2:0 is 12)", exact(&format!("What is {} / {}?", bottled * 8, nodes as u64 * (i.width * i.height) as u64), 4));
+            let perfect = b.choices()?.iter().filter(|c| c.0 == "guess, perfect").map(|c| c.1).sum::<usize>();
+            println!("  guessed perfectly   {perfect} of {nodes} frames (no correction at all)");
+            let (right, tiles) = b.guess_tiles()?;
+            if tiles > 0 {
+                println!("                      {right} of {tiles} tiles of 16 x 16 pixels = {}", exact(&format!("What is {right} / {tiles}?"), 4));
+            }
             println!("  frames unpacked     {raw} bytes; unpacked / bottle = {}", exact(&format!("What is {raw} / {bottled}?"), 4));
             println!("  original FPS        {}", exact(&format!("What is {} / {}?", i.fps.0, i.fps.1), 3));
             println!("  playback FPS        {} ({} guessed between each two nodes)", exact(&format!("What is {} * {smooth} / {}?", i.fps.0, i.fps.1), 3), smooth - 1);

@@ -222,18 +222,33 @@ impl Bottle {
                 start = start.checked_sub(1).ok_or("the first tile leans on nothing")?;
             }
         }
+        // A guessed tile waits for the frame before it; the others are unpacked at once.
+        let mut waiting: Vec<Option<Vec<u8>>> = Vec::new();
         let mut out: Vec<Vec<u8>> = (start..to)
             .into_par_iter()
             .map(|i| {
                 let packed = self.packed(i)?;
+                if crate::pack::guessed(&packed) {
+                    return Ok((Vec::new(), Some(packed)));
+                }
                 let res = crate::pack::uncode(&self.geo, &packed)?;
-                Ok(crate::pack::restore(&self.geo, &packed, &res))
+                Ok((crate::pack::restore(&self.geo, &packed, &res), None))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String>>()?
+            .into_iter()
+            .map(|(frame, guess)| {
+                waiting.push(guess);
+                frame
+            })
+            .collect();
         for i in 0..out.len() {
-            if self.index.nodes[start + i].leans {
-                let (done, rest) = out.split_at_mut(i);
-                let prev = done.last().map(|f| f.as_slice()).or(before).filter(|p| p.len() == rest[0].len());
+            let (done, rest) = out.split_at_mut(i);
+            let prev = done.last().map(|f| f.as_slice()).or(before);
+            if let Some(packed) = &waiting[i] {
+                // The same guesses as when it was packed, and the corrections added.
+                rest[0] = crate::guess::unpack(&self.geo, &packed[3..], prev)?;
+            } else if self.index.nodes[start + i].leans {
+                let prev = prev.filter(|p| p.len() == rest[0].len());
                 crate::pack::lean_on(&mut rest[0], prev.ok_or("a leaning tile was unpacked without the tile before it")?);
             }
         }
@@ -246,13 +261,23 @@ impl Bottle {
         Ok(out.split_off(from - start))
     }
 
+    /// (16 x 16 tiles guessed perfectly, tiles) over all guessed frames.
+    pub fn guess_tiles(&self) -> Result<(usize, usize), String> {
+        let mut n = (0, 0);
+        for i in 0..self.index.nodes.len() {
+            let t = crate::pack::guess_tiles(&self.packed(i)?);
+            n = (n.0 + t.0, n.1 + t.1);
+        }
+        Ok(n)
+    }
+
     /// How many nodes chose each way of packing.
     pub fn choices(&self) -> Result<Vec<(String, usize)>, String> {
         let mut n: HashMap<String, usize> = HashMap::new();
-        for node in &self.index.nodes {
-            let first = self.share(node.ports[0])?;
-            if first.len() >= 3 {
-                *n.entry(crate::pack::choice_name(&first)).or_default() += 1;
+        for i in 0..self.index.nodes.len() {
+            let packed = self.packed(i)?;
+            if packed.len() >= 3 {
+                *n.entry(crate::pack::choice_name(&packed)).or_default() += 1;
             }
         }
         let mut v: Vec<_> = n.into_iter().collect();

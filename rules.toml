@@ -1,7 +1,7 @@
 # Every number Frame Bottle's motor uses. The code holds the logic, this file the taste.
 
 # How many partial packs the beam keeps after each rule.
-beam = 3
+beam = 6
 
 # The axes a pack trades between, as the command's --for asks for them.
 [profile.size]    # the smallest bottle
@@ -16,13 +16,16 @@ size = 0.4
 
 # One rule per decision. Each variant says how it scores on the axes (0 to 1).
 
-# What a tile is told apart from: nothing (it stands on its own), or the tile before it
-# on the grid (only what differs from that tile is packed; it unpacks after that tile).
+# What a tile is told apart from: nothing (it stands on its own), the tile before it
+# on the grid (only what differs from that tile is packed; it unpacks after that tile),
+# or a guess of the whole tile (only the corrections to the guess are packed; the two
+# rules after this one have no say then).
 [rule.from]
 weight = 0.2
 variants = [
   { value = "own",  pack = 1.0, play = 1.0, size = 0.5 },
   { value = "tile", pack = 0.9, play = 0.6, size = 0.5 },
+  { value = "guess", pack = 0.5, play = 0.2, size = 0.5 },
 ]
 
 # What a pixel is guessed from, inside the tile.
@@ -52,6 +55,10 @@ size = 10.0
 # The sample: this many bands of this many rows, spread over the tile.
 sample_bands = 8
 band_rows = 16
+
+# The guess: a plane is cut into this many bands of rows, guessed side by side.
+[guess]
+bands = 16
 
 # The smoother: vectors between node A and node B.
 [smoother]
