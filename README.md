@@ -507,3 +507,23 @@ dictionaries lose nothing):
 - The player rebuilds the same bits: the dictionary's end hash matched, and
   every frame rebuilt from the books has the SHA-256 the packer recorded.
 - Against AV1 at the same quality a bottle is still about 12 times bigger.
+
+### Four ready-made patterns (`--four`)
+
+The book of block patterns with only four patterns, put in ready-made and
+never added to: the flattest wave one step down, one step up, and the next
+wave one step down, one step up. They are the four commonest on
+`guitar_10s.mp4` at coarse 20: 19.5 %, 9.7 %, 3.2 % and 3.1 % of the blocks
+that have corrections (35.5 % together).
+
+| coarse 20, 41.18 dB | bytes | saved |
+|---|---|---|
+| no dictionary | 3 598 135 | |
+| four ready-made patterns | 3 555 361 | 1.2 % |
+| the learning book (1024 a band) | 3 493 256 | 2.9 % |
+
+Not 30 %. The four patterns are a third of the blocks with corrections,
+but they are the cheapest third: a block with one wave one step long took
+only a few bits before, since the coder had already learned that such
+blocks are common. The bytes are in the blocks with many waves, and those
+are all different.

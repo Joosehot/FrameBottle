@@ -51,6 +51,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
              [--line]                    exact, but each sample first says whether it stayed what it was
              [--dictionary]              common bit patterns of the corrections are kept by label
+             [--four]                    the dictionary with only four ready-made patterns of block corrections
 fbottle verify <bottle> <movie>          every node against the movie's own frames
 fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
@@ -244,6 +245,22 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         let (blocks, hits, patterns) = books.iter().fold((0, 0, 0), |n, b| (n.0 + b.blocks, n.1 + b.hits, n.2 + b.patterns()));
         println!("BOOK   {patterns} patterns of block corrections at the end (in {} books); {hits} of {blocks} blocks with corrections were in a book ({:.2} %)", books.len(), 100.0 * hits as f64 / blocks.max(1) as f64);
     }
+    if std::env::var_os("FBOTT_PATTERNS").is_some() {
+        let mut all: std::collections::HashMap<Vec<(u8, i16)>, u64> = Default::default();
+        for b in &books {
+            for (w, n) in b.counts() {
+                *all.entry(w).or_default() += n as u64;
+            }
+        }
+        let mut v: Vec<_> = all.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let blocks: u64 = books.iter().map(|b| b.blocks).sum();
+        let mut so_far = 0;
+        for (w, n) in v.iter().take(12) {
+            so_far += n;
+            println!("pattern {:?}: {n} uses, {:.1} % of blocks with corrections (so far {:.1} %)", w, 100.0 * *n as f64 / blocks as f64, 100.0 * so_far as f64 / blocks as f64);
+        }
+    }
     println!("GRID   {n} frames as tiles of a {cols} x {rows} grid ({} x {} pixels)", cols * geo.width, rows * geo.height);
     println!("PACK   {} tiles packed, {} struck from Nimbus (already branded); {} lean on the tile before them", n - struck, struck, nodes.iter().filter(|n| n.leans).count());
     let out = out.unwrap_or_else(|| movie_path.with_extension("fbott"));
@@ -376,6 +393,10 @@ fn run() -> Result<(), String> {
             "--explain" => explain = true,
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
+            "--four" => {
+                rules.dictionary = true;
+                block::FOUR_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             "--line" => guess::BY_LINE.store(true, std::sync::atomic::Ordering::Relaxed),
             "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,

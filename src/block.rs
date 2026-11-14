@@ -196,6 +196,8 @@ pub struct Book {
     ticks: u64,
     hit: [u16; 2],
     rank_bits: [u16; 32],
+    /// A book of four patterns put in ready-made, which learns no others.
+    four: bool,
     /// Blocks with corrections, and how many of them were in the book.
     pub blocks: u64,
     pub hits: u64,
@@ -203,12 +205,33 @@ pub struct Book {
 
 const BOOK: usize = 1024;
 
+/// The books hold only the four ready-made patterns (the command's --four).
+pub static FOUR_ONLY: AtomicBool = AtomicBool::new(false);
+
 impl Book {
     pub fn new() -> Book {
-        Book { entries: Vec::new(), find: Default::default(), ranks: Vec::new(), oldest: Default::default(), waiting: Default::default(), ticks: 0, hit: [HALF; 2], rank_bits: [HALF; 32], blocks: 0, hits: 0 }
+        Book { entries: Vec::new(), find: Default::default(), ranks: Vec::new(), oldest: Default::default(), waiting: Default::default(), ticks: 0, hit: [HALF; 2], rank_bits: [HALF; 32], four: false, blocks: 0, hits: 0 }
+    }
+    /// The four commonest patterns of block corrections, ready-made: the flattest wave one
+    /// step down or up, and the next wave one step down or up (measured on the guitar clip:
+    /// 19.5 %, 9.7 %, 3.2 % and 3.1 % of the blocks that have corrections). Nothing is learned.
+    pub fn four() -> Book {
+        let mut b = Book::new();
+        b.four = true;
+        for w in [vec![(0u8, -1i16)], vec![(0, 1)], vec![(1, -1)], vec![(1, 1)]] {
+            b.entries.push((w.clone(), 1, 0, b.ranks.len()));
+            b.ranks.push(b.entries.len() - 1);
+            b.find.insert(w, b.entries.len() - 1);
+            b.oldest.insert((0, b.entries.len() - 1));
+        }
+        b
     }
     pub fn patterns(&self) -> usize {
         self.entries.len()
+    }
+    /// The patterns with how often each was used (for looking at which are common).
+    pub fn counts(&self) -> Vec<(Vec<(u8, i16)>, u32)> {
+        self.entries.iter().map(|e| (e.0.clone(), e.1)).collect()
     }
     fn used(&mut self, e: usize) {
         self.oldest.remove(&(self.entries[e].2, e));
@@ -226,6 +249,9 @@ impl Book {
     }
     /// A block's corrections that were not in the book: the second time, they enter it.
     fn saw(&mut self, w: Waves) {
+        if self.four {
+            return;
+        }
         if !self.waiting.remove(&w) {
             if self.waiting.len() >= 8192 {
                 self.waiting.clear();
@@ -635,13 +661,15 @@ fn smooth_seams(geo: &Geometry, frame: &mut [u8], coarse: u8, made: &Marks) {
 const FROM_BEFORE: u8 = 2;
 /// The frame's blocks were kept with the book of patterns.
 const BOOKS: u8 = 4;
+/// The books hold four ready-made patterns and learn no others.
+const FOUR: u8 = 8;
 
 /// One place for a book (or none) for each band.
-fn slots(books: Option<&mut Vec<Book>>, bands: usize) -> Vec<Option<&mut Book>> {
+fn slots(books: Option<&mut Vec<Book>>, bands: usize, four: bool) -> Vec<Option<&mut Book>> {
     match books {
         Some(b) => {
-            if b.len() != bands {
-                *b = (0..bands).map(|_| Book::new()).collect();
+            if b.len() != bands || b.iter().any(|x| x.four != four) {
+                *b = (0..bands).map(|_| if four { Book::four() } else { Book::new() }).collect();
             }
             b.iter_mut().map(Some).collect()
         }
@@ -688,6 +716,7 @@ pub struct How {
 /// length, the bands) and the frame as the player will rebuild it.
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>) -> (Vec<u8>, Vec<u8>) {
     let with_books = books.is_some();
+    let four = with_books && FOUR_ONLY.load(Ordering::Relaxed);
     let stack = stack.filter(|s| before.is_some() && s.len() == frame.len());
     // The top frame is what every still tile after it is a copy of: it is kept finer.
     let coarse = if before.is_none() { (coarse / 3).max(1) } else { coarse };
@@ -697,7 +726,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
     let mut rebuilt = vec![0u8; geo.frame_len()];
     let made = marks(geo);
     let work = cut(geo, &mut rebuilt, rows);
-    let places = slots(books, work.len());
+    let places = slots(books, work.len(), four);
     let done: Vec<Vec<u8>> = work
         .into_par_iter()
         .zip(places)
@@ -711,7 +740,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&
         })
         .collect();
     smooth_seams(geo, &mut rebuilt, coarse, &made);
-    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 })];
+    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -744,7 +773,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Opti
         coded.push(payload.get(data..data + len).ok_or("a frame of blocks is cut")?);
         data += len;
     }
-    let places = slots(if payload[0] & BOOKS != 0 { Some(books) } else { None }, work.len());
+    let places = slots(if payload[0] & BOOKS != 0 { Some(books) } else { None }, work.len(), payload[0] & FOUR != 0);
     work.into_par_iter().zip(coded).zip(places).for_each(|(((ty0, bufs), bytes), book)| {
         let mut c = Coder::Read(Decoder::new(bytes));
         band(geo, &t, None, before, stack, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
