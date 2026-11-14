@@ -2,7 +2,7 @@
 //!
 //! A frame is cut into the same 16 x 16 tiles. For each tile the packer
 //! looks for the same picture in the frame before, as the player rebuilt
-//! it, a few pixels away in any direction, to half a pixel; if it is there,
+//! it, a few pixels away in any direction, to a quarter of a pixel; if it is there,
 //! only the vector to it is kept (`moved`). If it is not, the tile is guessed as one flat
 //! value from the pixels above and to the left of it (`flat`). What the
 //! guess misses is not corrected pixel by pixel: each 8 x 8 block of it is
@@ -383,17 +383,58 @@ impl Pic<'_> {
 }
 
 impl Pic<'_> {
-    /// The plane at a place counted in half pixels: between two pixels their mean,
-    /// between four the mean of the four.
+    /// The light plane at a place counted in quarter pixels.
+    fn quarter(&self, x4: i32, y4: i32) -> i32 {
+        quarter_of(&|x, y| self.at(x, y) as i32, x4, y4)
+    }
+
+    /// A colour plane at a place counted in eighths of a pixel (a quarter of a light
+    /// pixel): the four pixels around it, each weighed by how near it is.
     #[inline(always)]
-    fn half(&self, x2: i32, y2: i32) -> i32 {
-        let (x, y) = (x2 >> 1, y2 >> 1);
-        match (x2 & 1, y2 & 1) {
-            (0, 0) => self.at(x, y) as i32,
-            (1, 0) => (self.at(x, y) as i32 + self.at(x + 1, y) as i32 + 1) >> 1,
-            (0, _) => (self.at(x, y) as i32 + self.at(x, y + 1) as i32 + 1) >> 1,
-            _ => (self.at(x, y) as i32 + self.at(x + 1, y) as i32 + self.at(x, y + 1) as i32 + self.at(x + 1, y + 1) as i32 + 2) >> 2,
+    fn eighth(&self, x8: i32, y8: i32) -> i32 {
+        let (x, y, fx, fy) = (x8 >> 3, y8 >> 3, x8 & 7, y8 & 7);
+        if fx == 0 && fy == 0 {
+            return self.at(x, y) as i32;
         }
+        let g = |dx: i32, dy: i32| self.at(x + dx, y + dy) as i32;
+        ((8 - fx) * (8 - fy) * g(0, 0) + fx * (8 - fy) * g(1, 0) + (8 - fx) * fy * g(0, 1) + fx * fy * g(1, 1) + 32) >> 6
+    }
+}
+
+/// A picture at a place counted in quarter pixels; `g` gives its whole pixels.
+/// Half way between two pixels is six pixels in a row weighed 1, -5, 20, 20, -5, 1
+/// (H.264's own filter: a movie that was H.264 once moved its blocks with exactly
+/// this); a quarter is the mean of the two places next to it.
+#[inline(always)]
+fn quarter_of<G: Fn(i32, i32) -> i32>(g: &G, x4: i32, y4: i32) -> i32 {
+    let (x, y, fx, fy) = (x4 >> 2, y4 >> 2, x4 & 3, y4 & 3);
+    if fx == 0 && fy == 0 {
+        return g(x, y);
+    }
+    let clip = |v: i32| v.clamp(0, 255);
+    let mean = |a: i32, b: i32| (a + b + 1) >> 1;
+    let across = |x: i32, y: i32| g(x - 2, y) - 5 * g(x - 1, y) + 20 * g(x, y) + 20 * g(x + 1, y) - 5 * g(x + 2, y) + g(x + 3, y);
+    let down = |x: i32, y: i32| g(x, y - 2) - 5 * g(x, y - 1) + 20 * g(x, y) + 20 * g(x, y + 1) - 5 * g(x, y + 2) + g(x, y + 3);
+    // Half way to the right of a pixel, half way below it, and the middle of four.
+    let right = |dx: i32, dy: i32| clip((across(x + dx, y + dy) + 16) >> 5);
+    let below = |dx: i32, dy: i32| clip((down(x + dx, y + dy) + 16) >> 5);
+    let middle = || clip((across(x, y - 2) - 5 * across(x, y - 1) + 20 * across(x, y) + 20 * across(x, y + 1) - 5 * across(x, y + 2) + across(x, y + 3) + 512) >> 10);
+    match (fx, fy) {
+        (1, 0) => mean(g(x, y), right(0, 0)),
+        (2, 0) => right(0, 0),
+        (3, 0) => mean(g(x + 1, y), right(0, 0)),
+        (0, 1) => mean(g(x, y), below(0, 0)),
+        (0, 2) => below(0, 0),
+        (0, 3) => mean(g(x, y + 1), below(0, 0)),
+        (2, 2) => middle(),
+        (2, 1) => mean(right(0, 0), middle()),
+        (2, 3) => mean(middle(), right(0, 1)),
+        (1, 2) => mean(below(0, 0), middle()),
+        (3, 2) => mean(middle(), below(1, 0)),
+        (1, 1) => mean(right(0, 0), below(0, 0)),
+        (3, 1) => mean(right(0, 0), below(1, 0)),
+        (1, 3) => mean(below(0, 0), right(0, 1)),
+        _ => mean(below(1, 0), right(0, 1)),
     }
 }
 
@@ -423,43 +464,71 @@ fn unlike(s: &[u8; 256], before: &Pic, x: i32, y: i32, limit: u32) -> u32 {
     sum
 }
 
-/// Where in the frame before the tile is: the vector in half pixels, and how unlike
-/// it still is. Whole pixels are looked through first, then the eight half-pixel
-/// places around the best.
+/// The frame before around a tile at a whole-pixel place: the tile and 4 pixels more on
+/// every side, cut out once so that the fine search need not look at the frame's edges.
+const AROUND: i32 = 4;
+const CUT: usize = 16 + 2 * AROUND as usize;
+
+fn cut_out(before: &Pic, x: i32, y: i32) -> [u8; CUT * CUT] {
+    let mut c = [0u8; CUT * CUT];
+    for j in 0..CUT as i32 {
+        for i in 0..CUT as i32 {
+            c[(j as usize) * CUT + i as usize] = before.at(x - AROUND + i, y - AROUND + j);
+        }
+    }
+    c
+}
+
+/// How unlike the tile and the cut-out are, the tile shifted by (qx, qy) quarter pixels.
+fn unlike_fine(s: &[u8; 256], cut: &[u8; CUT * CUT], qx: i32, qy: i32, limit: u32) -> u32 {
+    let g = |x: i32, y: i32| cut[((y + AROUND) as usize) * CUT + (x + AROUND) as usize] as i32;
+    let mut sum = 0u32;
+    for j in 0..16 {
+        for i in 0..16 {
+            sum += (s[(j * 16 + i) as usize] as i32).abs_diff(quarter_of(&g, 4 * i + qx, 4 * j + qy));
+        }
+        if sum >= limit {
+            return sum;
+        }
+    }
+    sum
+}
+
+/// Where in the frame before the tile is: the vector in quarter pixels, and how
+/// unlike it still is. Whole pixels are looked through first, then the eight
+/// half-pixel places around the best, then the eight quarter-pixel places around that.
 fn find(s: &[u8; 256], before: &Pic, x0: i32, y0: i32, (range, bias): (i32, u32), left: (i32, i32)) -> (i32, i32, u32) {
     let still = unlike(s, before, x0, y0, u32::MAX);
-    let (mut dx, mut dy, mut whole) = find_whole(s, before, x0, y0, range, (left.0 >> 1, left.1 >> 1));
+    let (mut dx, mut dy, mut whole) = find_whole(s, before, x0, y0, range, (left.0 >> 2, left.1 >> 2));
     // A tile is taken to have moved only when that is clearly more like it than standing
     // still: a vector that follows the grain blurs a still picture a little more each frame.
     if (dx, dy) != (0, 0) && whole + bias >= still {
         (dx, dy, whole) = (0, 0, still);
     }
-    let mut best = (2 * dx, 2 * dy, whole);
+    let mut best = (4 * dx, 4 * dy, whole);
     if whole <= 256 {
         return best;
     }
-    let whole_best = whole;
-    for hy in -1..=1 {
-        for hx in -1..=1 {
-            if (hx, hy) == (0, 0) {
-                continue;
-            }
-            let mut sum = 0u32;
-            'tile: for j in 0..16 {
-                for i in 0..16 {
-                    sum += (s[(j * 16 + i) as usize] as i32).abs_diff(before.half(2 * (x0 + dx + i) + hx, 2 * (y0 + dy + j) + hy));
+    // Each finer step is kept only if it is clearly more like the tile than the coarser one.
+    let cut = cut_out(before, x0 + dx, y0 + dy);
+    for (step, gain) in [(2, bias / 2), (1, bias / 4)] {
+        let (cx, cy, coarser) = best;
+        let mut finer = best;
+        for hy in -1..=1 {
+            for hx in -1..=1 {
+                if (hx, hy) == (0, 0) {
+                    continue;
                 }
-                if sum >= best.2 {
-                    break 'tile;
+                let (vx, vy) = (cx + hx * step, cy + hy * step);
+                let sum = unlike_fine(s, &cut, vx - 4 * dx, vy - 4 * dy, finer.2);
+                if sum < finer.2 {
+                    finer = (vx, vy, sum);
                 }
-            }
-            if sum < best.2 {
-                best = (2 * dx + hx, 2 * dy + hy, sum);
             }
         }
-    }
-    if best.2 + bias / 2 >= whole_best {
-        best = (2 * dx, 2 * dy, whole_best);
+        if finer.2 + gain < coarser {
+            best = finer;
+        }
     }
     best
 }
@@ -569,7 +638,8 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, s
                     }
                     if n == 0 { 128 } else { ((sum + n / 2) / n) as i32 }
                 };
-                let from = if from_stack { Some((pic(geo, &at, stack.unwrap(), i), 0, 0)) } else { vector.map(|(dx, dy)| (pic(geo, &at, before.unwrap(), i), dx >> p.sx, dy >> p.sy)) };
+                // The vector is in quarters of a light pixel, which are eighths of a colour pixel.
+                let from = if from_stack { Some((pic(geo, &at, stack.unwrap(), i), 0, 0)) } else { vector.map(|(dx, dy)| (pic(geo, &at, before.unwrap(), i), dx, dy)) };
                 for b in 0..(size / 8) * (size / 8) {
                     let (bx, by) = (px0 + (b % (size / 8)) * 8, py0 + (b / (size / 8)) * 8);
                     if bx >= p.w || by >= p.h {
@@ -579,7 +649,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, s
                     if let Some((bp, dx, dy)) = &from {
                         for j in 0..8 {
                             for k in 0..8 {
-                                guess[j * 8 + k] = bp.half(2 * (bx + k) as i32 + dx, 2 * (by + j) as i32 + dy);
+                                guess[j * 8 + k] = if i == 0 { bp.quarter(4 * (bx + k) as i32 + dx, 4 * (by + j) as i32 + dy) } else { bp.eighth(8 * (bx + k) as i32 + dx, 8 * (by + j) as i32 + dy) };
                             }
                         }
                     }

@@ -565,3 +565,22 @@ rebuilt are the same, and the player's dictionary ended as the packer's:
 Seen on the way: the bottle is about 280 000 bytes bigger than its frames'
 bytes at this size (8 %). That is the index: for each of the 3322 shares
 its SHA-256 as 64 letters, its place and length, and each node's ports.
+
+### Vectors to a quarter of a pixel, with H.264's filter (2026-11-15)
+
+The goal now: over 45 dB, and smaller than AV1 there (AV1 is about 1.7 MB
+at 45.4 dB on `guitar_10s.mp4`).
+
+A tile's vector is now counted in quarters of a pixel. Half way between two
+pixels is six pixels in a row weighed 1, -5, 20, 20, -5, 1, and a quarter
+is the mean of the two places next to it: H.264's own filter, since a movie
+that was H.264 once moved its blocks with exactly this. Colour planes take
+the four pixels around the place, weighed by how near each is. The search
+goes whole pixels, then half, then quarter, each finer step kept only if it
+is clearly nearer; it works on a cut-out of the frame before, so packing
+takes 11 s for the 10 s clip as before.
+
+| `guitar_10s.mp4` | half pixel | quarter pixel |
+|---|---|---|
+| coarse 8 | 9 400 443 bytes, 45.44 dB | 7 839 470 bytes, 45.48 dB (16.6 % smaller) |
+| coarse 20 | 3 598 135 bytes, 41.18 dB | 3 209 251 bytes, 41.47 dB (10.8 % smaller, 0.3 dB nearer) |
