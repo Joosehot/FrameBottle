@@ -105,6 +105,7 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
     let spent: [std::sync::atomic::AtomicU64; 4] = Default::default();
     let add = |i: usize, t: Instant| spent[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut prev: Option<Vec<u8>> = None;
+    let mut chain = bottle::Chain::new();
     let mut closed = false;
     for start in (0..n).step_by(rules.ahead) {
         let t = Instant::now();
@@ -120,11 +121,13 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
         // Only the unbroken run from the start is struck: what follows a gap is unpacked in order.
         let have = found.iter().take_while(|f| f.is_some()).count();
         let mut frames: Vec<(Vec<u8>, bool)> = found.into_iter().take(have).flatten().map(|f| (f, true)).collect();
+        // The frames struck from the window are laid on the chain too: the next ones lean on them.
+        for f in &frames {
+            chain.feed(&f.0);
+        }
         if start + have < end {
-            // A leaning tile takes the frame before it: the one just struck, or the last one played.
             let t = Instant::now();
-            let before = frames.last().map(|f| f.0.as_slice()).or(prev.as_deref());
-            let unpacked = b.frames(start + have, end, before)?;
+            let unpacked = b.frames(start + have, end, &mut chain)?;
             add(0, t);
             frames.extend(unpacked.into_iter().map(|f| (f, false)));
         }

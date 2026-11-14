@@ -245,7 +245,8 @@ fn differ(frame: &[u8], before: &[u8]) -> Vec<u8> {
 /// until the coder is chosen it scores how few bits the sample would need,
 /// with the coder chosen too it packs the sample and scores what it saved.
 /// `before` is the tile before this one on the grid, if there is one.
-pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules, profile: &[f64; 3]) -> Vec<motor::Candidate> {
+/// `hammer` is what the Hammer's stack guesses for this tile.
+pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, rules: &Rules, profile: &[f64; 3]) -> Vec<motor::Candidate> {
     let leaning: Option<Vec<u8>> = before.map(|b| differ(frame, b));
     let mut samples: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
     let mut guessed: Option<(usize, usize)> = None;
@@ -253,7 +254,7 @@ pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules
         let from = id(&FROMS, motor::get(choice, "from").unwrap());
         if from == 2 {
             // A guessed tile: the sample is guessed and corrected as the pack would be.
-            let (coded, raw) = *guessed.get_or_insert_with(|| crate::guess::sample(geo, frame, before, rules));
+            let (coded, raw) = *guessed.get_or_insert_with(|| crate::guess::sample(geo, frame, before, hammer, rules));
             let share = coded as f64 / raw.max(1) as f64;
             let bonus = rules.judge_size * profile[2] * (1.0 - share);
             return (bonus, vec![format!("+{bonus:.2} size: the sample guessed and corrected is {:.1}% of itself", share * 100.0)]);
@@ -276,11 +277,11 @@ pub fn choose(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules
 }
 
 /// The tile packed by this choice: what it leans on, the guess, the coder, the coder's bytes.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, choice: &Choice, rules: &Rules) -> Vec<u8> {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, choice: &Choice, rules: &Rules) -> Vec<u8> {
     let from = id(&FROMS, motor::get(choice, "from").unwrap());
     if from == 2 {
         let mut out = vec![2, 0, 0];
-        out.extend(crate::guess::pack(geo, frame, before, rules.bands));
+        out.extend(crate::guess::pack(geo, frame, before, hammer, rules.bands));
         return out;
     }
     let leaning;

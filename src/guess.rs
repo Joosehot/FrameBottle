@@ -15,7 +15,13 @@
 //!   fraction per plane. Nuome's Golden Answer derives the fraction (the
 //!   light of this plane over the light of the same plane before, in its
 //!   logical kind) when the frame is packed, and the fraction is kept in
-//!   the bottle, so the player needs no Nuome to make the same guess.
+//!   the bottle, so the player needs no Nuome to make the same guess;
+//! - `hammer`: the Hammer's stack. Every frame so far lies on the others,
+//!   so each pixel is one line of values through time, the top frame
+//!   first. The stack holds, for each pixel, where its line has settled
+//!   (each new frame moves it a quarter of the way to its value). A pixel
+//!   that stays what it was is guessed right from its line, and the grain
+//!   of a single frame does not shake the guess as it shakes `still`.
 //!
 //! The one that was least wrong on the neighbours just rebuilt makes the
 //! guess (HotMotor's way: variants, and a judge that scores them where they
@@ -36,7 +42,7 @@ use rayon::prelude::*;
 
 /// The guesser as it is now. A change to how it guesses or codes changes this, so that
 /// the lightning does not strike a pack made by an older guesser.
-pub const VERSION: &str = "guess 13";
+pub const VERSION: &str = "guess 17";
 
 const TOP: u32 = 1 << 24;
 const BITS: u32 = 12;
@@ -154,7 +160,7 @@ fn step(near: u32) -> usize {
 
 /// What the coder has learned so far in one band.
 struct Learned {
-    zero: [u16; STEPS * 4 * 3],
+    zero: [u16; STEPS * 5 * 3],
     sign: [u16; 9],
     length: [u16; STEPS * 8],
     digits: [u16; 9 * 8],
@@ -164,7 +170,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { zero: [HALF; STEPS * 4 * 3], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3] }
+        Learned { zero: [HALF; STEPS * 5 * 3], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3] }
     }
 }
 
@@ -179,7 +185,7 @@ struct Place {
 }
 
 fn write(e: &mut Encoder, l: &mut Learned, at: &Place, v: i32) {
-    e.bit(&mut l.zero[(at.step * 4 + at.who) * 3 + at.quiet], v != 0);
+    e.bit(&mut l.zero[(at.step * 5 + at.who) * 3 + at.quiet], v != 0);
     if v == 0 {
         return;
     }
@@ -199,7 +205,7 @@ fn write(e: &mut Encoder, l: &mut Learned, at: &Place, v: i32) {
 }
 
 fn read(d: &mut Decoder, l: &mut Learned, at: &Place) -> i32 {
-    if !d.bit(&mut l.zero[(at.step * 4 + at.who) * 3 + at.quiet]) {
+    if !d.bit(&mut l.zero[(at.step * 5 + at.who) * 3 + at.quiet]) {
         return 0;
     }
     let negative = d.bit(&mut l.sign[at.signs]);
@@ -231,14 +237,16 @@ struct Band<'a> {
     fix: Vec<i8>,
     fix_up: Vec<i8>,
     /// How wrong each guesser (still, moved, near, golden) was, this row and above.
-    wrong: [Vec<u8>; 4],
-    wrong_up: [Vec<u8>; 4],
+    wrong: [Vec<u8>; 5],
+    wrong_up: [Vec<u8>; 5],
+    /// The same row of the Hammer's stack.
+    stack: Option<&'a [u8]>,
     /// Golden's guess for each value a sample had in the frame before; None when it says "the same".
     golden: Option<[u8; 256]>,
     /// The same row of the frame before, and the row above it there.
     before: Option<&'a [u8]>,
     before_up: Option<&'a [u8]>,
-    offers: [u8; 4],
+    offers: [u8; 5],
 }
 
 impl<'a> Band<'a> {
@@ -251,12 +259,13 @@ impl<'a> Band<'a> {
             has_up: false,
             fix: vec![0; n],
             fix_up: vec![0; n],
-            wrong: [vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
-            wrong_up: [vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
+            wrong: [vec![0; n], vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
+            wrong_up: [vec![0; n], vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
+            stack: None,
             golden,
             before: None,
             before_up: None,
-            offers: [0; 4],
+            offers: [0; 5],
         }
     }
 
@@ -288,7 +297,7 @@ impl<'a> Band<'a> {
                 (false, Some(q)) => self.up[i] as i32 - q[i] as i32,
                 (false, None) => 0,
             };
-            self.offers = [still as u8, (still + change).clamp(0, 255) as u8, near as u8, self.golden.map_or(still as u8, |g| g[still as usize])];
+            self.offers = [still as u8, (still + change).clamp(0, 255) as u8, near as u8, self.golden.map_or(still as u8, |g| g[still as usize]), self.stack.map_or(still as u8, |h| h[i])];
             // The judge: how wrong each was on the sample to the left and the one above.
             let right = i + px < self.row.len();
             let score = |g: usize| {
@@ -297,22 +306,28 @@ impl<'a> Band<'a> {
                     + (if up && left { self.wrong_up[g][i - px] as u32 } else { 0 })
                     + (if up && right { self.wrong_up[g][i + px] as u32 } else { 0 })
             };
-            let (s0, s1, s2) = (score(0), score(1), score(2));
-            who = if s0 <= s1 && s0 <= s2 { 0 } else if s1 <= s2 { 1 } else { 2 };
-            // Golden speaks only where it says something else than `still` (else `still` would count twice).
-            let differs = self.golden.is_some() && self.offers[3] != self.offers[0];
-            let s3 = if differs { score(3) } else { u32::MAX };
-            if s3 < s0.min(s1).min(s2) {
-                who = 3;
+            // Golden and the Hammer speak only where they say something else than `still`
+            // (else `still` would be heard twice or three times).
+            let speaks = [true, true, true, self.golden.is_some() && self.offers[3] != self.offers[0], self.stack.is_some() && self.offers[4] != self.offers[0]];
+            let mut best = u32::MAX;
+            let (mut sum, mut total) = (0u32, 0u32);
+            for g in 0..5 {
+                if !speaks[g] {
+                    continue;
+                }
+                let s = score(g);
+                if s < best {
+                    best = s;
+                    who = g;
+                }
+                // Each speaks as loud as it was right: the guess is their mix.
+                let w = ((1u32 << 20) / ((s + 2) * (s + 2))).max(1);
+                sum += w;
+                total += self.offers[g] as u32 * w;
             }
-            // Each speaks as loud as it was right: the guess is their mix.
-            let w = |s: u32| ((1u32 << 20) / ((s + 2) * (s + 2))).max(1);
-            let (w0, w1, w2) = (w(s0), w(s1), w(s2));
-            let w3 = if differs { w(s3) } else { 0 };
-            let sum = w0 + w1 + w2 + w3;
-            mixed = ((self.offers[0] as u32 * w0 + self.offers[1] as u32 * w1 + self.offers[2] as u32 * w2 + self.offers[3] as u32 * w3 + sum / 2) / sum) as u8;
+            mixed = ((total + sum / 2) / sum) as u8;
         } else {
-            self.offers = [near as u8; 4];
+            self.offers = [near as u8; 5];
             mixed = near as u8;
         }
         let (fl, fu) = (if left { self.fix[i - px] as i32 } else { 0 }, if up { self.fix_up[i] as i32 } else { 0 });
@@ -332,7 +347,7 @@ impl<'a> Band<'a> {
     fn learn(&mut self, i: usize, real: u8, fix: i8) {
         self.row[i] = real;
         self.fix[i] = fix;
-        for g in 0..4 {
+        for g in 0..5 {
             self.wrong[g][i] = real.abs_diff(self.offers[g]);
         }
     }
@@ -350,6 +365,48 @@ impl<'a> Band<'a> {
     }
 }
 
+/// The Hammer: every frame so far, one on the other, so that each pixel is
+/// a line of values through time. It starts at the top frame and takes the
+/// next and the next until the last. For each pixel the stack keeps where
+/// its line has settled; a new frame moves it a quarter of the way to the
+/// pixel's new value. The player strikes the same frames in the same order,
+/// so its stack is the same.
+pub struct Hammer {
+    /// Where each line has settled, in 64ths of a value.
+    stack: Vec<u16>,
+    /// The same to the nearest whole value: the Hammer's guess for the next frame.
+    flat: Vec<u8>,
+    frames: usize,
+}
+
+impl Hammer {
+    pub fn new() -> Hammer {
+        Hammer { stack: Vec::new(), flat: Vec::new(), frames: 0 }
+    }
+    /// The next frame is laid on the stack.
+    pub fn strike(&mut self, frame: &[u8]) {
+        if self.frames == 0 || self.stack.len() != frame.len() {
+            self.stack = frame.iter().map(|v| (*v as u16) << 6).collect();
+            self.flat = frame.to_vec();
+        } else {
+            for ((h, f), v) in self.stack.iter_mut().zip(self.flat.iter_mut()).zip(frame) {
+                *h = (*h as i32 + ((((*v as i32) << 6) - *h as i32 + 2) >> 2)) as u16;
+                *f = ((*h + 32) >> 6) as u8;
+            }
+        }
+        self.frames += 1;
+    }
+    /// What the stack guesses for the next frame; None before the top frame.
+    pub fn guess(&self) -> Option<&[u8]> {
+        (self.frames > 0).then_some(&self.flat[..])
+    }
+}
+
+/// One plane of a frame, if there is a frame.
+fn plane_of(frame: Option<&[u8]>, at: usize, len: usize) -> Option<&[u8]> {
+    frame.map(|f| &f[at..at + len])
+}
+
 /// A frame is cut into tiles of 16 x 16 pixels (8 x 8 where a plane is halved).
 const TILE: usize = 16;
 
@@ -362,7 +419,7 @@ fn tile(p: &Plane) -> (usize, usize) {
 /// starts with one flag per tile: guessed perfectly, or not. Only the tiles
 /// that were not have corrections after it. Returns the bytes, the tiles
 /// guessed perfectly, and the tiles.
-fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize) -> (Vec<u8>, usize, usize) {
+fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize) -> (Vec<u8>, usize, usize) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
@@ -372,6 +429,7 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, golden: Option<[u8; 25
     let mut places: Vec<Place> = Vec::with_capacity((y1 - y0) * stride);
     for y in y0..y1 {
         band.at_row(before, y, stride);
+        band.stack = hammer.map(|h| &h[y * stride..(y + 1) * stride]);
         let row = &real[y * stride..(y + 1) * stride];
         for (i, x) in row.iter().enumerate() {
             let (g, place) = band.guess(i);
@@ -409,7 +467,8 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, golden: Option<[u8; 25
 /// Rows `y0..y1` of a plane rebuilt into `out` (those rows only): the same
 /// guesses, and the corrections added where a tile's flag says it has any.
 /// `coded` None means no tile needed one.
-fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize, out: &mut [u8]) {
+#[allow(clippy::too_many_arguments)]
+fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, hammer: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize, out: &mut [u8]) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
@@ -427,6 +486,7 @@ fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, golden: Optio
             }
         }
         band.at_row(before, y, stride);
+        band.stack = hammer.map(|h| &h[y * stride..(y + 1) * stride]);
         let row = &mut out[(y - y0) * stride..(y - y0 + 1) * stride];
         for (i, x) in row.iter_mut().enumerate() {
             let (g, place) = band.guess(i);
@@ -519,7 +579,8 @@ pub fn from_before(payload: &[u8]) -> bool {
 /// GUESS + CORRECT + the coder: flags, the number of bands, the tiles guessed
 /// perfectly and the tiles, then each band's length and bytes, plane by
 /// plane. A frame guessed perfectly keeps those first eleven bytes only.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize) -> Vec<u8> {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, bands: usize) -> Vec<u8> {
+    let hammer = hammer.filter(|h| before.is_some() && h.len() == frame.len());
     let gains: Vec<(u32, u32)> = match before {
         Some(b) if b != frame => ask_golden(geo, frame, b),
         _ => vec![(1, 1); geo.planes.len()],
@@ -546,7 +607,8 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize) -
         .par_iter()
         .map(|(i, y0, y1)| {
             let p = &geo.planes[*i];
-            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), golden_table(gains[*i]), *y0, *y1)
+            let part = |f| plane_of(f, at[*i], p.len());
+            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), golden_table(gains[*i]), *y0, *y1)
         })
         .collect();
     let (perfect, tiles) = done.iter().fold((0, 0), |n, d| (n.0 + d.1, n.1 + d.2));
@@ -572,7 +634,8 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize) -
 }
 
 /// UNPACK: the frame rebuilt from the same guesses and its corrections.
-pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<Vec<u8>, String> {
+pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let hammer = hammer.filter(|h| from_before(payload) && h.len() == geo.frame_len());
     if payload.len() < HEAD {
         return Err("not a guessed frame".into());
     }
@@ -616,14 +679,16 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<V
     work.into_par_iter().for_each(|(i, y0, coded, chunk)| {
         let p = &geo.planes[i];
         let y1 = y0 + chunk.len() / p.stride();
-        rebuild(p, coded, before.map(|b| &b[at[i]..at[i] + p.len()]), golden[i], y0, y1, chunk);
+        let part = |f| plane_of(f, at[i], p.len());
+        rebuild(p, coded, part(before), part(hammer), golden[i], y0, y1, chunk);
     });
     Ok(out)
 }
 
 /// For HotMotor's size judge: the sample bands of the tile, guessed and
 /// corrected as a pack would; returns (coded bytes, sample bytes).
-pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules) -> (usize, usize) {
+pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<&[u8]>, rules: &Rules) -> (usize, usize) {
+    let hammer = hammer.filter(|h| before.is_some() && h.len() == frame.len());
     let at = geo.offsets();
     let mut jobs = Vec::new();
     for (i, p) in geo.planes.iter().enumerate() {
@@ -637,7 +702,8 @@ pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules
         .par_iter()
         .map(|(i, y0, y1)| {
             let p = &geo.planes[*i];
-            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), None, *y0, *y1).0.len()
+            let part = |f| plane_of(f, at[*i], p.len());
+            correct(p, &frame[at[*i]..at[*i] + p.len()], part(before), part(hammer), None, *y0, *y1).0.len()
         })
         .sum();
     let raw: usize = jobs.iter().map(|(i, y0, y1)| (y1 - y0) * geo.planes[*i].stride()).sum();
@@ -668,13 +734,13 @@ mod tests {
                 b[i] = b[i].wrapping_add(3);
             }
             for bands in [1, 3, 16] {
-                let first = pack(&geo, &a, None, bands);
-                assert_eq!(unpack(&geo, &first, None).unwrap(), a, "{fmt} first, {bands} bands");
-                let second = pack(&geo, &b, Some(&a), bands);
-                assert_eq!(unpack(&geo, &second, Some(&a)).unwrap(), b, "{fmt} second, {bands} bands");
-                let same = pack(&geo, &a, Some(&a), bands);
+                let first = pack(&geo, &a, None, None, bands);
+                assert_eq!(unpack(&geo, &first, None, None).unwrap(), a, "{fmt} first, {bands} bands");
+                let second = pack(&geo, &b, Some(&a), Some(&a), bands);
+                assert_eq!(unpack(&geo, &second, Some(&a), Some(&a)).unwrap(), b, "{fmt} second, {bands} bands");
+                let same = pack(&geo, &a, Some(&a), Some(&a), bands);
                 assert!(perfect(&same) && same.len() == HEAD, "{fmt}: a frame equal to the one before is guessed perfectly");
-                assert_eq!(unpack(&geo, &same, Some(&a)).unwrap(), a);
+                assert_eq!(unpack(&geo, &same, Some(&a), Some(&a)).unwrap(), a);
             }
         }
     }

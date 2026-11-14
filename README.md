@@ -220,3 +220,25 @@ Every frame still unpacks identically in both. Golden's guesser helps only
 where the light changes, and only a little, because `moved` already
 follows what the neighbours did. Packing asks Golden three questions a
 frame (about 22 ms each).
+
+### The Hammer (added last)
+
+Every frame so far lies on the others, so each pixel is one line of
+values through time: the top frame first, then the next and the next
+until the last. For each pixel the Hammer's stack keeps where its line has
+settled; each new frame moves it a quarter of the way to the pixel's new
+value. Nothing in the stack is guessed. The fifth guesser, `hammer`, reads
+the stack: a pixel that stays what it was is guessed right from its line,
+and the grain of one frame does not shake that guess as it shakes `still`.
+Like Golden, it counts only where it says something else than `still`.
+
+The player lays the same frames on its own stack in the same order, so a
+guessed frame now needs every frame before it, not only the last one
+(`Chain` in [src/bottle.rs](src/bottle.rs)).
+
+Measured on `guitar_10s.mp4`: 128 886 416 bytes, 1.6465 bits per pixel
+(129 246 961 and 1.6511 without the Hammer: 0.28 % smaller); 1 547 410 of
+7 392 960 tiles guessed perfectly; all 302 frames identical. A quarter of
+the way was the best of a half, a quarter and an eighth. A step along the
+film takes about 12.2 ms now (about 10 before): five guessers are asked
+for every sample.

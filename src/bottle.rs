@@ -141,6 +141,30 @@ pub fn glue(out: &Path, mut index: Index, share_hashes: &[String]) -> Result<u64
     Ok(at + z.len() as u64 + 16)
 }
 
+/// What the frames so far leave for the next one: the frame before it, and the
+/// Hammer's stack of all of them.
+pub struct Chain {
+    /// The node the chain stands before.
+    pub at: usize,
+    pub before: Option<Vec<u8>>,
+    pub hammer: crate::guess::Hammer,
+}
+
+impl Chain {
+    pub fn new() -> Chain {
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new() }
+    }
+    /// The next frame is known: it becomes the frame before, and is laid on the stack.
+    pub fn feed(&mut self, frame: &[u8]) {
+        self.hammer.strike(frame);
+        match &mut self.before {
+            Some(b) if b.len() == frame.len() => b.copy_from_slice(frame),
+            b => *b = Some(frame.to_vec()),
+        }
+        self.at += 1;
+    }
+}
+
 pub struct Bottle {
     file: Mutex<std::fs::File>,
     pub index: Index,
@@ -210,21 +234,23 @@ impl Bottle {
     }
 
     /// UNPACK: the frames of the nodes `from..to`, exactly as they were chopped (each
-    /// checked by its hash). `before` is the frame of node `from - 1` if the caller has
-    /// it; without it the run starts further back, at a tile that stands on its own.
-    /// All nodes are unpacked at once; a leaning tile is then put on the frame before
-    /// it, in order.
-    pub fn frames(&self, from: usize, to: usize, before: Option<&[u8]>) -> Result<Vec<Vec<u8>>, String> {
+    /// checked by its hash). `chain` is what the frames before `from` left: the frame
+    /// before, and the Hammer's stack. A chain that stands elsewhere is made again
+    /// from the top frame. Tiles that stand on their own are unpacked at once; a
+    /// leaning or guessed tile then takes what the chain holds, in order.
+    pub fn frames(&self, from: usize, to: usize, chain: &mut Chain) -> Result<Vec<Vec<u8>>, String> {
         use rayon::prelude::*;
-        let mut start = from;
-        if before.is_none() {
-            while self.index.nodes[start].leans {
-                start = start.checked_sub(1).ok_or("the first tile leans on nothing")?;
+        if chain.at != from {
+            *chain = Chain::new();
+            let mut at = 0;
+            while at < from {
+                let end = (at + 24).min(from);
+                self.frames(at, end, chain)?;
+                at = end;
             }
         }
-        // A guessed tile waits for the frame before it; the others are unpacked at once.
         let mut waiting: Vec<Option<Vec<u8>>> = Vec::new();
-        let mut out: Vec<Vec<u8>> = (start..to)
+        let mut out: Vec<Vec<u8>> = (from..to)
             .into_par_iter()
             .map(|i| {
                 let packed = self.packed(i)?;
@@ -242,23 +268,22 @@ impl Bottle {
             })
             .collect();
         for i in 0..out.len() {
-            let (done, rest) = out.split_at_mut(i);
-            let prev = done.last().map(|f| f.as_slice()).or(before);
             if let Some(packed) = &waiting[i] {
                 // The same guesses as when it was packed, and the corrections added.
-                rest[0] = crate::guess::unpack(&self.geo, &packed[3..], prev)?;
-            } else if self.index.nodes[start + i].leans {
-                let prev = prev.filter(|p| p.len() == rest[0].len());
-                crate::pack::lean_on(&mut rest[0], prev.ok_or("a leaning tile was unpacked without the tile before it")?);
+                out[i] = crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?;
+            } else if self.index.nodes[from + i].leans {
+                let prev = chain.before.as_deref().filter(|p| p.len() == out[i].len());
+                crate::pack::lean_on(&mut out[i], prev.ok_or("a leaning tile was unpacked without the tile before it")?);
             }
+            chain.feed(&out[i]);
         }
         out.par_iter().enumerate().try_for_each(|(i, f)| {
-            if sha(f) != self.index.nodes[start + i].raw {
-                return Err(format!("node {} did not unpack to its frame", start + i));
+            if sha(f) != self.index.nodes[from + i].raw {
+                return Err(format!("node {} did not unpack to its frame", from + i));
             }
             Ok(())
         })?;
-        Ok(out.split_off(from - start))
+        Ok(out)
     }
 
     /// (16 x 16 tiles guessed perfectly, tiles) over all guessed frames.

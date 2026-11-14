@@ -11,6 +11,10 @@
 //!             rolling window in Nimbus (src/player.rs)
 //! 7. SMOOTHER the frames between two nodes, guessed live from vectors (src/smooth.rs)
 //!
+//! The lossless packer (src/guess.rs) guesses each frame and keeps only the corrections.
+//! Its guessers read the frame before, this frame so far, Golden Answer's fraction and
+//! the Hammer: the stack of every pixel's line through all the frames so far.
+//!
 //! The report's numbers are worked out by Nuome's Golden Answer (src/golden.rs).
 
 // Strike's own code, as it is in Strike: the lightning's home and hashes, and Nimbus.
@@ -78,6 +82,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let (mut struck, mut explained) = (0usize, !explain);
     // The tile before the next one on the grid: the last frame of the batch before.
     let mut carry: Option<(Vec<u8>, String)> = None;
+    // The Hammer's stack of every frame so far, and one name for all of them (for the brand).
+    let mut hammer = guess::Hammer::new();
+    let mut so_far = String::new();
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -96,7 +103,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             if second {
                 println!("       (the second tile is shown: the first has no tile before it)");
             }
-            let shown = if second { pack::choose(geo, &frames[1], Some(&frames[0]), rules, &profile) } else { pack::choose(geo, &frames[0], None, rules, &profile) };
+            let shown = if second { pack::choose(geo, &frames[1], Some(&frames[0]), Some(&frames[0]), rules, &profile) } else { pack::choose(geo, &frames[0], None, None, rules, &profile) };
             for c in shown {
                 let name: Vec<&str> = c.choice.iter().map(|(_, v)| v.as_str()).collect();
                 println!("         {:14} {:.3} = {:.3} by the rules {:+.3} judged   {}", name.join("+"), c.score(), c.local, c.judged, c.notes.join("; "));
@@ -104,6 +111,15 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
         let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
+        // The stack as it stands before each frame of the batch, top frame first.
+        let mut stacks: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for (frame, raw) in frames.iter().zip(&raws) {
+            stacks.push(hammer.guess().map(|s| s.to_vec()));
+            names.push(so_far.clone());
+            hammer.strike(frame);
+            so_far = bottle::sha(format!("{so_far}{raw}").as_bytes());
+        }
         let done: Vec<(String, Vec<String>, bool, bool)> = frames
             .par_iter()
             .enumerate()
@@ -112,7 +128,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 let before: Option<(&[u8], &str)> = if i > 0 { Some((&frames[i - 1], &raws[i - 1])) } else { carry.as_ref().map(|(f, r)| (f.as_slice(), r.as_str())) };
                 // Only the rules that decide a pack are in its brand (not the smoother's or the player's).
                 let pack_rules = motor::DEFAULT_RULES.split("[smoother]").next().unwrap();
-                let key = pack_key(pack_rules, profile_name, geo, &species, &raw, before.map_or("", |b| b.1));
+                let key = pack_key(pack_rules, profile_name, geo, &species, &raw, &names[i]);
                 if let Some(text) = bottle::branded("pack", &key) {
                     let mut lines = text.lines();
                     let leans = lines.next() == Some("tile");
@@ -121,8 +137,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                         return Ok((raw, hashes, true, leans));
                     }
                 }
-                let best = pack::choose(geo, frame, before.map(|b| b.0), rules, &profile).remove(0);
-                let packed = pack::pack(geo, frame, before.map(|b| b.0), &best.choice, rules);
+                let best = pack::choose(geo, frame, before.map(|b| b.0), stacks[i].as_deref(), rules, &profile).remove(0);
+                let packed = pack::pack(geo, frame, before.map(|b| b.0), stacks[i].as_deref(), &best.choice, rules);
                 let leans = pack::leans(&packed);
                 let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
                 bottle::brand("pack", &key, &format!("{}\n{}", if leans { "tile" } else { "own" }, hashes.join("\n")));
@@ -183,7 +199,7 @@ fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String
     let mut reader = chop::frames(movie_path, &b.geo)?;
     let batch = rayon::current_num_threads() * 2;
     let (mut same, mut seen) = (0usize, 0usize);
-    let mut carry: Option<Vec<u8>> = None;
+    let mut chain = bottle::Chain::new();
     loop {
         let mut frames = Vec::new();
         while frames.len() < batch {
@@ -198,9 +214,8 @@ fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String
         let nodes = b.index.nodes.len();
         let to = (seen + frames.len()).min(nodes);
         if seen < to {
-            let unpacked = b.frames(seen, to, carry.as_deref())?;
+            let unpacked = b.frames(seen, to, &mut chain)?;
             same += unpacked.iter().zip(&frames).filter(|(u, f)| u == f).count();
-            carry = unpacked.into_iter().last();
         }
         seen += frames.len();
     }
@@ -307,7 +322,7 @@ fn run() -> Result<(), String> {
                 let e: f64 = x[..luma].iter().zip(&y[..luma]).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / luma as f64;
                 if e == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / e).log10() }
             };
-            let all = b.frames(0, b.index.nodes.len().min(50), None)?;
+            let all = b.frames(0, b.index.nodes.len().min(50), &mut bottle::Chain::new())?;
             let triples: Vec<usize> = (0..all.len().saturating_sub(2)).step_by(2).take(24).collect();
             let scores: Vec<(f64, f64)> = triples
                 .par_iter()
