@@ -358,6 +358,10 @@ fn run() -> Result<(), String> {
             let perfect = b.choices()?.iter().filter(|c| c.0 == "guess, perfect").map(|c| c.1).sum::<usize>();
             println!("  guessed perfectly   {perfect} of {nodes} frames (no correction at all)");
             let (right, tiles) = b.guess_tiles()?;
+            let (spoke, planes) = b.golden_planes()?;
+            if planes > 0 {
+                println!("  Golden's guesser    spoke for {spoke} of {planes} planes (an exact fraction each, kept in the bottle)");
+            }
             if tiles > 0 {
                 println!("                      {right} of {tiles} tiles of 16 x 16 pixels = {}", exact(&format!("What is {right} / {tiles}?"), 4));
             }

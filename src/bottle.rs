@@ -271,6 +271,18 @@ impl Bottle {
         Ok(n)
     }
 
+    /// (planes for which Golden's guesser spoke, planes) over all guessed frames.
+    pub fn golden_planes(&self) -> Result<(usize, usize), String> {
+        let mut n = (0, 0);
+        for i in 0..self.index.nodes.len() {
+            let packed = self.packed(i)?;
+            if crate::pack::guessed(&packed) {
+                n = (n.0 + crate::pack::golden_planes(&self.geo, &packed), n.1 + self.geo.planes.len());
+            }
+        }
+        Ok(n)
+    }
+
     /// How many nodes chose each way of packing.
     pub fn choices(&self) -> Result<Vec<(String, usize)>, String> {
         let mut n: HashMap<String, usize> = HashMap::new();

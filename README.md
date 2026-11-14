@@ -196,3 +196,27 @@ other encodes were made with ffmpeg outside Frame Bottle):
   run, 6.5 to 11.6 ms were seen).
 - The guessers read the frame before only at the same place: nothing
   follows motion yet. That is the main thing the two that beat it do.
+
+### Golden Answer as a guesser (added after the table above)
+
+A fourth guesser, `golden`: the frame before, made lighter or darker by
+one exact fraction per plane. When a frame is packed, Nuome's Golden Answer
+is asked, in its logical kind, what the light of the plane is over the
+light of the same plane before ("What is 219408113 / 219377412?"); its
+answer, a fraction in lowest terms, is kept in the bottle (8 bytes a
+plane), so the player makes the same guess without Nuome. Golden's guess
+counts only where it differs from `still`, since otherwise `still` would
+be heard twice. This replaces the sentence above that Golden takes no part
+in the guess.
+
+Measured:
+
+| clip | without Golden | with Golden |
+|---|---|---|
+| `guitar_10s.mp4` (steady light) | 129 237 300 | 129 246 961 (the kept fractions cost 9 661 bytes; the guess gains nothing) |
+| `fade_2s.mp4` (the guitar clip fading to black, 60 frames) | 18 205 507 | 18 131 561 (0.4 % smaller) |
+
+Every frame still unpacks identically in both. Golden's guesser helps only
+where the light changes, and only a little, because `moved` already
+follows what the neighbours did. Packing asks Golden three questions a
+frame (about 22 ms each).

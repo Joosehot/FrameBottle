@@ -319,6 +319,11 @@ pub fn guess_tiles(packed: &[u8]) -> (usize, usize) {
     if guessed(packed) { crate::guess::tiles(&packed[3..]) } else { (0, 0) }
 }
 
+/// The planes of a guessed frame for which Golden's guesser spoke.
+pub fn golden_planes(geo: &Geometry, packed: &[u8]) -> usize {
+    if guessed(packed) { crate::guess::golden_planes(geo, &packed[3..]) } else { 0 }
+}
+
 /// Was this tile guessed perfectly (it holds no correction at all)?
 pub fn perfect(packed: &[u8]) -> bool {
     guessed(packed) && crate::guess::perfect(&packed[3..])

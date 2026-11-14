@@ -10,7 +10,12 @@
 //!   (frame before + the median way the left, upper and upper-left
 //!   neighbours differ from theirs);
 //! - `near`: from this frame alone, the median of left, above and their
-//!   slope (for the first frame there is nothing else).
+//!   slope (for the first frame there is nothing else);
+//! - `golden`: the frame before, made lighter or darker by one exact
+//!   fraction per plane. Nuome's Golden Answer derives the fraction (the
+//!   light of this plane over the light of the same plane before, in its
+//!   logical kind) when the frame is packed, and the fraction is kept in
+//!   the bottle, so the player needs no Nuome to make the same guess.
 //!
 //! The one that was least wrong on the neighbours just rebuilt makes the
 //! guess (HotMotor's way: variants, and a judge that scores them where they
@@ -31,7 +36,7 @@ use rayon::prelude::*;
 
 /// The guesser as it is now. A change to how it guesses or codes changes this, so that
 /// the lightning does not strike a pack made by an older guesser.
-pub const VERSION: &str = "guess 11";
+pub const VERSION: &str = "guess 13";
 
 const TOP: u32 = 1 << 24;
 const BITS: u32 = 12;
@@ -149,7 +154,7 @@ fn step(near: u32) -> usize {
 
 /// What the coder has learned so far in one band.
 struct Learned {
-    zero: [u16; STEPS * 3 * 3],
+    zero: [u16; STEPS * 4 * 3],
     sign: [u16; 9],
     length: [u16; STEPS * 8],
     digits: [u16; 9 * 8],
@@ -159,7 +164,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { zero: [HALF; STEPS * 3 * 3], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3] }
+        Learned { zero: [HALF; STEPS * 4 * 3], sign: [HALF; 9], length: [HALF; STEPS * 8], digits: [HALF; 9 * 8], tile: [HALF; 3] }
     }
 }
 
@@ -174,7 +179,7 @@ struct Place {
 }
 
 fn write(e: &mut Encoder, l: &mut Learned, at: &Place, v: i32) {
-    e.bit(&mut l.zero[(at.step * 3 + at.who) * 3 + at.quiet], v != 0);
+    e.bit(&mut l.zero[(at.step * 4 + at.who) * 3 + at.quiet], v != 0);
     if v == 0 {
         return;
     }
@@ -194,7 +199,7 @@ fn write(e: &mut Encoder, l: &mut Learned, at: &Place, v: i32) {
 }
 
 fn read(d: &mut Decoder, l: &mut Learned, at: &Place) -> i32 {
-    if !d.bit(&mut l.zero[(at.step * 3 + at.who) * 3 + at.quiet]) {
+    if !d.bit(&mut l.zero[(at.step * 4 + at.who) * 3 + at.quiet]) {
         return 0;
     }
     let negative = d.bit(&mut l.sign[at.signs]);
@@ -225,17 +230,19 @@ struct Band<'a> {
     /// The corrections of this row and the one above.
     fix: Vec<i8>,
     fix_up: Vec<i8>,
-    /// How wrong each guesser (still, moved, near) was, this row and above.
-    wrong: [Vec<u8>; 3],
-    wrong_up: [Vec<u8>; 3],
+    /// How wrong each guesser (still, moved, near, golden) was, this row and above.
+    wrong: [Vec<u8>; 4],
+    wrong_up: [Vec<u8>; 4],
+    /// Golden's guess for each value a sample had in the frame before; None when it says "the same".
+    golden: Option<[u8; 256]>,
     /// The same row of the frame before, and the row above it there.
     before: Option<&'a [u8]>,
     before_up: Option<&'a [u8]>,
-    offers: [u8; 3],
+    offers: [u8; 4],
 }
 
 impl<'a> Band<'a> {
-    fn new(p: &Plane) -> Band<'a> {
+    fn new(p: &Plane, golden: Option<[u8; 256]>) -> Band<'a> {
         let n = p.stride();
         Band {
             px: p.px(),
@@ -244,11 +251,12 @@ impl<'a> Band<'a> {
             has_up: false,
             fix: vec![0; n],
             fix_up: vec![0; n],
-            wrong: [vec![0; n], vec![0; n], vec![0; n]],
-            wrong_up: [vec![0; n], vec![0; n], vec![0; n]],
+            wrong: [vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
+            wrong_up: [vec![0; n], vec![0; n], vec![0; n], vec![0; n]],
+            golden,
             before: None,
             before_up: None,
-            offers: [0; 3],
+            offers: [0; 4],
         }
     }
 
@@ -280,7 +288,7 @@ impl<'a> Band<'a> {
                 (false, Some(q)) => self.up[i] as i32 - q[i] as i32,
                 (false, None) => 0,
             };
-            self.offers = [still as u8, (still + change).clamp(0, 255) as u8, near as u8];
+            self.offers = [still as u8, (still + change).clamp(0, 255) as u8, near as u8, self.golden.map_or(still as u8, |g| g[still as usize])];
             // The judge: how wrong each was on the sample to the left and the one above.
             let right = i + px < self.row.len();
             let score = |g: usize| {
@@ -291,13 +299,20 @@ impl<'a> Band<'a> {
             };
             let (s0, s1, s2) = (score(0), score(1), score(2));
             who = if s0 <= s1 && s0 <= s2 { 0 } else if s1 <= s2 { 1 } else { 2 };
+            // Golden speaks only where it says something else than `still` (else `still` would count twice).
+            let differs = self.golden.is_some() && self.offers[3] != self.offers[0];
+            let s3 = if differs { score(3) } else { u32::MAX };
+            if s3 < s0.min(s1).min(s2) {
+                who = 3;
+            }
             // Each speaks as loud as it was right: the guess is their mix.
             let w = |s: u32| ((1u32 << 20) / ((s + 2) * (s + 2))).max(1);
             let (w0, w1, w2) = (w(s0), w(s1), w(s2));
-            let sum = w0 + w1 + w2;
-            mixed = ((self.offers[0] as u32 * w0 + self.offers[1] as u32 * w1 + self.offers[2] as u32 * w2 + sum / 2) / sum) as u8;
+            let w3 = if differs { w(s3) } else { 0 };
+            let sum = w0 + w1 + w2 + w3;
+            mixed = ((self.offers[0] as u32 * w0 + self.offers[1] as u32 * w1 + self.offers[2] as u32 * w2 + self.offers[3] as u32 * w3 + sum / 2) / sum) as u8;
         } else {
-            self.offers = [near as u8; 3];
+            self.offers = [near as u8; 4];
             mixed = near as u8;
         }
         let (fl, fu) = (if left { self.fix[i - px] as i32 } else { 0 }, if up { self.fix_up[i] as i32 } else { 0 });
@@ -317,7 +332,7 @@ impl<'a> Band<'a> {
     fn learn(&mut self, i: usize, real: u8, fix: i8) {
         self.row[i] = real;
         self.fix[i] = fix;
-        for g in 0..3 {
+        for g in 0..4 {
             self.wrong[g][i] = real.abs_diff(self.offers[g]);
         }
     }
@@ -347,12 +362,12 @@ fn tile(p: &Plane) -> (usize, usize) {
 /// starts with one flag per tile: guessed perfectly, or not. Only the tiles
 /// that were not have corrections after it. Returns the bytes, the tiles
 /// guessed perfectly, and the tiles.
-fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, y0: usize, y1: usize) -> (Vec<u8>, usize, usize) {
+fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize) -> (Vec<u8>, usize, usize) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
     // First the guesses, which need only what the player will have too.
-    let mut band = Band::new(p);
+    let mut band = Band::new(p, golden);
     let mut fixes: Vec<i8> = Vec::with_capacity((y1 - y0) * stride);
     let mut places: Vec<Place> = Vec::with_capacity((y1 - y0) * stride);
     for y in y0..y1 {
@@ -394,11 +409,11 @@ fn correct(p: &Plane, real: &[u8], before: Option<&[u8]>, y0: usize, y1: usize) 
 /// Rows `y0..y1` of a plane rebuilt into `out` (those rows only): the same
 /// guesses, and the corrections added where a tile's flag says it has any.
 /// `coded` None means no tile needed one.
-fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, y0: usize, y1: usize, out: &mut [u8]) {
+fn rebuild(p: &Plane, coded: Option<&[u8]>, before: Option<&[u8]>, golden: Option<[u8; 256]>, y0: usize, y1: usize, out: &mut [u8]) {
     let stride = p.stride();
     let (tw, th) = tile(p);
     let across = stride.div_ceil(tw);
-    let (mut band, mut l) = (Band::new(p), Learned::new());
+    let (mut band, mut l) = (Band::new(p, golden), Learned::new());
     let mut d = coded.map(Decoder::new);
     // Without corrections every tile was guessed perfectly; with them, nothing is above the first row.
     let mut flags = vec![d.is_none(); across];
@@ -443,6 +458,54 @@ pub fn tiles(payload: &[u8]) -> (usize, usize) {
     (n(3), n(7))
 }
 
+/// Golden's guess for a plane: each value of the frame before times num / den, to the
+/// nearest whole value. None when the fraction is 1 (Golden says "the same").
+fn golden_table(gain: (u32, u32)) -> Option<[u8; 256]> {
+    if gain.0 == gain.1 || gain.1 == 0 {
+        return None;
+    }
+    let mut t = [0u8; 256];
+    for (v, slot) in t.iter_mut().enumerate() {
+        *slot = ((v as u64 * gain.0 as u64 + gain.1 as u64 / 2) / gain.1 as u64).min(255) as u8;
+    }
+    Some(t)
+}
+
+/// Golden Answer is asked how much lighter or darker each plane is than the same plane
+/// of the frame before: an exact fraction, derived (logical kind). A plane it cannot
+/// answer for (no Nuome here, a black plane, samples of two bytes) gets 1.
+fn ask_golden(geo: &Geometry, frame: &[u8], before: &[u8]) -> Vec<(u32, u32)> {
+    let at = geo.offsets();
+    geo.planes
+        .par_iter()
+        .zip(at)
+        .map(|(p, at)| {
+            if p.bps != 1 {
+                return (1, 1);
+            }
+            let sum = |f: &[u8]| f[at..at + p.len()].iter().map(|v| *v as u64).sum::<u64>();
+            let (now, then) = (sum(frame), sum(before));
+            if now == 0 || then == 0 || now == then {
+                return (1, 1);
+            }
+            let Ok(answer) = crate::golden::ask(&format!("What is {now} / {then}?")) else { return (1, 1) };
+            let (num, den) = answer.split_once('/').unwrap_or((answer.as_str(), "1"));
+            match (num.trim().parse::<u32>(), den.trim().parse::<u32>()) {
+                (Ok(n), Ok(d)) if n > 0 && d > 0 => (n, d),
+                _ => (1, 1),
+            }
+        })
+        .collect()
+}
+
+/// The planes of a guessed frame for which Golden's guesser spoke (its fraction is not 1).
+pub fn golden_planes(geo: &Geometry, payload: &[u8]) -> usize {
+    if perfect(payload) {
+        return 0;
+    }
+    (0..geo.planes.len()).filter(|i| payload.get(HEAD + 8 * i..HEAD + 8 * i + 8).is_some_and(|b| b[..4] != b[4..])).count()
+}
+
 /// Was the frame guessed perfectly (no correction at all)?
 pub fn perfect(payload: &[u8]) -> bool {
     payload.first().is_some_and(|f| f & PERFECT != 0)
@@ -457,6 +520,10 @@ pub fn from_before(payload: &[u8]) -> bool {
 /// perfectly and the tiles, then each band's length and bytes, plane by
 /// plane. A frame guessed perfectly keeps those first eleven bytes only.
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize) -> Vec<u8> {
+    let gains: Vec<(u32, u32)> = match before {
+        Some(b) if b != frame => ask_golden(geo, frame, b),
+        _ => vec![(1, 1); geo.planes.len()],
+    };
     if before == Some(frame) {
         let tiles: usize = geo.planes.iter().map(|p| p.stride().div_ceil(tile(p).0) * p.h.div_ceil(tile(p).1)).sum();
         let mut out = vec![PERFECT | FROM_BEFORE | STILL];
@@ -479,16 +546,21 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize) -
         .par_iter()
         .map(|(i, y0, y1)| {
             let p = &geo.planes[*i];
-            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), *y0, *y1)
+            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), golden_table(gains[*i]), *y0, *y1)
         })
         .collect();
     let (perfect, tiles) = done.iter().fold((0, 0), |n, d| (n.0 + d.1, n.1 + d.2));
-    let any = perfect < tiles;
+    // A frame keeps its corrections' bytes also when Golden spoke: its fractions are in them.
+    let any = perfect < tiles || gains.iter().any(|g| g.0 != g.1);
     let mut out = vec![(if any { 0 } else { PERFECT }) | (if before.is_some() { FROM_BEFORE } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.extend((perfect as u32).to_le_bytes());
     out.extend((tiles as u32).to_le_bytes());
     if any {
+        for g in &gains {
+            out.extend(g.0.to_le_bytes());
+            out.extend(g.1.to_le_bytes());
+        }
         for d in &done {
             out.extend((d.0.len() as u32).to_le_bytes());
         }
@@ -514,7 +586,14 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<V
     // Each band's bytes, in the order they were written.
     let count: usize = geo.planes.iter().map(|p| p.h.div_ceil(band_rows(p, bands))).sum();
     let mut coded: Vec<Option<&[u8]>> = vec![None; count];
+    let mut golden = vec![None; geo.planes.len()];
     if !perfect(payload) {
+        // Golden's fraction for each plane, then each band's length, then the bands.
+        let word = |at: usize| payload.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or("a guessed frame is cut");
+        for (i, slot) in golden.iter_mut().enumerate() {
+            *slot = golden_table((word(HEAD + 8 * i)?, word(HEAD + 8 * i + 4)?));
+        }
+        let payload = &payload[8 * geo.planes.len()..];
         let mut data = HEAD + 4 * count;
         for (i, slot) in coded.iter_mut().enumerate() {
             let len = payload.get(HEAD + 4 * i..HEAD + 4 + 4 * i).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a guessed frame is cut")?;
@@ -537,7 +616,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<V
     work.into_par_iter().for_each(|(i, y0, coded, chunk)| {
         let p = &geo.planes[i];
         let y1 = y0 + chunk.len() / p.stride();
-        rebuild(p, coded, before.map(|b| &b[at[i]..at[i] + p.len()]), y0, y1, chunk);
+        rebuild(p, coded, before.map(|b| &b[at[i]..at[i] + p.len()]), golden[i], y0, y1, chunk);
     });
     Ok(out)
 }
@@ -558,7 +637,7 @@ pub fn sample(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, rules: &Rules
         .par_iter()
         .map(|(i, y0, y1)| {
             let p = &geo.planes[*i];
-            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), *y0, *y1).0.len()
+            correct(p, &frame[at[*i]..at[*i] + p.len()], before.map(|b| &b[at[*i]..at[*i] + p.len()]), None, *y0, *y1).0.len()
         })
         .sum();
     let raw: usize = jobs.iter().map(|(i, y0, y1)| (y1 - y0) * geo.planes[*i].stride()).sum();
