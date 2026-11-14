@@ -110,14 +110,16 @@ struct Learned {
     /// Where the last wave left is (6 binary digits), by light or colour.
     last: [[u16; 64]; 2],
     /// Is this wave left? By light or colour, how fine the wave is, and whether the one before was left.
-    left: [u16; 2 * 6 * 2],
+    left: [u16; 2 * 6 * 6],
+    /// Is a wave more than one step, more than two? By light or colour and the waves next to it.
+    more: [u16; 2 * 4 * 2],
     sign: [u16; 2],
     size: [[u16; 32]; 12],
 }
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 24], sign: [HALF; 2], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -304,7 +306,7 @@ fn waves_of(steps: &[i32; 64]) -> Waves {
 }
 
 /// The steps of one block's waves, coarse to fine: written, or read into `steps`.
-fn block(c: &mut Coder, l: &mut Learned, book: &mut Option<&mut Book>, kind: usize, moved: usize, steps: &mut [i32; 64]) {
+fn block(c: &mut Coder, l: &mut Learned, t: &Tables, book: &mut Option<&mut Book>, kind: usize, moved: usize, steps: &mut [i32; 64]) {
     let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
     if !c.bit(&mut l.any[kind * 2 + moved], want > 0) {
         *steps = [0; 64];
@@ -336,23 +338,37 @@ fn block(c: &mut Coder, l: &mut Learned, book: &mut Option<&mut Book>, kind: usi
         end = end * 2 + bit as usize;
     }
     let end = end + 1;
-    let mut before = 1usize;
-    for i in 0..64 {
-        if i >= end {
-            steps[i] = 0;
-            continue;
-        }
+    // From the last wave left back to the flattest (AV1's way): how likely a wave is left, and
+    // how large it is, is learned by how large the waves next to it are, to the right and
+    // below: finer ones, which are already written.
+    let mut size_at = [0u8; 64];
+    for i in (0..end).rev() {
+        let at = t.order[i];
+        let (u, v) = (at % 8, at / 8);
+        let get = |du: usize, dv: usize| if u + du < 8 && v + dv < 8 { size_at[(v + dv) * 8 + u + du] as usize } else { 0 };
+        let near = get(1, 0) + get(0, 1) + get(1, 1) + get(2, 0) + get(0, 2);
         let fine = kind * 6 + l_fine(i);
         // The last wave left is left: that is what "last" said.
-        if i + 1 < end && !c.bit(&mut l.left[fine * 2 + before], steps[i] != 0) {
+        if i + 1 < end && !c.bit(&mut l.left[fine * 6 + near.min(5)], steps[i] != 0) {
             steps[i] = 0;
-            before = 0;
             continue;
         }
         let negative = c.bit(&mut l.sign[kind], steps[i] < 0);
-        let n = c.count(&mut l.size[fine], steps[i].unsigned_abs().clamp(1, 65535)) as i32;
-        steps[i] = if negative { -n } else { n };
-        before = 1;
+        let want = steps[i].unsigned_abs().clamp(1, 65535);
+        // One step, two, or more (and then how many more).
+        let ctx = (kind * 4 + near.min(3)) * 2;
+        let mut n = 1;
+        if c.bit(&mut l.more[ctx], want > 1) {
+            n = 2;
+            if c.bit(&mut l.more[ctx + 1], want > 2) {
+                n = 2 + c.count(&mut l.size[fine], want.saturating_sub(2).max(1));
+            }
+        }
+        steps[i] = if negative { -(n as i32) } else { n as i32 };
+        size_at[at] = n.min(3) as u8;
+    }
+    for s in steps.iter_mut().skip(end) {
+        *s = 0;
     }
     if let Some(book) = book.as_deref_mut() {
         book.saw(waves_of(steps));
@@ -697,7 +713,7 @@ fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, 
 }
 
 /// A miss as steps of its waves, coarse to fine.
-fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32) -> [i32; 64] {
+fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32, price: f64) -> [i32; 64] {
     let w = t.waves(miss);
     let mut steps = [0i32; 64];
     for (n, s) in steps.iter_mut().enumerate() {
@@ -705,6 +721,20 @@ fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32) -> [i32; 64] {
         // nearly a step long is grain more often than picture.
         let (v, step) = (w[t.order[n]], t.step[n]);
         *s = v.signum() * ((v.abs() + step / dead) / step);
+    }
+    // Then each wave is weighed on its own, finest first: a step less, if what that
+    // leaves wrong costs less than the bits it saves (a wave gone saves about five,
+    // a step shorter about two).
+    for n in (0..64).rev() {
+        if steps[n] == 0 {
+            continue;
+        }
+        let (v, step) = (w[t.order[n]] as f64, t.step[n] as f64);
+        let less = steps[n] - steps[n].signum();
+        let (wrong, wrong_less) = ((v - steps[n] as f64 * step).powi(2), (v - less as f64 * step).powi(2));
+        if wrong_less - wrong < price * if less == 0 { 5.0 } else { 2.0 } {
+            steps[n] = less;
+        }
     }
     steps
 }
@@ -763,7 +793,7 @@ fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &
                 miss[j * 8 + k] = sp.at((bx + k) as i32, (by + j) as i32) as i32 - guess[j * 8 + k];
             }
         }
-        let mut steps = count_steps(t, &miss, dead);
+        let mut steps = count_steps(t, &miss, dead, price);
         let wrong_without: i64 = miss.iter().map(|m| (*m as i64) * (*m as i64)).sum();
         let mut wrong = wrong_without as f64 + price;
         if steps.iter().any(|s| *s != 0) {
@@ -878,7 +908,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 let flat = if kind == Kind::Flat { flat_of(&bufs[i][..], p, px0, py0, TILE >> p.sx, band_top) } else { 0 };
                 let guess = guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind, flat);
                 let mut steps = kept.as_ref().map_or([0i32; 64], |k| k[n]);
-                block(c, &mut l, &mut book, (i > 0) as usize, (kind != Kind::Flat) as usize, &mut steps);
+                block(c, &mut l, t, &mut book, (i > 0) as usize, (kind != Kind::Flat) as usize, &mut steps);
                 let waves_left = steps.iter().any(|s| *s != 0);
                 // A block that is only the same block of the frame before is not made anew.
                 let same = match kind {

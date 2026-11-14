@@ -584,3 +584,65 @@ takes 11 s for the 10 s clip as before.
 |---|---|---|
 | coarse 8 | 9 400 443 bytes, 45.44 dB | 7 839 470 bytes, 45.48 dB (16.6 % smaller) |
 | coarse 20 | 3 598 135 bytes, 41.18 dB | 3 209 251 bytes, 41.47 dB (10.8 % smaller, 0.3 dB nearer) |
+
+## Toward AV1 at over 45 dB (2026-11-15)
+
+The goal: over 45 dB, and smaller than AV1 there. All on `guitar_10s.mp4`;
+PSNR is over all samples frame by frame in order, VMAF is ffmpeg's libvmaf
+on the frames as the player shows them (`fbottle raw`), against the MP4's
+own frames.
+
+What was added to the blocks, each measured:
+
+| step | effect |
+|---|---|
+| the index kept tight (8 bytes of each share's name, the nodes as a table) | 128 kB less: 4.1 % of a 3 MB bottle, 1.7 % of a 7.7 MB one |
+| the packer weighs every way of guessing a tile (bits against error); a tile can be split in four, each quarter with its own vector | coarse 8: 7.71 MB at 45.48 dB to 7.51 MB at 46.24 dB |
+| `--between`: every second frame guessed from the frames on both sides, its steps 1.7 times longer | about 14 % smaller at the same PSNR |
+| waves written by the size of the waves next to them (AV1's way) | 2.5 % smaller, same frames |
+| each wave weighed on its own (AV1's way) | nothing: the dead zone already rounds a wave down unless it is nearly a step long |
+
+Where it stands:
+
+| | bytes | PSNR | VMAF |
+|---|---|---|---|
+| Frame Bottle, `--coarse 8 --between --dictionary` | 5 859 483 | 45.94 dB | 94.58 |
+| Frame Bottle, `--coarse 9 --between --dictionary` | 5 144 164 | 45.35 dB | 93.85 |
+| H.264, crf 22 | 4 621 893 | 46.33 dB | 94.90 |
+| H.264, crf 26 | 2 334 877 | 44.23 dB | 91.88 |
+| AV1, crf 30 | 2 159 426 | 45.76 dB | 94.59 |
+| AV1, crf 36 | 1 450 315 | 45.09 dB | 93.51 |
+| AV1, crf 48 | 708 735 | 43.70 dB | 91.02 |
+
+At VMAF 94.6 a bottle is 5.86 MB and AV1 2.16 MB: AV1 is 2.7 times smaller
+(it was 5.5 times at the start of the day). H.264 is about a quarter
+smaller than a bottle there. A step along the film: about 8 ms.
+
+### Dimmed light, a grid for each frame, fake grain
+
+[src/light.rs](src/light.rs). With the exact packing; the brightness plane
+is kept as level numbers and the player brightens it back, smoothing each
+sample toward its neighbours inside the span its level stands for (against
+banding; noise laid on before packing would make the frames harder to pack).
+
+| | bytes | PSNR | VMAF |
+|---|---|---|---|
+| exact (256 levels) | 128 825 550 | exact | 100 |
+| `--light 128` (on the gamma curve) | 88 129 586 | 50.81 dB | 98.52 |
+| `--light 96` | 78 412 143 | 48.75 dB | 97.95 |
+| `--light 64` | 66 282 836 | 45.24 dB | 96.44 |
+| `--grid 128` (a grid made for each frame) | 105 136 983 | 53.85 dB | 98.00 |
+| `--grid 64` | 85 578 508 | 48.80 dB | 94.96 |
+
+- Dimmed light makes the exact bottle a third to a half smaller. Against
+  the blocks it is far off: 66 MB at 45.2 dB where blocks take about 5 MB.
+- A grid for each frame is nearer the movie level for level (48.8 dB with
+  64 levels, where the curve needs 96), but its bottle is bigger than the
+  curve's at the same PSNR (85.6 MB against 78.4 MB) and its VMAF is lower
+  (94.96 against 97.95): when a frame stores a new grid, every level number
+  means something else, and the guess from the frame before misses.
+- `--grain` (fake film grain on what is shown, three quarters of the
+  strength of what the packing left out): the bottle is the same size; PSNR
+  falls from 45.94 to 44.17 dB and VMAF from 94.58 to 94.36, as they must
+  when grain that is not the movie's own is laid on. Whether it looks
+  better is for the eye, not for these two numbers.
