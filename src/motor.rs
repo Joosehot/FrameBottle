@@ -44,6 +44,12 @@ pub struct Rules {
     pub dictionary: bool,
     /// Every second frame is guessed from the frames on both sides (the command's --between).
     pub between: bool,
+    /// Dimmed light: the number of brightness levels on the film's curve (0: not used).
+    pub light: usize,
+    /// A light grid for each frame: its number of levels (0: not used).
+    pub grid: usize,
+    /// Fake film grain is laid on what the player shows.
+    pub grain: bool,
     /// The most patterns the bit dictionary holds (0: the usual 4096).
     pub patterns: usize,
     pub blocks: crate::block::How,
@@ -129,6 +135,9 @@ impl Rules {
             coarse: 0,
             dictionary: false,
             between: false,
+            light: 0,
+            grid: 0,
+            grain: false,
             patterns: 0,
             blocks: crate::block::How {
                 range: num(table("block")?, "range", "block")? as usize,

@@ -88,6 +88,12 @@ pub struct Index {
     /// Every second frame lies between two and is guessed from both.
     #[serde(default)]
     pub between: bool,
+    /// The brightness plane is kept as level numbers (dimmed light, or a grid for each frame).
+    #[serde(default)]
+    pub light: bool,
+    /// Fake film grain is laid on what is shown: its strength in 16ths of a level (0: none).
+    #[serde(default)]
+    pub grain: u8,
     /// Kept in the tables after the text, not in it.
     #[serde(skip)]
     pub nodes: Vec<Node>,
@@ -233,31 +239,54 @@ pub struct Chain {
     pub books: Vec<crate::block::Book>,
     /// For a bottle with a tolerance: each frame fed is also mended (what the
     /// tolerance lost put right as far as it can be) and waits here to be shown.
-    mending: Option<(Geometry, u8)>,
+    /// For a bottle whose frames are shown otherwise than they are kept (a tolerance is
+    /// mended, dimmed light is brightened, fake grain is laid on): each frame as it is
+    /// shown waits in `mended`.
+    mending: Option<Shows>,
     pub mended: Vec<Vec<u8>>,
+    /// The light grid in use (the last one a frame stored).
+    grid: Option<Vec<u8>>,
     /// A frame rebuilt before its turn (the one after a frame between two), with its node.
     pub ahead: Option<(usize, Vec<u8>)>,
 }
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), ahead: None }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), grid: None, ahead: None }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
         let mut c = Chain::new();
-        c.mending = (b.index.tolerance > 0).then(|| (b.geo.clone(), b.index.tolerance));
+        let i = &b.index;
+        c.mending = (i.tolerance > 0 || i.light || i.grain > 0).then(|| Shows { geo: b.geo.clone(), tolerance: i.tolerance, light: i.light, grain: i.grain });
         c.dictionary = crate::dict::Dictionary::holding(b.index.patterns);
         c
     }
     /// The next frame is known: it becomes the frame before, and is laid on the stack.
     pub fn feed(&mut self, frame: &[u8]) {
         self.hammer.strike(frame);
-        if let Some((geo, tol)) = &self.mending {
-            self.mended.push(crate::guess::mend(geo, frame, *tol));
-        }
         self.refer(frame);
         self.at += 1;
+    }
+    /// The frame of `node` as the player shows it is made and waits in `mended` (for a
+    /// bottle that shows frames otherwise than it keeps them). `grid` is the light grid
+    /// the frame stored, if it stored one.
+    pub fn show(&mut self, node: usize, frame: &[u8], grid: Option<Vec<u8>>) {
+        if grid.is_some() {
+            self.grid = grid;
+        }
+        let Some(s) = &self.mending else { return };
+        let mut shown = if s.tolerance > 0 {
+            crate::guess::mend(&s.geo, frame, s.tolerance)
+        } else if let (true, Some(g)) = (s.light, &self.grid) {
+            crate::light::brighten(&s.geo, frame, g)
+        } else {
+            frame.to_vec()
+        };
+        if s.grain > 0 {
+            crate::light::grain(&s.geo, &mut shown, node, s.grain);
+        }
+        self.mended.push(shown);
     }
     /// The frame becomes the one the next frames are guessed from.
     pub fn refer(&mut self, frame: &[u8]) {
@@ -266,6 +295,14 @@ impl Chain {
             b => *b = Some(frame.to_vec()),
         }
     }
+}
+
+/// How a bottle's frames are shown otherwise than they are kept.
+struct Shows {
+    geo: Geometry,
+    tolerance: u8,
+    light: bool,
+    grain: u8,
 }
 
 pub struct Bottle {
@@ -368,6 +405,13 @@ impl Bottle {
                 *t = chain.dictionary.open(std::mem::take(t))?;
             }
         }
+        // A frame of dimmed light has its grid in front (or uses the one before).
+        let mut grids: Vec<Option<Vec<u8>>> = vec![None; ready.is_some() as usize];
+        for t in tiles.iter_mut() {
+            let (grid, tile) = crate::light::strip(std::mem::take(t));
+            grids.push(grid);
+            *t = tile;
+        }
         // Tiles that stand on their own are unpacked at once; the others wait for their turn.
         let unpacked: Vec<(Vec<u8>, Option<Vec<u8>>)> = tiles
             .into_par_iter()
@@ -415,6 +459,7 @@ impl Bottle {
                 if self.index.dictionary.is_some() {
                     tile = chain.dictionary.open(tile)?;
                 }
+                let tile = crate::light::strip(tile).1;
                 let mut frame = Vec::new();
                 if crate::pack::guessed(&tile) || crate::pack::blocks(&tile) {
                     self.rebuild(k, Some(&tile), &mut frame, chain)?;
@@ -444,6 +489,9 @@ impl Bottle {
             }
             Ok(())
         })?;
+        for (i, f) in out.iter().enumerate() {
+            chain.show(from + i, f, grids[i].take());
+        }
         Ok(out)
     }
 
@@ -475,7 +523,7 @@ impl Bottle {
     /// Every node's packed tile, in order, out of the dictionary if the bottle has one.
     fn tiles(&self) -> Result<Vec<Vec<u8>>, String> {
         let mut d = crate::dict::Dictionary::holding(self.index.patterns);
-        (0..self.index.nodes.len()).map(|i| if self.index.dictionary.is_some() { d.open(self.packed(i)?) } else { self.packed(i) }).collect()
+        (0..self.index.nodes.len()).map(|i| Ok(crate::light::strip(if self.index.dictionary.is_some() { d.open(self.packed(i)?)? } else { self.packed(i)? }).1)).collect()
     }
 
     /// (16 x 16 tiles guessed perfectly, tiles) over all guessed frames.

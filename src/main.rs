@@ -31,6 +31,7 @@ mod chop;
 mod dict;
 mod golden;
 mod guess;
+mod light;
 mod motor;
 mod pack;
 mod particle;
@@ -50,6 +51,9 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
              [--line]                    exact, but each sample first says whether it stayed what it was
+             [--light N]                 exact packing of dimmed light: N brightness levels on a curve (64, 96, 128)
+             [--grid N]                  the same with a grid of N levels made for each frame
+             [--grain]                   with --coarse or --tolerance: fake film grain on what is shown
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
@@ -60,6 +64,7 @@ fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
 fbottle info <bottle>
 fbottle forget <bottle>                  empty the bottle's window in Nimbus
+fbottle raw <bottle> <file>              the frames as the player shows them, one after the other, as plain bytes
 fbottle smoother <bottle>                how near a guessed frame comes to a real one";
 
 struct Packed {
@@ -99,6 +104,18 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let profile = *rules.profiles.get(profile_name).ok_or(format!("--for {profile_name}: rules.toml has no such profile"))?;
     let movie = chop::probe(movie_path)?;
     let geo = &movie.geo;
+    let mut light = match (rules.light, rules.grid) {
+        (0, 0) => None,
+        (n, 0) => Some(light::Light::curve(n)),
+        (_, n) => Some(light::Light::grid(n)),
+    };
+    if light.is_some() && (rules.coarse > 0 || rules.tolerance > 0 || !block::fits(geo)) {
+        return Err("--light and --grid go with the exact packing of 8-bit YUV 4:2:0 only".into());
+    }
+    // For fake grain: the squares of what the rebuilt brightness differs from the movie's by.
+    let (mut grain_squares, mut grain_samples) = (0f64, 0f64);
+    let light_len = geo.planes[0].len();
+    let far_light = |a: &[u8], b: &[u8]| a[..light_len].iter().zip(&b[..light_len]).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>();
     if rules.coarse > 0 && !block::fits(geo) {
         return Err(format!("--coarse cuts 8-bit YUV 4:2:0 only; this movie's frames are {}", geo.pix_fmt));
     }
@@ -138,6 +155,13 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         if frames.is_empty() {
             break;
         }
+        // Dimmed light: each frame's brightness becomes level numbers, in order.
+        let mut grids: Vec<Option<Vec<u8>>> = Vec::new();
+        if let Some(l) = light.as_mut() {
+            for f in frames.iter_mut() {
+                grids.push(l.dim(geo, f));
+            }
+        }
         if !explained {
             explained = true;
             println!("PACK   HotMotor on the first tile (--for {profile_name}), best first:");
@@ -172,6 +196,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                     (2, guess::pack_within(geo, &frame, before, hammer.guess(), rules.bands, rules.tolerance))
                 };
                 hammer.strike(&rebuilt);
+                if rules.grain {
+                    grain_squares += far_light(&frame, &rebuilt);
+                    grain_samples += light_len as f64;
+                }
                 if let Some(waited) = held.take() {
                     // The frame that waited lies between the last one kept and this one.
                     let coarser = ((rules.coarse as f64 * rules.blocks.between).round() as u8).max(rules.coarse);
@@ -220,11 +248,18 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             })
             .collect::<Result<_, String>>()?;
         carry_exact = frames.pop().zip(raws.last().cloned());
-        for (raw, mut hashes, was_struck, leans) in done {
+        for (i, (raw, mut hashes, was_struck, leans)) in done.into_iter().enumerate() {
             struck += was_struck as usize;
-            if rules.dictionary {
+            if rules.dictionary || light.is_some() {
                 let parts: Option<Vec<Vec<u8>>> = hashes.iter().map(|h| bottle::from_nimbus(h)).collect();
-                let kept = dictionary.close(parts.ok_or("a share is not in Nimbus")?.concat());
+                let mut kept = parts.ok_or("a share is not in Nimbus")?.concat();
+                if light.is_some() {
+                    // The frame's grid goes in front of it (or "the one before").
+                    kept = light::wrap(grids[i].as_deref(), kept);
+                }
+                if rules.dictionary {
+                    kept = dictionary.close(kept);
+                }
                 hashes = particle::shares(&kept, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
             }
             let ports = hashes
@@ -254,6 +289,12 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     for (i, node) in nodes.iter_mut().enumerate() {
         (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
         node.next = (i + 1 < n).then_some(i as u32 + 1);
+    }
+    if let Some(l) = &light {
+        println!("LIGHT  brightness kept as level numbers: {} of {} frames store a grid, the others use the one before", l.stored, l.frames);
+    }
+    if rules.grain {
+        println!("GRAIN  the brightness the packing left out is {:.2} levels strong (root mean square); the player lays three quarters of it back as fake grain", light::grain_of(grain_squares, grain_samples) as f64 / 16.0);
     }
     if rules.dictionary {
         let d = &dictionary;
@@ -313,6 +354,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         tolerance: rules.tolerance,
         coarse: rules.coarse,
         between: rules.coarse > 0 && rules.between,
+        light: light.is_some(),
+        grain: if rules.grain { light::grain_of(grain_squares, grain_samples) } else { 0 },
         dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
         patterns: rules.patterns,
         nodes,
@@ -431,6 +474,9 @@ fn run() -> Result<(), String> {
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
             "--between" => rules.between = true,
+            "--grain" => rules.grain = true,
+            "--light" => rules.light = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--light needs a number of levels from 2 to 256")?,
+            "--grid" => rules.grid = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--grid needs a number of levels from 2 to 256")?,
             "--dictionary-first" => {
                 rules.dictionary = true;
                 block::PLAIN_BITS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -458,9 +504,12 @@ fn run() -> Result<(), String> {
             let (mut far, mut mended) = ((0, 0.0, 0), (0, 0.0, 0));
             let (same, nodes, frames) = verify(&b, path(1, "the movie")?, &mut far, &mut mended)?;
             println!("{same} of {frames} frames unpack identically ({nodes} nodes): {}", if same == frames && nodes == frames { "identical" } else { "NOT identical" });
-            let close = nodes == frames && (b.index.coarse > 0 || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
+            let close = nodes == frames && (b.index.coarse > 0 || b.index.light || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
             if b.index.coarse > 0 {
                 println!("blocks, coarse {}: {}", b.index.coarse, nearness(&far, 0));
+            }
+            if b.index.light || b.index.grain > 0 {
+                println!("as shown    {}", nearness(&mended, 0));
             }
             if b.index.tolerance > 0 {
                 println!("as rebuilt  {}", nearness(&far, b.index.tolerance));
@@ -491,6 +540,23 @@ fn run() -> Result<(), String> {
                 })?
             };
             show_play("played", &s);
+        }
+        Some("raw") => {
+            // The frames as the player shows them, for measuring from outside.
+            use std::io::Write;
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let out = path(1, "the file to write")?;
+            let mut file = std::io::BufWriter::new(std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?);
+            let mut chain = bottle::Chain::mending(&b);
+            let n = b.index.nodes.len();
+            for from in (0..n).step_by(24) {
+                let frames = b.frames(from, (from + 24).min(n), &mut chain)?;
+                let shown: Vec<Vec<u8>> = chain.mended.drain(..).collect();
+                for f in if shown.is_empty() { &frames } else { &shown } {
+                    file.write_all(f).map_err(|e| e.to_string())?;
+                }
+            }
+            println!("{n} frames of {}x{} {} written to {}", b.index.width, b.index.height, b.index.pix_fmt, out.display());
         }
         Some("forget") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
@@ -543,7 +609,7 @@ fn run() -> Result<(), String> {
             let (mut far, mut mended) = ((0, 0.0, 0), (0, 0.0, 0));
             let (same, nodes, frames) = verify(&b, movie, &mut far, &mut mended)?;
             let identical = same == frames && nodes == frames;
-            let close = nodes == frames && (b.index.coarse > 0 || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
+            let close = nodes == frames && (b.index.coarse > 0 || b.index.light || (b.index.tolerance > 0 && far.0 <= b.index.tolerance));
             player::forget(&b);
             let first = player::play(&b, &rules, smooth, &mut |_| true)?;
             let again = player::play(&b, &rules, smooth, &mut |_| true)?;
