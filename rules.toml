@@ -1,0 +1,64 @@
+# Every number Frame Bottle's motor uses. The code holds the logic, this file the taste.
+
+# How many partial packs the beam keeps after each rule.
+beam = 3
+
+# The axes a pack trades between, as the command's --for asks for them.
+[profile.size]    # the smallest bottle
+pack = 0.1
+play = 0.2
+size = 1.0
+
+[profile.play]    # the quickest unpacking
+pack = 0.1
+play = 1.0
+size = 0.4
+
+# One rule per decision. Each variant says how it scores on the axes (0 to 1).
+
+# What a pixel is told apart from, inside its own tile only (never another frame).
+[rule.predict]
+weight = 0.3
+variants = [
+  { value = "none",  pack = 1.0, play = 1.0, size = 0.0 },
+  { value = "left",  pack = 0.9, play = 0.9, size = 0.5 },
+  { value = "up",    pack = 0.9, play = 0.9, size = 0.5 },
+  { value = "paeth", pack = 0.6, play = 0.6, size = 0.8 },
+  { value = "med",   pack = 0.7, play = 0.7, size = 0.9 },
+]
+
+# The coder that writes the tile's bytes.
+[rule.coder]
+weight = 0.5
+variants = [
+  { value = "deflate", pack = 0.7, play = 0.9, size = 0.4 },
+  { value = "zstd",    pack = 0.3, play = 1.0, size = 0.6 },
+  { value = "xz",      pack = 0.3, play = 0.3, size = 0.9 },
+]
+
+# Judges look at the whole set of choices, on the tile itself.
+[judge]
+# The size judge packs a sample of the tile with the choice and scores what it saved.
+size = 10.0
+# The sample: this many bands of this many rows, spread over the tile.
+sample_bands = 8
+band_rows = 16
+
+# The smoother: vectors between node A and node B.
+[smoother]
+# A vector is found per block of this many pixels.
+block = 16
+# How far a block may move from A to B, in pixels each way.
+range = 24
+# How much nearer per pixel (in grey levels) a moved block must match than a still one
+# (so still things stay still and a vector does not follow the grain).
+zero_bias = 12.0
+# A block whose best match still differs this much per pixel is blended in place.
+poor_match = 24.0
+
+# The player rolling window in Nimbus, counted in nodes around the playhead.
+[player]
+# Nodes made ready ahead of the playhead (unpacked, and their in-between frames guessed).
+ahead = 24
+# Nodes kept behind the playhead; older ones leave Nimbus.
+behind = 24

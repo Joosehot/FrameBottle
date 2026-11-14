@@ -1,0 +1,344 @@
+//! Frame Bottle: a movie as a grid of frames.
+//!
+//! 1. CHOP     the movie into its frames, every one (src/chop.rs)
+//! 2. GRID     every frame is a tile of one grid
+//! 3. PACK     each tile into smaller bytes, HotMotor choosing how (src/motor.rs, src/pack.rs);
+//!             the packed tiles lie in Strike's Nimbus, branded by Strike's lightning
+//! 4. NODES    each frame is a node, a particle of the rice bowl's particle maker whose
+//!             ports hold the packed tile and whose bond leads to the next frame (src/particle.rs)
+//! 5. GLUE     Strike's Nimbus strikes every share into one .fbott file (src/bottle.rs)
+//! 6. PLAYER   from node to node, the frames unpacked just before they play, in a
+//!             rolling window in Nimbus (src/player.rs)
+//! 7. SMOOTHER the frames between two nodes, guessed live from vectors (src/smooth.rs)
+//!
+//! The report's numbers are worked out by Nuome's Golden Answer (src/golden.rs).
+
+// Strike's own code, as it is in Strike: the lightning's home and hashes, and Nimbus.
+#[allow(dead_code)]
+#[path = "../../Strike/src/lightning.rs"]
+mod lightning;
+#[allow(dead_code)]
+#[path = "../../Strike/src/fstrike.rs"]
+mod fstrike;
+
+mod bottle;
+mod chop;
+mod golden;
+mod motor;
+mod pack;
+mod particle;
+mod player;
+mod smooth;
+
+use bottle::{Bottle, Index, Node};
+use motor::Rules;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+const USAGE: &str = "\
+fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain]
+fbottle verify <bottle> <movie>          every node against the movie's own frames
+fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2); --bench: no window, timed
+fbottle test <movie> [--smooth N] [--for size|play]   pack, verify, play twice without a window, report
+fbottle info <bottle>
+fbottle forget <bottle>                  empty the bottle's window in Nimbus
+fbottle smoother <bottle>                how near a guessed frame comes to a real one";
+
+struct Packed {
+    out: PathBuf,
+    frames: usize,
+    struck: usize,
+    seconds: f64,
+}
+
+fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str) -> String {
+    bottle::sha(format!("fbottle pack 1\n{rules_text}\n{profile}\n{} {}x{}\n{} {}\n{raw}", geo.pix_fmt, geo.width, geo.height, species.definition_hash, species.k).as_bytes())
+}
+
+fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bool, rules: &Rules) -> Result<Packed, String> {
+    let began = Instant::now();
+    let profile = *rules.profiles.get(profile_name).ok_or(format!("--for {profile_name}: rules.toml has no such profile"))?;
+    let movie = chop::probe(movie_path)?;
+    let geo = &movie.geo;
+    let species = particle::choose()?;
+    println!("CHOP   {}: {}x{} {} at {}/{} frames a second", movie_path.display(), geo.width, geo.height, movie.source_pix_fmt, movie.fps.0, movie.fps.1);
+    if movie.source_pix_fmt != geo.pix_fmt {
+        println!("       the frames are taken as {} (ffmpeg's conversion of {})", geo.pix_fmt, movie.source_pix_fmt);
+    }
+    println!(
+        "NODES  each node is a copy of the particle {} ({}): {} ports hold the tile, the bond port {} -> port {} of the next (affinity {:.3}) is the link",
+        species.id, species.kind, species.k, species.out, species.into, species.affinity
+    );
+    let mut reader = chop::frames(movie_path, geo)?;
+    let batch = rayon::current_num_threads() * 2;
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut share_ids: HashMap<String, u32> = HashMap::new();
+    let mut share_hashes: Vec<String> = Vec::new();
+    let (mut struck, mut explained) = (0usize, !explain);
+    loop {
+        let mut frames = Vec::new();
+        while frames.len() < batch {
+            match reader.next()? {
+                Some(f) => frames.push(f),
+                None => break,
+            }
+        }
+        if frames.is_empty() {
+            break;
+        }
+        if !explained {
+            explained = true;
+            println!("PACK   HotMotor on the first tile (--for {profile_name}), best first:");
+            for c in pack::choose(geo, &frames[0], rules, &profile) {
+                let name: Vec<&str> = c.choice.iter().map(|(_, v)| v.as_str()).collect();
+                println!("         {:14} {:.3} = {:.3} by the rules {:+.3} judged   {}", name.join("+"), c.score(), c.local, c.judged, c.notes.join("; "));
+            }
+        }
+        // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
+        let done: Vec<(String, Vec<String>, bool)> = frames
+            .par_iter()
+            .map(|frame| -> Result<_, String> {
+                let raw = bottle::sha(frame);
+                // Only the rules that decide a pack are in its brand (not the smoother's or the player's).
+                let pack_rules = motor::DEFAULT_RULES.split("[smoother]").next().unwrap();
+                let key = pack_key(pack_rules, profile_name, geo, &species, &raw);
+                if let Some(text) = bottle::branded("pack", &key) {
+                    let hashes: Vec<String> = text.lines().map(str::to_string).collect();
+                    if hashes.len() == species.k && hashes.iter().all(|h| bottle::in_nimbus(h)) {
+                        return Ok((raw, hashes, true));
+                    }
+                }
+                let best = pack::choose(geo, frame, rules, &profile).remove(0);
+                let packed = pack::pack(geo, frame, &best.choice);
+                let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
+                bottle::brand("pack", &key, &hashes.join("\n"));
+                Ok((raw, hashes, false))
+            })
+            .collect::<Result<_, String>>()?;
+        for (raw, hashes, was_struck) in done {
+            struck += was_struck as usize;
+            let ports = hashes
+                .into_iter()
+                .map(|h| {
+                    *share_ids.entry(h.clone()).or_insert_with(|| {
+                        share_hashes.push(h);
+                        share_hashes.len() as u32 - 1
+                    })
+                })
+                .collect();
+            nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw, ports, next: None });
+        }
+    }
+    let n = nodes.len();
+    if n == 0 {
+        return Err(format!("{}: no frames in it", movie_path.display()));
+    }
+    // GRID: the smallest square-ish grid that has a tile for every frame, filled row by row.
+    let cols = (1..=n).find(|c| c * c >= n).unwrap();
+    let rows = n.div_ceil(cols);
+    for (i, node) in nodes.iter_mut().enumerate() {
+        (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
+        node.next = (i + 1 < n).then_some(i as u32 + 1);
+    }
+    println!("GRID   {n} frames as tiles of a {cols} x {rows} grid ({} x {} pixels)", cols * geo.width, rows * geo.height);
+    println!("PACK   {} tiles packed, {} struck from Nimbus (already branded)", n - struck, struck);
+    let out = out.unwrap_or_else(|| movie_path.with_extension("fbott"));
+    let index = Index {
+        format: "frame-bottle/1".into(),
+        source: movie_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        pix_fmt: geo.pix_fmt.clone(),
+        source_pix_fmt: movie.source_pix_fmt.clone(),
+        width: geo.width,
+        height: geo.height,
+        fps: movie.fps,
+        cols: cols as u32,
+        rows: rows as u32,
+        species,
+        nodes,
+        shares: Vec::new(),
+    };
+    let size = bottle::glue(&out, index, &share_hashes)?;
+    println!("GLUE   {} shares struck from Nimbus into {} ({size} bytes)", share_hashes.len(), out.display());
+    Ok(Packed { out, frames: n, struck, seconds: began.elapsed().as_secs_f64() })
+}
+
+/// Every node unpacked from the bottle itself and compared, byte by byte,
+/// with the movie's frames chopped again. Returns (frames alike, nodes, frames in the movie).
+fn verify(b: &Bottle, movie_path: &Path) -> Result<(usize, usize, usize), String> {
+    let mut reader = chop::frames(movie_path, &b.geo)?;
+    let batch = rayon::current_num_threads() * 2;
+    let (mut same, mut seen) = (0usize, 0usize);
+    loop {
+        let mut frames = Vec::new();
+        while frames.len() < batch {
+            match reader.next()? {
+                Some(f) => frames.push(f),
+                None => break,
+            }
+        }
+        if frames.is_empty() {
+            break;
+        }
+        let nodes = b.index.nodes.len();
+        same += frames.par_iter().enumerate().filter(|(i, f)| seen + i < nodes && b.frame(seen + i).is_ok_and(|u| u == **f)).count();
+        seen += frames.len();
+    }
+    Ok((same, b.index.nodes.len(), seen))
+}
+
+fn exact(question: &str, places: usize) -> String {
+    match golden::ask(question) {
+        Ok(a) if a.contains('/') => format!("{} = {a} (Golden Answer, logical)", golden::decimal(&a, places)),
+        Ok(a) => format!("{a} (Golden Answer, logical)"),
+        Err(e) => format!("not worked out: {e}"),
+    }
+}
+
+fn show_play(label: &str, s: &player::Stats) {
+    println!(
+        "{label}: {} frames ({} nodes + {} guessed) in {:.2} s of work, {:.1} ms a frame, enough for {:.0} frames a second",
+        s.frames_out(),
+        s.nodes,
+        s.guessed_frames,
+        s.work.as_secs_f64(),
+        s.ms_per_frame(),
+        1000.0 / s.ms_per_frame().max(1e-9)
+    );
+    println!(
+        "         nodes: {} unpacked from particles, {} struck from Nimbus; guessed: {} made live, {} struck; window: {} frames at most, {} left Nimbus",
+        s.unpacked, s.struck, s.guessed, s.guesses_struck, s.window_peak, s.left
+    );
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    println!(
+        "         thread time: unpacking {:.0} ms, into Nimbus {:.0} ms, vectors {:.0} ms, guessed frames {:.0} ms",
+        ms(s.spent[0]), ms(s.spent[1]), ms(s.spent[2]), ms(s.spent[3])
+    );
+    if s.blocks > 0 {
+        println!("         vectors: {} of {} blocks moved", s.moving_blocks, s.blocks);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rules = Rules::parse(motor::DEFAULT_RULES)?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let (mut out, mut profile, mut explain, mut smooth, mut bench) = (None, "size".to_string(), false, 2usize, false);
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" => out = Some(PathBuf::from(it.next().ok_or("-o needs a file")?)),
+            "--for" => profile = it.next().ok_or("--for needs size or play")?.clone(),
+            "--explain" => explain = true,
+            "--bench" => bench = true,
+            "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,
+            _ => paths.push(PathBuf::from(a)),
+        }
+    }
+    let path = |i: usize, what: &str| paths.get(i).ok_or(format!("{what} is missing\n{USAGE}"));
+    match args.first().map(String::as_str) {
+        Some("pack") => {
+            let p = pack(path(0, "the movie")?, out, &profile, explain, &rules)?;
+            println!("packed {} frames in {:.1} s", p.frames, p.seconds);
+        }
+        Some("verify") => {
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let (same, nodes, frames) = verify(&b, path(1, "the movie")?)?;
+            println!("{same} of {frames} frames unpack identically ({nodes} nodes): {}", if same == frames && nodes == frames { "identical" } else { "NOT identical" });
+            if same != frames || nodes != frames {
+                return Err("the bottle does not hold the movie's frames".into());
+            }
+        }
+        Some("play") => {
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let s = player::play(&b, &rules, smooth, !bench)?;
+            show_play("played", &s);
+        }
+        Some("forget") => {
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            println!("{} frames left Nimbus", player::forget(&b));
+        }
+        Some("smoother") => {
+            // Every second node is hidden and guessed from its two neighbours, then compared
+            // with the real frame; the same for a plain mix of the neighbours, with no vectors.
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let luma = b.geo.planes[0].len();
+            if b.geo.planes[0].bps != 1 {
+                return Err("the smoother's check reads 8-bit frames only".into());
+            }
+            let psnr = |x: &[u8], y: &[u8]| {
+                let e: f64 = x[..luma].iter().zip(&y[..luma]).map(|(p, q)| (*p as f64 - *q as f64).powi(2)).sum::<f64>() / luma as f64;
+                if e == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / e).log10() }
+            };
+            let triples: Vec<usize> = (0..b.index.nodes.len().saturating_sub(2)).step_by(2).take(24).collect();
+            let scores: Vec<(f64, f64)> = triples
+                .par_iter()
+                .map(|i| -> Result<(f64, f64), String> {
+                    let (a, real, c) = (b.frame(*i)?, b.frame(i + 1)?, b.frame(i + 2)?);
+                    let v = smooth::vectors(&b.geo, &a, &c, &rules);
+                    let still = smooth::Vectors { block: v.block, bw: v.bw, bh: v.bh, d: vec![(0, 0); v.d.len()] };
+                    Ok((psnr(&smooth::between(&b.geo, &a, &c, &v, 1, 2), &real), psnr(&smooth::between(&b.geo, &a, &c, &still, 1, 2), &real)))
+                })
+                .collect::<Result<_, String>>()?;
+            let n = scores.len().max(1) as f64;
+            let (with, without) = (scores.iter().map(|s| s.0).sum::<f64>() / n, scores.iter().map(|s| s.1).sum::<f64>() / n);
+            let better = scores.iter().filter(|s| s.0 > s.1).count();
+            println!("{} hidden frames guessed from their neighbours (two frames apart, so harder than in play):", scores.len());
+            println!("  with vectors     {with:.2} dB (PSNR of the light, higher is nearer)");
+            println!("  plain mix        {without:.2} dB");
+            println!("  vectors nearer in {better} of {}", scores.len());
+        }
+        Some("info") => {
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let i = &b.index;
+            println!("{}: {}x{} {} at {}/{} frames a second, {} nodes on a {} x {} grid", i.source, i.width, i.height, i.pix_fmt, i.fps.0, i.fps.1, i.nodes.len(), i.cols, i.rows);
+            println!("particle {} ({}), {} ports, bond {} -> {}; {} shares", i.species.id, i.species.kind, i.species.k, i.species.out, i.species.into, i.shares.len());
+            for (name, n) in b.choices()? {
+                println!("  {n} tiles packed as {name}");
+            }
+        }
+        Some("test") => {
+            let movie = path(0, "the movie")?;
+            let p = pack(movie, out, &profile, explain, &rules)?;
+            let b = Bottle::open(&p.out)?;
+            let (same, nodes, frames) = verify(&b, movie)?;
+            let identical = same == frames && nodes == frames;
+            player::forget(&b);
+            let first = player::play(&b, &rules, smooth, false)?;
+            let again = player::play(&b, &rules, smooth, false)?;
+            let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).map_err(|e| format!("{}: {e}", p.display()));
+            let (original, bottled) = (size(movie)?, size(&p.out)?);
+            let raw = b.geo.frame_len() as u64 * nodes as u64;
+            let i = &b.index;
+            println!();
+            println!("REPORT {}", movie.display());
+            println!("  frames              {frames} in the movie, {nodes} nodes, grid {} x {} = {} tiles", i.cols, i.rows, exact(&format!("What is {} * {}?", i.cols, i.rows), 0));
+            println!("  original size       {original} bytes");
+            println!("  Frame Bottle size   {bottled} bytes");
+            println!("  compression ratio   original / bottle = {}", exact(&format!("What is {original} / {bottled}?"), 4));
+            println!("  frames unpacked     {raw} bytes; unpacked / bottle = {}", exact(&format!("What is {raw} / {bottled}?"), 4));
+            println!("  original FPS        {}", exact(&format!("What is {} / {}?", i.fps.0, i.fps.1), 3));
+            println!("  playback FPS        {} ({} guessed between each two nodes)", exact(&format!("What is {} * {smooth} / {}?", i.fps.0, i.fps.1), 3), smooth - 1);
+            println!("  frames identical    {} ({same} of {frames})", if identical { "yes" } else { "NO" });
+            println!("  packing             {:.1} s, {} tiles struck from Nimbus", p.seconds, p.struck);
+            for (name, n) in b.choices()? {
+                println!("                      {n} tiles packed as {name}");
+            }
+            show_play("  first play", &first);
+            show_play("  play again", &again);
+            if !identical {
+                return Err("the bottle does not hold the movie's frames".into());
+            }
+        }
+        _ => println!("{USAGE}"),
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("fbottle: {e}");
+        std::process::exit(1);
+    }
+}
