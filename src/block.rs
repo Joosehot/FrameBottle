@@ -79,6 +79,8 @@ impl Coder<'_> {
 struct Learned {
     /// Is the tile `moved`? By whether the tile to the left was (2: there is none).
     moved: [u16; 3],
+    /// Is a tile that is not `moved` from the Hammer's stack? By whether the one to the left was.
+    stack: [u16; 2],
     vector: [([u16; 32], [u16; 2]); 2],
     /// Has the block any wave left? By light or colour, and by flat or moved.
     any: [u16; 4],
@@ -92,7 +94,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 24], sign: [HALF; 2], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 24], sign: [HALF; 2], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -343,17 +345,18 @@ fn find_whole(s: &[u8; 256], before: &Pic, x0: i32, y0: i32, range: i32, left: (
 /// One band of tile rows `ty0..ty1`: packed (with `src`) or rebuilt (without).
 /// `bufs` are the band's rows of the three planes as the player has them.
 #[allow(clippy::too_many_arguments)]
-fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (range, dead, still): (i32, i32, u32), ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, c: &mut Coder) {
+fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, stack: Option<&[u8]>, (range, dead, still): (i32, i32, u32), ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, c: &mut Coder) {
     let at = geo.offsets();
     let mut l = Learned::new();
     let across = geo.width.div_ceil(TILE);
     for ty in ty0..ty1 {
         let mut left: Option<(i32, i32)> = None;
-        let mut any_left = false;
+        let (mut any_left, mut left_stack) = (false, false);
         for tx in 0..across {
             let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
             // The packer decides: is the tile somewhere in the frame before, or flat?
             let mut want: Option<(i32, i32)> = None;
+            let mut want_stack = false;
             if let (Some(src), Some(before)) = (src, before) {
                 let (sp, bp) = (pic(geo, &at, src, 0), pic(geo, &at, before, 0));
                 let mut s = [0u8; 256];
@@ -370,13 +373,29 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (
                 if moved <= flat * 4 + 2048 {
                     want = Some((dx, dy));
                 }
+                // The Hammer's stack: every frame so far, one on the other. Where the picture
+                // stands still the misses of single frames have evened out in it, and the
+                // tile is taken from there when the stack is more like it than the frame before.
+                if let Some(stack) = stack {
+                    let from_stack = unlike(&s, &pic(geo, &at, stack, 0), x0, y0, u32::MAX);
+                    // "More like it" by a clear margin (one grey level a pixel): measured, a tile
+                    // taken from the stack for less than that costs more bytes than it mends.
+                    let margin = 256;
+                    if from_stack + margin < moved && from_stack <= flat * 4 + 2048 {
+                        want = None;
+                        want_stack = true;
+                    }
+                }
             }
             let mut vector: Option<(i32, i32)> = None;
+            let mut from_stack = false;
             if before.is_some() {
                 let ctx = if !any_left { 2 } else { left.is_some() as usize };
                 if c.bit(&mut l.moved[ctx], want.is_some()) {
                     let (from, w) = (left.unwrap_or((0, 0)), want.unwrap_or((0, 0)));
                     vector = Some((from.0 + c.signed(&mut l.vector[0], w.0 - from.0), from.1 + c.signed(&mut l.vector[1], w.1 - from.1)));
+                } else if stack.is_some() {
+                    from_stack = c.bit(&mut l.stack[left_stack as usize], want_stack);
                 }
             }
             for i in 0..3 {
@@ -405,7 +424,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (
                     }
                     if n == 0 { 128 } else { ((sum + n / 2) / n) as i32 }
                 };
-                let from = vector.map(|(dx, dy)| (pic(geo, &at, before.unwrap(), i), dx >> p.sx, dy >> p.sy));
+                let from = if from_stack { Some((pic(geo, &at, stack.unwrap(), i), 0, 0)) } else { vector.map(|(dx, dy)| (pic(geo, &at, before.unwrap(), i), dx >> p.sx, dy >> p.sy)) };
                 for b in 0..(size / 8) * (size / 8) {
                     let (bx, by) = (px0 + (b % (size / 8)) * 8, py0 + (b / (size / 8)) * 8);
                     if bx >= p.w || by >= p.h {
@@ -436,10 +455,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (
                             *s = v.signum() * ((v.abs() + step / dead) / step);
                         }
                     }
-                    block(c, &mut l, (i > 0) as usize, vector.is_some() as usize, &mut steps);
+                    block(c, &mut l, (i > 0) as usize, (vector.is_some() || from_stack) as usize, &mut steps);
                     let mut back = [0i32; 64];
                     let waves_left = steps.iter().any(|s| *s != 0);
-                    if waves_left || !matches!(vector, Some((0, 0))) {
+                    if waves_left || !(from_stack || matches!(vector, Some((0, 0)))) {
                         made[i][(by / 8) * p.w.div_ceil(8) + bx / 8].store(true, Ordering::Relaxed);
                     }
                     if waves_left {
@@ -457,6 +476,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, before: Option<&[u8]>, (
                 }
             }
             left = vector;
+            left_stack = from_stack;
             any_left = true;
         }
     }
@@ -551,7 +571,8 @@ pub struct How {
 /// Packs a frame in AV1's way. `before` is the frame before as the player
 /// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
 /// length, the bands) and the frame as the player will rebuild it.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, coarse: u8, how: &How) -> (Vec<u8>, Vec<u8>) {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How) -> (Vec<u8>, Vec<u8>) {
+    let stack = stack.filter(|s| before.is_some() && s.len() == frame.len());
     // The top frame is what every still tile after it is a copy of: it is kept finer.
     let coarse = if before.is_none() { (coarse / 3).max(1) } else { coarse };
     let t = Tables::new(coarse, how.slope);
@@ -563,7 +584,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, c
         .into_par_iter()
         .map(|(ty0, bufs)| {
             let mut c = Coder::Write(Encoder::new());
-            band(geo, &t, Some(frame), before, (how.range as i32, how.dead.max(1) as i32, how.still), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
+            band(geo, &t, Some(frame), before, stack, (how.range as i32, how.dead.max(1) as i32, how.still), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
             match c {
                 Coder::Write(e) => e.finish(),
                 Coder::Read(_) => unreachable!(),
@@ -585,11 +606,12 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, c
 }
 
 /// The frame as the player rebuilds it.
-pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<Vec<u8>, String> {
+pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, stack: Option<&[u8]>) -> Result<Vec<u8>, String> {
     if payload.len() < HEAD || !fits(geo) {
         return Err("not a frame of blocks".into());
     }
     let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
+    let stack = stack.filter(|s| before.is_some() && s.len() == geo.frame_len());
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
@@ -605,7 +627,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>) -> Result<V
     }
     work.into_par_iter().zip(coded).for_each(|((ty0, bufs), bytes)| {
         let mut c = Coder::Read(Decoder::new(bytes));
-        band(geo, &t, None, before, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
+        band(geo, &t, None, before, stack, (0, 1, 0), ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, &mut c);
     });
     smooth_seams(geo, &mut out, payload[3], &made);
     Ok(out)
@@ -623,10 +645,10 @@ mod tests {
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
         let how = How { range: 7, slope: 32, dead: 12, still: 256 };
         for coarse in [1u8, 6, 20] {
-            let (first, a2) = pack(&geo, &a, None, 3, coarse, &how);
-            assert_eq!(unpack(&geo, &first, None).unwrap(), a2);
-            let (second, b2) = pack(&geo, &b, Some(&a2), 3, coarse, &how);
-            assert_eq!(unpack(&geo, &second, Some(&a2)).unwrap(), b2);
+            let (first, a2) = pack(&geo, &a, None, None, 3, coarse, &how);
+            assert_eq!(unpack(&geo, &first, None, None).unwrap(), a2);
+            let (second, b2) = pack(&geo, &b, Some(&a2), Some(&a2), 3, coarse, &how);
+            assert_eq!(unpack(&geo, &second, Some(&a2), Some(&a2)).unwrap(), b2);
         }
     }
 }

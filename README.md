@@ -400,3 +400,17 @@ Together: about 41 dB took 5.9 MB before this round and takes about 3.5 MB
 now. Tried and dropped, because they made it worse: looking 20 pixels away
 instead of 7, a stronger preference for standing still, and leaving out
 blocks with only one or two small waves.
+
+### The Hammer's stack as a place to take a tile from
+
+A tile can now be taken from three places: the frame before (by a vector),
+a flat guess, or the Hammer's stack (every frame so far, one on the other,
+at the same place). The packer takes it from the stack when the stack is
+more like the tile than the frame before by a clear margin.
+
+Measured on `guitar_10s.mp4`: no gain. Coarse 8: 9 400 423 bytes at
+45.44 dB (9 402 634 before); coarse 18: 3 971 804 at 41.75 dB (3 972 884).
+A stack that settles more slowly (1/16, 1/32 of the way a frame) was tried
+too: 0.03 dB nearer for 0.4 % more bytes. Where the picture stands still, a
+tile is already a copy of the tile before it, miss and all, so every frame
+in the stack carries the same miss and stacking them evens nothing out.

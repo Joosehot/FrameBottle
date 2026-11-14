@@ -124,7 +124,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             for frame in &frames {
                 let before = carry.as_ref().map(|(f, _)| f.as_slice());
                 let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
-                    (3, block::pack(geo, frame, before, rules.bands, rules.coarse, &rules.blocks))
+                    (3, block::pack(geo, frame, before, hammer.guess(), rules.bands, rules.coarse, &rules.blocks))
                 } else {
                     (2, guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance))
                 };

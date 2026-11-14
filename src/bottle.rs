@@ -293,7 +293,7 @@ impl Bottle {
             if let Some(packed) = &waiting[i] {
                 // The same guesses as when it was packed, and the corrections added.
                 out[i] = if crate::pack::blocks(packed) {
-                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref())?
+                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
                 } else {
                     crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
                 };
