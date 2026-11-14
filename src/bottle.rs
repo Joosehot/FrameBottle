@@ -85,6 +85,9 @@ pub struct Index {
     /// The most patterns the dictionary holds (0: the usual 4096).
     #[serde(default)]
     pub patterns: usize,
+    /// Every second frame lies between two and is guessed from both.
+    #[serde(default)]
+    pub between: bool,
     /// Kept in the tables after the text, not in it.
     #[serde(skip)]
     pub nodes: Vec<Node>,
@@ -232,11 +235,13 @@ pub struct Chain {
     /// tolerance lost put right as far as it can be) and waits here to be shown.
     mending: Option<(Geometry, u8)>,
     pub mended: Vec<Vec<u8>>,
+    /// A frame rebuilt before its turn (the one after a frame between two), with its node.
+    pub ahead: Option<(usize, Vec<u8>)>,
 }
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new() }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), ahead: None }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
@@ -251,11 +256,15 @@ impl Chain {
         if let Some((geo, tol)) = &self.mending {
             self.mended.push(crate::guess::mend(geo, frame, *tol));
         }
+        self.refer(frame);
+        self.at += 1;
+    }
+    /// The frame becomes the one the next frames are guessed from.
+    pub fn refer(&mut self, frame: &[u8]) {
         match &mut self.before {
             Some(b) if b.len() == frame.len() => b.copy_from_slice(frame),
             b => *b = Some(frame.to_vec()),
         }
-        self.at += 1;
     }
 }
 
@@ -348,15 +357,19 @@ impl Bottle {
                 at = end;
             }
         }
-        let mut waiting: Vec<Option<Vec<u8>>> = Vec::new();
-        let mut tiles: Vec<Vec<u8>> = (from..to).into_par_iter().map(|i| self.packed(i)).collect::<Result<_, String>>()?;
+        // A frame that was rebuilt early (the one after a frame between two) is already here.
+        let ready = chain.ahead.take().filter(|(k, _)| *k == from);
+        let first = from + ready.is_some() as usize;
+        let mut waiting: Vec<Option<Vec<u8>>> = vec![None; ready.is_some() as usize];
+        let mut tiles: Vec<Vec<u8>> = (first..to).into_par_iter().map(|i| self.packed(i)).collect::<Result<_, String>>()?;
         if self.index.dictionary.is_some() {
             // In order: each frame's bits come back through the dictionary, which moves on.
             for t in tiles.iter_mut() {
                 *t = chain.dictionary.open(std::mem::take(t))?;
             }
         }
-        let mut out: Vec<Vec<u8>> = tiles
+        // Tiles that stand on their own are unpacked at once; the others wait for their turn.
+        let unpacked: Vec<(Vec<u8>, Option<Vec<u8>>)> = tiles
             .into_par_iter()
             .map(|packed| {
                 if crate::pack::guessed(&packed) || crate::pack::blocks(&packed) {
@@ -365,26 +378,65 @@ impl Bottle {
                 let res = crate::pack::uncode(&self.geo, &packed)?;
                 Ok((crate::pack::restore(&self.geo, &packed, &res), None))
             })
-            .collect::<Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String>>()?
-            .into_iter()
-            .map(|(frame, guess)| {
-                waiting.push(guess);
-                frame
-            })
-            .collect();
+            .collect::<Result<_, String>>()?;
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(to - from);
+        let mut done = vec![false; to - from];
+        if let Some((_, frame)) = ready {
+            out.push(frame);
+            done[0] = true;
+            chain.at += 1;
+        }
+        for (frame, guess) in unpacked {
+            out.push(frame);
+            waiting.push(guess);
+        }
+        let between = |w: &Option<Vec<u8>>| w.as_ref().is_some_and(|p| crate::pack::blocks(p) && crate::block::between(&p[3..]));
         for i in 0..out.len() {
-            if let Some(packed) = &waiting[i] {
-                // The same guesses as when it was packed, and the corrections added.
-                out[i] = if crate::pack::blocks(packed) {
-                    crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books)?
-                } else {
-                    crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
-                };
-            } else if self.index.nodes[from + i].leans {
-                let prev = chain.before.as_deref().filter(|p| p.len() == out[i].len());
-                crate::pack::lean_on(&mut out[i], prev.ok_or("a leaning tile was unpacked without the tile before it")?);
+            if done[i] {
+                continue;
             }
-            chain.feed(&out[i]);
+            if !between(&waiting[i]) {
+                self.rebuild(from + i, waiting[i].as_deref(), &mut out[i], chain)?;
+                chain.feed(&out[i]);
+                continue;
+            }
+            // A frame between two: the frame after it is rebuilt first (from the frame
+            // before this one), then this one from both.
+            let after = if i + 1 < out.len() {
+                let (now, later) = out.split_at_mut(i + 1);
+                self.rebuild(from + i + 1, waiting[i + 1].as_deref(), &mut later[0], chain)?;
+                let _ = now;
+                done[i + 1] = true;
+                out[i + 1].clone()
+            } else {
+                // It lies past this run: it is rebuilt now and kept for the next run.
+                let k = from + out.len();
+                let mut tile = self.packed(k)?;
+                if self.index.dictionary.is_some() {
+                    tile = chain.dictionary.open(tile)?;
+                }
+                let mut frame = Vec::new();
+                if crate::pack::guessed(&tile) || crate::pack::blocks(&tile) {
+                    self.rebuild(k, Some(&tile), &mut frame, chain)?;
+                } else {
+                    frame = crate::pack::restore(&self.geo, &tile, &crate::pack::uncode(&self.geo, &tile)?);
+                    self.rebuild(k, None, &mut frame, chain)?;
+                }
+                if sha(&frame) != self.index.nodes[k].raw {
+                    return Err(format!("node {k} did not unpack to its frame"));
+                }
+                frame
+            };
+            chain.hammer.strike(&after);
+            let packed = waiting[i].as_ref().unwrap();
+            out[i] = crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), Some(&after), chain.hammer.picture(), &mut chain.books)?;
+            chain.at += 1;
+            chain.refer(&after);
+            if i + 1 < out.len() {
+                chain.at += 1;
+            } else {
+                chain.ahead = Some((from + out.len(), after));
+            }
         }
         out.par_iter().enumerate().try_for_each(|(i, f)| {
             if sha(f) != self.index.nodes[from + i].raw {
@@ -393,6 +445,22 @@ impl Bottle {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// One node's frame finished from what the chain holds: a guessed tile or a tile of
+    /// blocks is rebuilt (`packed`), a leaning tile is put on the frame before it.
+    fn rebuild(&self, node: usize, packed: Option<&[u8]>, frame: &mut Vec<u8>, chain: &mut Chain) -> Result<(), String> {
+        if let Some(packed) = packed {
+            *frame = if crate::pack::blocks(packed) {
+                crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books)?
+            } else {
+                crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
+            };
+        } else if self.index.nodes[node].leans {
+            let prev = chain.before.as_deref().filter(|p| p.len() == frame.len());
+            crate::pack::lean_on(frame, prev.ok_or("a leaning tile was unpacked without the tile before it")?);
+        }
+        Ok(())
     }
 
     /// A frame struck from the window is not unpacked, but its bits still go through

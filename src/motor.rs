@@ -42,6 +42,8 @@ pub struct Rules {
     pub coarse: u8,
     /// The pattern dictionary is used (the command's --dictionary).
     pub dictionary: bool,
+    /// Every second frame is guessed from the frames on both sides (the command's --between).
+    pub between: bool,
     /// The most patterns the bit dictionary holds (0: the usual 4096).
     pub patterns: usize,
     pub blocks: crate::block::How,
@@ -126,6 +128,7 @@ impl Rules {
             tolerance: 0,
             coarse: 0,
             dictionary: false,
+            between: false,
             patterns: 0,
             blocks: crate::block::How {
                 range: num(table("block")?, "range", "block")? as usize,
@@ -133,6 +136,7 @@ impl Rules {
                 dead: (num(table("block")?, "dead", "block")? as usize).clamp(1, 255) as u8,
                 still: num(table("block")?, "still", "block")? as u32,
                 weigh: num(table("block")?, "weigh", "block")?,
+                between: num(table("block")?, "between", "block")?,
             },
         })
     }

@@ -75,6 +75,9 @@ still = 256
 # the squares of what is still wrong, plus this for every bit, times the square of the
 # flattest step's length.
 weigh = 0.1
+# With --between, every second frame is guessed from the frame before it and the frame
+# after it. Nothing is guessed from such a frame, so its steps may be this much longer.
+between = 1.7
 
 # The smoother: vectors between node A and node B.
 [smoother]

@@ -1024,6 +1024,8 @@ pub struct How {
     /// What a bit is worth against the squares of what is still wrong, for a flattest
     /// step one long (it grows with the square of the step).
     pub weigh: f64,
+    /// How much longer the steps of a frame between two are.
+    pub between: f64,
 }
 
 /// Packs a frame in AV1's way. `before` is the frame before as the player
@@ -1081,7 +1083,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
     let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
     let after = if between(payload) { Some(after.filter(|a| a.len() == geo.frame_len()).ok_or("a frame between two was rebuilt without the frame after it")?) } else { None };
     let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()) };
-    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0 };
+    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0 };
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
@@ -1114,7 +1116,7 @@ mod tests {
         let mut s = 7u32;
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
-        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1 };
+        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0 };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
             let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer));

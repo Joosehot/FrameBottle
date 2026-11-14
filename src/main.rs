@@ -50,6 +50,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
              [--line]                    exact, but each sample first says whether it stayed what it was
+             [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
              [--dictionary-first]        with --coarse: the corrections as plain bits, the dictionary does the final packing
@@ -66,6 +67,27 @@ struct Packed {
     frames: usize,
     struck: usize,
     seconds: f64,
+}
+
+/// A packed frame becomes a node: through the dictionary if there is one, into the
+/// particle's ports, into Nimbus.
+fn keep(mut packed: Vec<u8>, rebuilt: &[u8], dictionary: Option<&mut dict::Dictionary>, ports: usize, share_ids: &mut HashMap<String, u32>, share_hashes: &mut Vec<String>, nodes: &mut Vec<Node>) -> Result<(), String> {
+    let leans = pack::leans(&packed);
+    if let Some(d) = dictionary {
+        packed = d.close(packed);
+    }
+    let hashes: Vec<String> = particle::shares(&packed, ports).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
+    let ports = hashes
+        .into_iter()
+        .map(|h| {
+            *share_ids.entry(h.clone()).or_insert_with(|| {
+                share_hashes.push(h);
+                share_hashes.len() as u32 - 1
+            })
+        })
+        .collect();
+    nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw: bottle::sha(rebuilt), ports, next: None, leans });
+    Ok(())
 }
 
 fn pack_key(rules_text: &str, profile: &str, geo: &pack::Geometry, species: &particle::Species, raw: &str, before: &str) -> String {
@@ -93,7 +115,12 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let mut share_hashes: Vec<String> = Vec::new();
     let (mut struck, mut explained) = (0usize, !explain);
     // The tile before the next one on the grid: the last frame of the batch before.
-    let mut carry: Option<(Vec<u8>, String)> = None;
+    let mut carry_exact: Option<(Vec<u8>, String)> = None;
+    // For the packings that are not exact: the last frame as the player will have it, the
+    // frame that waits to be guessed from both sides, and how many frames have come.
+    let mut carry: Option<Vec<u8>> = None;
+    let mut held: Option<Vec<u8>> = None;
+    let mut lossy_seen = 0usize;
     // The Hammer's stack of every frame so far, and one name for all of them (for the brand).
     let mut hammer = guess::Hammer::new();
     let mut so_far = String::new();
@@ -130,33 +157,29 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             // are; with --coarse, a frame is kept as blocks, vectors and waves. Either way each
             // frame is made from the frames as the player will have them, so one frame at a
             // time (its bands side by side).
-            for frame in &frames {
-                let before = carry.as_ref().map(|(f, _)| f.as_slice());
-                let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
-                    (3, block::pack(geo, frame, before, None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books)))
-                } else {
-                    (2, guess::pack_within(geo, frame, before, hammer.guess(), rules.bands, rules.tolerance))
-                };
-                let mut packed = vec![kind, 0, 0];
-                packed.extend(payload);
-                let leans = pack::leans(&packed);
-                if rules.dictionary {
-                    packed = dictionary.close(packed);
+            for frame in std::mem::take(&mut frames) {
+                let odd = lossy_seen % 2 == 1;
+                lossy_seen += 1;
+                // With --between every second frame waits for the one after it.
+                if rules.coarse > 0 && rules.between && odd && held.is_none() {
+                    held = Some(frame);
+                    continue;
                 }
-                let hashes: Vec<String> = particle::shares(&packed, species.k).into_iter().map(fstrike::put_bytes).collect::<Result<_, _>>()?;
-                let ports = hashes
-                    .into_iter()
-                    .map(|h| {
-                        *share_ids.entry(h.clone()).or_insert_with(|| {
-                            share_hashes.push(h);
-                            share_hashes.len() as u32 - 1
-                        })
-                    })
-                    .collect();
-                let raw = bottle::sha(&rebuilt);
-                nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw: raw.clone(), ports, next: None, leans });
+                let before = carry.as_ref().map(|f| f.as_slice());
+                let (kind, (payload, rebuilt)) = if rules.coarse > 0 {
+                    (3, block::pack(geo, &frame, before, None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books)))
+                } else {
+                    (2, guess::pack_within(geo, &frame, before, hammer.guess(), rules.bands, rules.tolerance))
+                };
                 hammer.strike(&rebuilt);
-                carry = Some((rebuilt, raw));
+                if let Some(waited) = held.take() {
+                    // The frame that waited lies between the last one kept and this one.
+                    let coarser = ((rules.coarse as f64 * rules.blocks.between).round() as u8).max(rules.coarse);
+                    let (p, r) = block::pack(geo, &waited, before, Some(&rebuilt), hammer.picture(), rules.bands, coarser, &rules.blocks, rules.dictionary.then_some(&mut books));
+                    keep([vec![3, 0, 0], p].concat(), &r, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+                }
+                keep([vec![kind, 0, 0], payload].concat(), &rebuilt, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+                carry = Some(rebuilt);
             }
             continue;
         }
@@ -175,7 +198,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             .enumerate()
             .map(|(i, frame)| -> Result<_, String> {
                 let raw = raws[i].clone();
-                let before: Option<(&[u8], &str)> = if i > 0 { Some((&frames[i - 1], &raws[i - 1])) } else { carry.as_ref().map(|(f, r)| (f.as_slice(), r.as_str())) };
+                let before: Option<(&[u8], &str)> = if i > 0 { Some((&frames[i - 1], &raws[i - 1])) } else { carry_exact.as_ref().map(|(f, r)| (f.as_slice(), r.as_str())) };
                 // Only the rules that decide a pack are in its brand (not the smoother's or the player's).
                 let pack_rules = motor::DEFAULT_RULES.split("[smoother]").next().unwrap();
                 let by_line = guess::BY_LINE.load(std::sync::atomic::Ordering::Relaxed);
@@ -196,7 +219,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 Ok((raw, hashes, false, leans))
             })
             .collect::<Result<_, String>>()?;
-        carry = frames.pop().zip(raws.last().cloned());
+        carry_exact = frames.pop().zip(raws.last().cloned());
         for (raw, mut hashes, was_struck, leans) in done {
             struck += was_struck as usize;
             if rules.dictionary {
@@ -215,6 +238,11 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 .collect();
             nodes.push(Node { frame: nodes.len() as u32, col: 0, row: 0, raw, ports, next: None, leans });
         }
+    }
+    if let Some(waited) = held.take() {
+        // The last frame waited for one that never came: it is kept as the others are.
+        let (p, r) = block::pack(geo, &waited, carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut books));
+        keep([vec![3, 0, 0], p].concat(), &r, rules.dictionary.then_some(&mut dictionary), species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
     }
     let n = nodes.len();
     if n == 0 {
@@ -284,6 +312,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         species,
         tolerance: rules.tolerance,
         coarse: rules.coarse,
+        between: rules.coarse > 0 && rules.between,
         dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
         patterns: rules.patterns,
         nodes,
@@ -401,6 +430,7 @@ fn run() -> Result<(), String> {
             "--explain" => explain = true,
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
+            "--between" => rules.between = true,
             "--dictionary-first" => {
                 rules.dictionary = true;
                 block::PLAIN_BITS.store(true, std::sync::atomic::Ordering::Relaxed);
