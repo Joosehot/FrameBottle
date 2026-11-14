@@ -678,3 +678,25 @@ after alone, groups of four were no better than groups of two. At VMAF 94.6
 a bottle is now about 5.15 MB against AV1's 2.16 MB (2.4 times); H.264 is
 about 16 % smaller than a bottle at VMAF 94.9. A step along the film:
 about 10 ms. The book of block patterns saves only 0.3 % now.
+
+### Four more of AV1's ways (2026-11-15, last)
+
+| what | measured on `guitar_10s.mp4`, coarse 8, `--between` |
+|---|---|
+| a tile that is in no other frame guessed from the pixels around each block, four ways (their mean, the row above carried down, the column to the left carried across, Paeth) | the first frame 276 806 to 268 971 bytes (2.8 %) |
+| the rebuilt frame's levels put right inside the loop (32 spans of 8 levels in each plane, by how far off they were on the whole; 96 bytes a frame) | with the next: |
+| the whole picture's move (the commonest vector of every third tile), which a tile's vector is told apart from | all three together: 4 868 255 bytes at 45.71 dB to 4 833 022 at 45.74 dB (0.7 %) |
+| a tile's light as one block of 16 x 16 when that weighs less than four of 8 x 8 | 4 878 971 bytes at 45.80 dB: 1 % more bytes for 0.06 dB, no gain; it is off (`large` in rules.toml) |
+
+Where it stands (`--coarse N --between --dictionary`):
+
+| | bytes | PSNR | VMAF |
+|---|---|---|---|
+| Frame Bottle, coarse 8 | 4 830 031 | 45.74 dB | 94.40 |
+| Frame Bottle, coarse 7 | 5 566 406 | 46.31 dB | 95.03 |
+| H.264, crf 22 | 4 621 893 | 46.33 dB | 94.90 |
+| AV1, crf 30 | 2 159 426 | 45.76 dB | 94.59 |
+
+These four moved little. The frames guessed from the one before still take
+35 kB each and the frames between two 8 kB; AV1's whole average is 7 kB a
+frame.

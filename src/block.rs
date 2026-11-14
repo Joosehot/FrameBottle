@@ -106,6 +106,8 @@ struct Learned {
     between: [u16; 2],
     /// Is a tile that is neither from the frame after (for a frame between two)?
     after: u16,
+    /// Which guess from the pixels around a tile that is in no other frame.
+    around: [u16; 3],
     vector: [([u16; 32], [u16; 2]); 2],
     /// Has the block any wave left? By light or colour, and by flat or moved.
     any: [u16; 4],
@@ -116,12 +118,21 @@ struct Learned {
     /// Is a wave more than one step, more than two? By light or colour and the waves next to it.
     more: [u16; 2 * 4 * 2],
     sign: [u16; 2],
+    /// For a tile of light taken as one block of 16 x 16: is it? (by whether the tile to
+    /// the left was); has it any wave; where the last one is (8 binary digits); is a wave
+    /// left, is it more than one step or two, and how many more.
+    big: [u16; 2],
+    any16: u16,
+    last16: [u16; 256],
+    left16: [u16; 7 * 6],
+    more16: [u16; 4 * 2],
+    size16: [[u16; 32]; 7],
     size: [[u16; 32]; 12],
 }
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -131,26 +142,36 @@ struct Tables {
     order: [usize; 64],
     cosine: [[i32; 8]; 8],
     step: [i32; 64],
+    /// The same for a whole tile of light taken as one block of 16 x 16.
+    order16: [usize; 256],
+    cosine16: [[i32; 16]; 16],
+    step16: [i32; 256],
+}
+
+/// The zigzag from the flattest wave to the finest, for a block `n` wide.
+fn zigzag(n: usize) -> Vec<usize> {
+    let mut order = Vec::with_capacity(n * n);
+    let (mut x, mut y, last) = (0usize, 0usize, n - 1);
+    for _ in 0..n * n {
+        order.push(y * n + x);
+        if (x + y) % 2 == 0 {
+            if x == last { y += 1 } else if y == 0 { x += 1 } else { x += 1; y -= 1 }
+        } else if y == last {
+            x += 1
+        } else if x == 0 {
+            y += 1
+        } else {
+            x -= 1;
+            y += 1
+        }
+    }
+    order
 }
 
 impl Tables {
     fn new(coarse: u8, slope: u8) -> Tables {
-        // The zigzag from the flattest wave to the finest.
-        let mut order = [0usize; 64];
-        let (mut x, mut y) = (0i32, 0i32);
-        for slot in order.iter_mut() {
-            *slot = (y * 8 + x) as usize;
-            if (x + y) % 2 == 0 {
-                if x == 7 { y += 1 } else if y == 0 { x += 1 } else { x += 1; y -= 1 }
-            } else if y == 7 {
-                x += 1
-            } else if x == 0 {
-                y += 1
-            } else {
-                x -= 1;
-                y += 1
-            }
-        }
+        let order: [usize; 64] = zigzag(8).try_into().unwrap();
+        let order16: [usize; 256] = zigzag(16).try_into().unwrap();
         // cos(k pi / 16) in 4096ths, k = 0..8; row 0 is the mean (1 / sqrt 2).
         const C: [i32; 9] = [4096, 4017, 3784, 3406, 2896, 2276, 1567, 799, 0];
         let mut cosine = [[0i32; 8]; 8];
@@ -167,7 +188,53 @@ impl Tables {
             let (u, v) = (order[i] % 8, order[i] / 8);
             *s = (coarse as i32 * (slope.max(1) as i32 + u as i32 + v as i32) / slope.max(1) as i32).max(1);
         }
-        Tables { order, cosine, step }
+        // cos(k pi / 32) in 4096ths, k = 0..16, for the block of 16.
+        const C16: [i32; 17] = [4096, 4076, 4017, 3920, 3784, 3612, 3406, 3166, 2896, 2598, 2276, 1931, 1567, 1189, 799, 401, 0];
+        let mut cosine16 = [[0i32; 16]; 16];
+        for (k, row) in cosine16.iter_mut().enumerate() {
+            for (n, v) in row.iter_mut().enumerate() {
+                let t = ((2 * n + 1) * k) % 64;
+                let t = if t > 32 { 64 - t } else { t };
+                *v = if k == 0 { 2896 } else if t <= 16 { C16[t] } else { -C16[32 - t] };
+            }
+        }
+        // A wave of the block of 16 is as fine as the wave of half its number in a block of 8.
+        let mut step16 = [1i32; 256];
+        for (i, s) in step16.iter_mut().enumerate() {
+            let (u, v) = (order16[i] % 16, order16[i] / 16);
+            *s = (coarse as i32 * (2 * slope.max(1) as i32 + u as i32 + v as i32) / (2 * slope.max(1) as i32)).max(1);
+        }
+        Tables { order, cosine, step, order16, cosine16, step16 }
+    }
+
+    /// 256 samples (a tile of light) into 256 waves, and back.
+    fn waves16(&self, x: &[i32; 256]) -> [i32; 256] {
+        let (t, mut mid, mut out) = (&self.cosine16, [0i32; 256], [0i32; 256]);
+        for r in 0..16 {
+            for k in 0..16 {
+                mid[r * 16 + k] = ((0..16).map(|n| t[k][n] * x[r * 16 + n]).sum::<i32>() + (1 << 12)) >> 13;
+            }
+        }
+        for c in 0..16 {
+            for k in 0..16 {
+                out[k * 16 + c] = ((0..16).map(|n| t[k][n] * mid[n * 16 + c]).sum::<i32>() + (1 << 13)) >> 14;
+            }
+        }
+        out
+    }
+    fn samples16(&self, y: &[i32; 256]) -> [i32; 256] {
+        let (t, mut mid, mut out) = (&self.cosine16, [0i32; 256], [0i32; 256]);
+        for c in 0..16 {
+            for n in 0..16 {
+                mid[n * 16 + c] = ((0..16).map(|k| t[k][n] * y[k * 16 + c]).sum::<i32>() + (1 << 12)) >> 13;
+            }
+        }
+        for r in 0..16 {
+            for n in 0..16 {
+                out[r * 16 + n] = ((0..16).map(|k| t[k][n] * mid[r * 16 + k]).sum::<i32>() + (1 << 13)) >> 14;
+            }
+        }
+        out
     }
 
     /// 64 samples into 64 waves.
@@ -375,6 +442,73 @@ fn block(c: &mut Coder, l: &mut Learned, t: &Tables, book: &mut Option<&mut Book
     if let Some(book) = book.as_deref_mut() {
         book.saw(waves_of(steps));
     }
+}
+
+/// The steps of the waves of a tile of light taken as one block of 16 x 16: written, or
+/// read into `steps`. As `block` does it, with the block's own learning.
+fn block16(c: &mut Coder, l: &mut Learned, t: &Tables, steps: &mut [i32; 256]) {
+    let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
+    if !c.bit(&mut l.any16, want > 0) {
+        *steps = [0; 256];
+        return;
+    }
+    let (mut node, mut end) = (1usize, 0usize);
+    for b in (0..8).rev() {
+        let bit = c.bit(&mut l.last16[node], (want.wrapping_sub(1) >> b) & 1 == 1);
+        node = (node * 2 + bit as usize) & 255;
+        end = end * 2 + bit as usize;
+    }
+    let end = end + 1;
+    let mut size_at = [0u8; 256];
+    for i in (0..end).rev() {
+        let at = t.order16[i];
+        let (u, v) = (at % 16, at / 16);
+        let get = |du: usize, dv: usize| if u + du < 16 && v + dv < 16 { size_at[(v + dv) * 16 + u + du] as usize } else { 0 };
+        let near = get(1, 0) + get(0, 1) + get(1, 1) + get(2, 0) + get(0, 2);
+        let fine = if i >= 64 { 6 } else { l_fine(i) };
+        if i + 1 < end && !c.bit(&mut l.left16[fine * 6 + near.min(5)], steps[i] != 0) {
+            steps[i] = 0;
+            continue;
+        }
+        let negative = c.bit(&mut l.sign[0], steps[i] < 0);
+        let want = steps[i].unsigned_abs().clamp(1, 65535);
+        let ctx = near.min(3) * 2;
+        let mut n = 1;
+        if c.bit(&mut l.more16[ctx], want > 1) {
+            n = 2;
+            if c.bit(&mut l.more16[ctx + 1], want > 2) {
+                n = 2 + c.count(&mut l.size16[fine], want.saturating_sub(2).max(1));
+            }
+        }
+        steps[i] = if negative { -(n as i32) } else { n as i32 };
+        size_at[at] = n.min(3) as u8;
+    }
+    for s in steps.iter_mut().skip(end) {
+        *s = 0;
+    }
+}
+
+/// A tile of light's miss as steps of the waves of one block of 16 x 16, and what
+/// those steps put back.
+fn count_steps16(t: &Tables, miss: &[i32; 256], dead: i32) -> [i32; 256] {
+    let w = t.waves16(miss);
+    let mut steps = [0i32; 256];
+    for (n, s) in steps.iter_mut().enumerate() {
+        let (v, step) = (w[t.order16[n]], t.step16[n]);
+        *s = v.signum() * ((v.abs() + step / dead) / step);
+    }
+    steps
+}
+
+fn put_back16(t: &Tables, steps: &[i32; 256]) -> [i32; 256] {
+    if steps.iter().all(|s| *s == 0) {
+        return [0; 256];
+    }
+    let mut w = [0i32; 256];
+    for (n, s) in steps.iter().enumerate() {
+        w[t.order16[n]] = s * t.step16[n];
+    }
+    t.samples16(&w)
 }
 
 #[inline(always)]
@@ -636,8 +770,12 @@ fn find_between(s: &[u8; 256], before: &Pic, after: &Pic, x0: i32, y0: i32) -> (
 /// Where a tile's guess comes from.
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
-    /// One flat value, from the pixels above the tile and to its left.
-    Flat,
+    /// From the pixels just above each block and just to its left, already rebuilt (for a
+    /// tile that is in no other frame): 0 their mean, 1 the row above carried down,
+    /// 2 the column to the left carried across, 3 each pixel from the one above it, the
+    /// one to its left and the one at the corner, whichever is nearest to above + left -
+    /// corner (AV1's Paeth).
+    Flat(u8),
     /// The Hammer's stack, at the same place.
     Stack,
     /// The frame before, by a vector for each quarter of the tile (in quarter pixels);
@@ -656,36 +794,63 @@ struct From<'a> {
     before: Option<&'a [u8]>,
     after: Option<&'a [u8]>,
     stack: Option<&'a [u8]>,
+    /// The vector most tiles of the frame have (the whole picture's move): what a
+    /// tile's vector is told apart from when the tile to its left has none.
+    whole: (i32, i32),
 }
 
-/// The flat guess of a plane's tile: the mean of the row above it and the column to
-/// its left, as far as the band has them.
-fn flat_of(buf: &[u8], p: &crate::pack::Plane, px0: usize, py0: usize, size: usize, band_top: usize) -> i32 {
-    let (mut sum, mut n) = (0u32, 0u32);
-    if py0 > band_top {
-        for x in px0..(px0 + size).min(p.w) {
-            sum += buf[(py0 - 1 - band_top) * p.w + x] as u32;
-            n += 1;
+/// The guess of a block from the pixels just above it and just to its left. `get`
+/// gives a pixel that is already rebuilt, or None where there is none.
+fn from_neighbours(mode: u8, get: &dyn Fn(i32, i32) -> Option<i32>, bx: i32, by: i32) -> [i32; 64] {
+    // A row or column that runs out of the picture is carried on by its last pixel.
+    let line = |along: &dyn Fn(i32) -> Option<i32>| -> Option<[i32; 8]> {
+        let mut l = [along(0)?; 8];
+        for k in 1..8 {
+            l[k] = along(k as i32).unwrap_or(l[k - 1]);
         }
-    }
-    if px0 > 0 {
-        for y in py0..(py0 + size).min(p.h) {
-            sum += buf[(y - band_top) * p.w + px0 - 1] as u32;
-            n += 1;
+        Some(l)
+    };
+    let above = line(&|k| get(bx + k, by - 1));
+    let left = line(&|k| get(bx - 1, by + k));
+    let both: Vec<i32> = above.iter().chain(left.iter()).flatten().copied().collect();
+    let mean = if both.is_empty() { 128 } else { (both.iter().sum::<i32>() + both.len() as i32 / 2) / both.len() as i32 };
+    let mut guess = [mean; 64];
+    match (mode, above, left) {
+        (1, Some(a), _) => {
+            for j in 0..8 {
+                guess[j * 8..j * 8 + 8].copy_from_slice(&a);
+            }
         }
+        (2, _, Some(l)) => {
+            for j in 0..8 {
+                guess[j * 8..j * 8 + 8].fill(l[j]);
+            }
+        }
+        (3, Some(a), Some(l)) => {
+            let corner = get(bx - 1, by - 1).unwrap_or(a[0]);
+            for j in 0..8 {
+                for k in 0..8 {
+                    let base = a[k] + l[j] - corner;
+                    let (da, dl, dc) = ((base - a[k]).abs(), (base - l[j]).abs(), (base - corner).abs());
+                    guess[j * 8 + k] = if dl <= da && dl <= dc { l[j] } else if da <= dc { a[k] } else { corner };
+                }
+            }
+        }
+        _ => {}
     }
-    if n == 0 { 128 } else { ((sum + n / 2) / n) as i32 }
+    guess
 }
 
 /// The guess for the 8 x 8 block at (bx, by) of plane `i`, in a tile whose corner in
 /// that plane is (px0, py0).
 #[allow(clippy::too_many_arguments)]
-fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, usize), (px0, py0): (usize, usize), kind: &Kind, flat: i32) -> [i32; 64] {
-    let mut guess = [flat; 64];
+fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, usize), (px0, py0): (usize, usize), kind: &Kind) -> [i32; 64] {
+    let mut guess = [128; 64];
     // A place in quarters of a light pixel is the same place in eighths of a colour pixel.
     let sample = |p: &Pic, x: usize, y: usize, dx: i32, dy: i32| if i == 0 { p.quarter(4 * x as i32 + dx, 4 * y as i32 + dy) } else { p.eighth(8 * x as i32 + dx, 8 * y as i32 + dy) };
     match kind {
-        Kind::Flat => {}
+        // A guess from the pixels around the block is made where the block is rebuilt (`from_neighbours`).
+        Kind::Flat(_) => {}
         Kind::Stack => {
             let sp = pic(geo, at, f.stack.unwrap(), i);
             for j in 0..8 {
@@ -791,13 +956,32 @@ fn blocks_of(geo: &Geometry, tx: usize, ty: usize) -> Vec<(usize, (usize, usize)
 /// every bit it would take. A block's waves are left out altogether when keeping them
 /// costs more than it mends.
 #[allow(clippy::too_many_arguments)]
-fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &Kind, head_bits: u32, (tx, ty, ty0): (usize, usize, usize), bufs: &[&mut [u8]; 3], dead: i32, price: f64) -> (f64, Vec<[i32; 64]>) {
+fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &Kind, head_bits: u32, (tx, ty, ty0): (usize, usize, usize), bufs: &[&mut [u8]; 3], (dead, large): (i32, bool), price: f64) -> (f64, Vec<[i32; 64]>, Option<Box<[i32; 256]>>) {
     let mut cost = price * head_bits as f64;
     let mut all = Vec::with_capacity(6);
+    // The light of the tile: what its four blocks weigh, their guesses and their misses.
+    let (mut light_cost, mut light) = (0f64, Vec::new());
+    // The blocks of this tile as this try would rebuild them (the next block is guessed from them).
+    let mut tried: Vec<(usize, usize, usize, [u8; 64])> = Vec::new();
     for (i, (bx, by), (px0, py0)) in blocks_of(geo, tx, ty) {
         let p = &geo.planes[i];
-        let flat = if *kind == Kind::Flat { flat_of(&bufs[i][..], p, px0, py0, TILE >> p.sx, ty0 * (TILE >> p.sy)) } else { 0 };
-        let guess = guess_of(geo, at, f, i, (bx, by), (px0, py0), kind, flat);
+        let guess = if let Kind::Flat(mode) = kind {
+            let band_top = ty0 * (TILE >> p.sy);
+            let get = |x: i32, y: i32| -> Option<i32> {
+                if x < 0 || y < 0 || x >= p.w as i32 || y >= p.h as i32 {
+                    return None;
+                }
+                for (pi, tx0, ty0, px) in &tried {
+                    if *pi == i && x >= *tx0 as i32 && x < *tx0 as i32 + 8 && y >= *ty0 as i32 && y < *ty0 as i32 + 8 {
+                        return Some(px[(y as usize - ty0) * 8 + x as usize - tx0] as i32);
+                    }
+                }
+                (y as usize >= band_top).then(|| bufs[i][(y as usize - band_top) * p.w + x as usize] as i32)
+            };
+            from_neighbours(*mode, &get, bx as i32, by as i32)
+        } else {
+            guess_of(geo, at, f, i, (bx, by), (px0, py0), kind)
+        };
         let sp = pic(geo, at, src, i);
         let mut miss = [0i32; 64];
         for j in 0..8 {
@@ -808,20 +992,63 @@ fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &
         let mut steps = count_steps(t, &miss, dead, price);
         let wrong_without: i64 = miss.iter().map(|m| (*m as i64) * (*m as i64)).sum();
         let mut wrong = wrong_without as f64 + price;
+        let mut back = [0i32; 64];
         if steps.iter().any(|s| *s != 0) {
-            let back = put_back(t, &steps);
+            back = put_back(t, &steps);
             let with: i64 = (0..64).map(|n| { let e = (miss[n] - ((guess[n] + back[n]).clamp(0, 255) - guess[n])) as i64; e * e }).sum();
             let bits: u32 = 7 + steps.iter().filter(|s| **s != 0).map(|s| 3 + 2 * s.unsigned_abs().ilog2()).sum::<u32>();
             if (with as f64) + price * bits as f64 <= wrong {
                 wrong = with as f64 + price * bits as f64;
             } else {
                 steps = [0; 64];
+                back = [0; 64];
             }
         }
+        if matches!(kind, Kind::Flat(_)) {
+            let mut px = [0u8; 64];
+            for n in 0..64 {
+                px[n] = (guess[n] + back[n]).clamp(0, 255) as u8;
+            }
+            tried.push((i, bx, by, px));
+        }
         cost += wrong;
+        if i == 0 {
+            light_cost += wrong;
+            light.push((bx - px0, by - py0, guess, miss));
+        }
         all.push(steps);
     }
-    (cost, all)
+    // A tile whose light is whole (not at the picture's edge) and guessed from another
+    // frame may keep its light as one block of 16 x 16, if that weighs less.
+    let mut big = None;
+    if large && light.len() == 4 && !matches!(kind, Kind::Flat(_)) {
+        let (mut guess, mut miss) = ([0i32; 256], [0i32; 256]);
+        for (dx, dy, g, m) in &light {
+            for j in 0..8 {
+                for k in 0..8 {
+                    guess[(dy + j) * 16 + dx + k] = g[j * 8 + k];
+                    miss[(dy + j) * 16 + dx + k] = m[j * 8 + k];
+                }
+            }
+        }
+        let steps = count_steps16(t, &miss, dead);
+        let mut wrong: f64 = miss.iter().map(|m| (*m as f64) * (*m as f64)).sum::<f64>() + price;
+        let mut kept = [0i32; 256];
+        if steps.iter().any(|s| *s != 0) {
+            let back = put_back16(t, &steps);
+            let with: f64 = (0..256).map(|n| ((miss[n] - ((guess[n] + back[n]).clamp(0, 255) - guess[n])) as f64).powi(2)).sum();
+            let bits: u32 = 9 + steps.iter().filter(|s| **s != 0).map(|s| 3 + 2 * s.unsigned_abs().ilog2()).sum::<u32>();
+            if with + price * bits as f64 <= wrong {
+                wrong = with + price * bits as f64;
+                kept = steps;
+            }
+        }
+        if wrong < light_cost {
+            cost += wrong - light_cost;
+            big = Some(Box::new(kept));
+        }
+    }
+    (cost, all, big)
 }
 
 /// A tile of `n` x `n` light pixels cut from a frame, its edges held.
@@ -841,13 +1068,14 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
     let price = how.weigh * (t.step[0] * t.step[0]) as f64;
     for ty in ty0..ty1 {
         let mut left: Option<(i32, i32)> = None;
-        let (mut any_left, mut left_stack, mut left_split, mut left_between) = (false, false, false, false);
+        let (mut any_left, mut left_stack, mut left_split, mut left_between, mut left_big) = (false, false, false, false, false);
         for tx in 0..across {
             let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
-            let from = left.unwrap_or((0, 0));
+            let from = left.unwrap_or(f.whole);
             // The packer tries the ways a tile can be guessed and keeps the one that weighs least.
-            let mut want = Kind::Flat;
+            let mut want = Kind::Flat(0);
             let mut kept: Option<Vec<[i32; 64]>> = None;
+            let mut kept_big: Option<Box<[i32; 256]>> = None;
             if let Some(src) = src {
                 let mut ways: Vec<(Kind, u32)> = Vec::new();
                 let sp = pic(geo, &at, src, 0);
@@ -881,21 +1109,25 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                         if f.stack.is_some() {
                             ways.push((Kind::Stack, 3));
                         }
-                        ways.push((Kind::Flat, 3));
+                        for mode in 0..4 {
+                            ways.push((Kind::Flat(mode), 5));
+                        }
                     }
                 } else {
-                    ways.push((Kind::Flat, 0));
+                    for mode in 0..4 {
+                        ways.push((Kind::Flat(mode), 2));
+                    }
                 }
                 let mut least = f64::MAX;
                 for (kind, bits) in &ways {
-                    let (cost, steps) = weigh(geo, t, &at, f, src, kind, *bits, (tx, ty, ty0), &bufs, dead, price);
+                    let (cost, steps, big) = weigh(geo, t, &at, f, src, kind, *bits, (tx, ty, ty0), &bufs, (dead, how.large), price);
                     if cost < least {
-                        (least, want, kept) = (cost, *kind, Some(steps));
+                        (least, want, kept, kept_big) = (cost, *kind, Some(steps), big);
                     }
                 }
             }
             // The tile's kind and vectors: written, or read.
-            let mut kind = Kind::Flat;
+            let mut kind = Kind::Flat(0);
             if f.before.is_some() {
                 let ctx = if !any_left { 2 } else { left.is_some() as usize };
                 if c.bit(&mut l.moved[ctx], matches!(want, Kind::Moved(..))) {
@@ -920,13 +1152,62 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     kind = Kind::Stack;
                 }
             }
+            if matches!(kind, Kind::Flat(_)) {
+                // Which of the four guesses from the pixels around: two yes/no.
+                let wm = if let Kind::Flat(m) = want { m } else { 0 };
+                let high = c.bit(&mut l.around[0], wm >= 2);
+                let low = c.bit(&mut l.around[1 + high as usize], wm & 1 == 1);
+                kind = Kind::Flat((high as u8) << 1 | low as u8);
+            }
+            // The light of a whole tile guessed from another frame: as one block of 16 x 16?
+            let whole_tile = x0 as usize + TILE <= geo.width && y0 as usize + TILE <= geo.height;
+            let big = !matches!(kind, Kind::Flat(_)) && whole_tile && c.bit(&mut l.big[left_big as usize], kept_big.is_some());
+            if big {
+                let (p, band_top) = (&geo.planes[0], ty0 * TILE);
+                let mut guess = [0i32; 256];
+                for b in 0..4 {
+                    let (dx, dy) = ((b % 2) * 8, (b / 2) * 8);
+                    let g = guess_of(geo, &at, f, 0, (x0 as usize + dx, y0 as usize + dy), (x0 as usize, y0 as usize), &kind);
+                    for j in 0..8 {
+                        guess[(dy + j) * 16 + dx..(dy + j) * 16 + dx + 8].copy_from_slice(&g[j * 8..j * 8 + 8]);
+                    }
+                }
+                let mut steps = kept_big.map_or([0i32; 256], |k| *k);
+                block16(c, &mut l, t, &mut steps);
+                let waves_left = steps.iter().any(|s| *s != 0);
+                let same = match kind {
+                    Kind::Stack => true,
+                    Kind::Moved(v, _) => v.iter().all(|v| *v == (0, 0)),
+                    _ => false,
+                };
+                if waves_left || !same {
+                    for b in 0..4 {
+                        made[0][((y0 as usize + (b / 2) * 8) / 8) * p.w.div_ceil(8) + (x0 as usize + (b % 2) * 8) / 8].store(true, Ordering::Relaxed);
+                    }
+                }
+                let back = put_back16(t, &steps);
+                let buf = &mut *bufs[0];
+                for j in 0..16 {
+                    for k in 0..16 {
+                        buf[(y0 as usize + j - band_top) * p.w + x0 as usize + k] = (guess[j * 16 + k] + back[j * 16 + k]).clamp(0, 255) as u8;
+                    }
+                }
+            }
             for (n, (i, (bx, by), (px0, py0))) in blocks_of(geo, tx, ty).into_iter().enumerate() {
+                if big && i == 0 {
+                    continue;
+                }
                 let p = &geo.planes[i];
                 let band_top = ty0 * (TILE >> p.sy);
-                let flat = if kind == Kind::Flat { flat_of(&bufs[i][..], p, px0, py0, TILE >> p.sx, band_top) } else { 0 };
-                let guess = guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind, flat);
+                let guess = if let Kind::Flat(mode) = kind {
+                    let buf = &bufs[i][..];
+                    let get = |x: i32, y: i32| -> Option<i32> { (x >= 0 && x < p.w as i32 && y >= band_top as i32 && y < p.h as i32).then(|| buf[(y as usize - band_top) * p.w + x as usize] as i32) };
+                    from_neighbours(mode, &get, bx as i32, by as i32)
+                } else {
+                    guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind)
+                };
                 let mut steps = kept.as_ref().map_or([0i32; 64], |k| k[n]);
-                block(c, &mut l, t, &mut book, (i > 0) as usize, (kind != Kind::Flat) as usize, &mut steps);
+                block(c, &mut l, t, &mut book, (i > 0) as usize, !matches!(kind, Kind::Flat(_)) as usize, &mut steps);
                 let waves_left = steps.iter().any(|s| *s != 0);
                 // A block that is only the same block of the frame before is not made anew.
                 let same = match kind {
@@ -949,6 +1230,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             left_split = matches!(kind, Kind::Moved(_, true));
             left_stack = kind == Kind::Stack;
             left_between = matches!(kind, Kind::Between(_));
+            left_big = big;
             any_left = true;
         }
     }
@@ -1036,7 +1318,69 @@ fn slots(books: Option<&mut Vec<Book>>, bands: usize, four: bool) -> Vec<Option<
         None => (0..bands).map(|_| None).collect(),
     }
 }
-const HEAD: usize = 7;
+const HEAD: usize = 9;
+/// After the frame is rebuilt its brightness and colours are put right level by level.
+const PUT_RIGHT: u8 = 64;
+
+/// The vector most tiles of the frame have: every third tile each way is looked for in
+/// the frame before, and the commonest answer is taken.
+fn whole_move(geo: &Geometry, frame: &[u8], before: &[u8], how: &How) -> (i32, i32) {
+    let at = geo.offsets();
+    let (sp, bp) = (pic(geo, &at, frame, 0), pic(geo, &at, before, 0));
+    let found: Vec<(i32, i32)> = (0..geo.height.div_ceil(TILE))
+        .into_par_iter()
+        .step_by(3)
+        .flat_map_iter(|ty| {
+            let (sp, bp) = (sp, bp);
+            (0..geo.width.div_ceil(TILE)).step_by(3).map(move |tx| {
+                let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
+                let v = find(&cut_tile(&sp, x0, y0, 16), 16, &bp, x0, y0, (how.range as i32, how.still), (0, 0));
+                (v.0, v.1)
+            })
+        })
+        .collect();
+    let mut count: std::collections::BTreeMap<(i32, i32), usize> = Default::default();
+    for v in found {
+        *count.entry(v).or_default() += 1;
+    }
+    let (mut most, mut n) = ((0, 0), 0);
+    for (v, k) in count {
+        if k > n {
+            (most, n) = (v, k);
+        }
+    }
+    (most.0.clamp(-127, 127), most.1.clamp(-127, 127))
+}
+
+/// How far, on the whole, the rebuilt frame's samples of each level (32 spans of 8
+/// levels, in each plane) are from the movie's: the packer measures it, and the frame
+/// is put right by it on both sides before anything is guessed from it.
+fn levels_off(geo: &Geometry, real: &[u8], rebuilt: &[u8]) -> [[i8; 32]; 3] {
+    let mut off = [[0i8; 32]; 3];
+    for (i, (p, at)) in geo.planes.iter().zip(geo.offsets()).enumerate().take(3) {
+        let mut sum = [(0i64, 0i64); 32];
+        for (r, v) in real[at..at + p.len()].iter().zip(&rebuilt[at..at + p.len()]) {
+            sum[(*v >> 3) as usize].0 += *r as i64 - *v as i64;
+            sum[(*v >> 3) as usize].1 += 1;
+        }
+        for (o, s) in off[i].iter_mut().zip(sum) {
+            if s.1 > 0 {
+                *o = ((2 * s.0 + s.1.signum() * s.0.signum() * s.1) / (2 * s.1)).clamp(-8, 8) as i8;
+            }
+        }
+    }
+    off
+}
+
+fn put_right(geo: &Geometry, frame: &mut [u8], off: &[[i8; 32]; 3]) {
+    for (i, (p, at)) in geo.planes.iter().zip(geo.offsets()).enumerate().take(3) {
+        frame[at..at + p.len()].par_chunks_mut(4096).for_each(|part| {
+            for v in part {
+                *v = (*v as i32 + off[i][(*v >> 3) as usize] as i32).clamp(0, 255) as u8;
+            }
+        });
+    }
+}
 
 /// For a frame between two: how many frames back and how many frames on the two lie.
 pub fn refs(payload: &[u8]) -> (usize, usize) {
@@ -1082,6 +1426,8 @@ pub struct How {
     /// With --between: how many frames a group is. The last of a group is guessed from
     /// the last of the group before; the others lie between two, the middle one first.
     pub group: usize,
+    /// The packer may keep a tile's light as one block of 16 x 16.
+    pub large: bool,
 }
 
 /// Packs a frame in AV1's way. `before` is the frame before as the player
@@ -1090,7 +1436,12 @@ pub struct How {
 #[allow(clippy::too_many_arguments)]
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>, refs: (u8, u8)) -> (Vec<u8>, Vec<u8>) {
     let after = after.filter(|_| before.is_some());
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()) };
+    // The whole picture's move, for a frame guessed from the one before it alone.
+    let whole = match (before, after) {
+        (Some(b), None) => whole_move(geo, frame, b, how),
+        _ => (0, 0),
+    };
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()), whole };
     let plain = PLAIN_BITS.load(Ordering::Relaxed);
     let books = if plain { None } else { books };
     let with_books = books.is_some();
@@ -1118,12 +1469,22 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
         })
         .collect();
     smooth_seams(geo, &mut rebuilt, coarse, &made);
-    let mut out = vec![(if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 })];
+    let off = levels_off(geo, frame, &rebuilt);
+    let any_off = off.iter().flatten().any(|o| *o != 0);
+    if any_off {
+        put_right(geo, &mut rebuilt, &off);
+    }
+    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
     out.push(refs.0);
     out.push(refs.1);
+    out.push(whole.0 as i8 as u8);
+    out.push(whole.1 as i8 as u8);
+    if any_off {
+        out.extend(off.iter().flatten().map(|o| *o as u8));
+    }
     for d in &done {
         out.extend((d.len() as u32).to_le_bytes());
     }
@@ -1140,18 +1501,28 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
     }
     let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
     let after = if between(payload) { Some(after.filter(|a| a.len() == geo.frame_len()).ok_or("a frame between two was rebuilt without the frame after it")?) } else { None };
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()) };
-    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1 };
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()), whole: (payload[7] as i8 as i32, payload[8] as i8 as i32) };
+    // The levels to put right, if the frame has them, lie before the bands' lengths.
+    let mut off = [[0i8; 32]; 3];
+    let mut head = HEAD;
+    if payload[0] & PUT_RIGHT != 0 {
+        let bytes = payload.get(HEAD..HEAD + 96).ok_or("a frame of blocks is cut")?;
+        for (o, b) in off.iter_mut().flatten().zip(bytes) {
+            *o = *b as i8;
+        }
+        head += 96;
+    }
+    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1, large: false };
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
     let mut out = vec![0u8; geo.frame_len()];
     let made = marks(geo);
     let work = cut(geo, &mut out, rows);
-    let mut data = HEAD + 4 * work.len();
+    let mut data = head + 4 * work.len();
     let mut coded = Vec::new();
     for i in 0..work.len() {
-        let len = payload.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a frame of blocks is cut")?;
+        let len = payload.get(head + 4 * i..head + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a frame of blocks is cut")?;
         coded.push(payload.get(data..data + len).ok_or("a frame of blocks is cut")?);
         data += len;
     }
@@ -1161,6 +1532,9 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
         band(geo, &t, None, &from, &how, ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
     });
     smooth_seams(geo, &mut out, payload[3], &made);
+    if payload[0] & PUT_RIGHT != 0 {
+        put_right(geo, &mut out, &off);
+    }
     Ok(out)
 }
 
@@ -1174,7 +1548,7 @@ mod tests {
         let mut s = 7u32;
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
-        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2 };
+        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
             let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer), (0, 0));

@@ -83,6 +83,10 @@ between = 2.1
 # inward. A frame that others are guessed from has steps only the square root of
 # `between` longer.
 group = 4
+# May the packer keep a tile's light as one block of 16 x 16 when that weighs less than
+# four of 8 x 8 (1) or not (0)? Measured on the guitar clip it gains nothing (1 % more
+# bytes for 0.06 dB), so it is off; the player reads either.
+large = 0
 
 # The smoother: vectors between node A and node B.
 [smoother]
