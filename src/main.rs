@@ -38,6 +38,7 @@ mod golden;
 mod guess;
 mod light;
 mod mix;
+mod trial;
 mod motor;
 mod pack;
 mod particle;
@@ -56,8 +57,11 @@ const USAGE: &str = "\
 fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance N]
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
-             [--mix]                     exact, 8-bit YUV 4:2:0: ten guessers mixed, the misses written by five learners mixed
+             [--mix]                     exact, 8-bit YUV 4:2:0: four guessers mixed, the misses written by three learners mixed;
+                                         every band of every frame is a job, mapped first and struck on all cores
              [--alone]                   with --mix: every frame stands alone (nothing is read from the frame before)
+             [--bands N]                 with --mix: the bands a frame is cut into (16)
+             [--window N]                with --mix, and for play: the frames the strike lets in at once (32)
              [--line]                    exact, but each sample first says whether it stayed what it was
              [--light N]                 exact packing of dimmed light: N brightness levels on a curve (64, 96, 128)
              [--grid N]                  the same with a grid of N levels made for each frame
@@ -182,7 +186,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         species.id, species.kind, species.k, species.out, species.into, species.affinity
     );
     let mut reader = chop::frames(movie_path, geo)?;
-    let batch = rayon::current_num_threads() * 2;
+    let batch = if rules.mix { rules.window } else { rayon::current_num_threads() * 2 };
     let mut nodes: Vec<Node> = Vec::new();
     let mut share_ids: HashMap<String, u32> = HashMap::new();
     let mut share_hashes: Vec<String> = Vec::new();
@@ -218,6 +222,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let (mut carry_name, mut carry2_name) = (String::from("-"), String::from("-"));
     let mut ruled: Vec<(usize, [u64; 8])> = Vec::new();
     let mut mix_bytes = 0usize;
+    let mut mix_strike = mix::Struck::default();
+    let mut done_fresh: Vec<(usize, Vec<u8>)> = Vec::new();
     // What the mix has learned so far, and the frames struck while it was not needed yet.
     let mut mix_memory = mix::Memory::new();
     let mut mix_struck: Option<Vec<Vec<u8>>> = Some(Vec::new());
@@ -277,57 +283,60 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
             let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
             let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands).as_bytes());
-            let done: Vec<(Vec<u8>, bool)> = if rules.alone {
-                // Every frame alone: a batch side by side.
-                frames
-                    .par_iter()
-                    .zip(&raws)
-                    .map(|(frame, raw)| -> Result<_, String> {
-                        let key = brand_of(raw, "alone");
-                        if let Some(payload) = bottle::branded("mix", &key).and_then(|hash| bottle::from_nimbus(hash.trim())) {
-                            return Ok((payload, true));
-                        }
-                        let payload = mix::pack(geo, frame, None, rules.bands, &mut mix::Memory::new());
-                        bottle::brand("mix", &key, &fstrike::put_bytes(&payload)?);
-                        Ok((payload, false))
-                    })
-                    .collect::<Result<_, String>>()?
+            // The map: each frame's brand (alone: its own; else it names every frame so far),
+            // and what Nimbus already holds under it.
+            let keys: Vec<String> = raws
+                .iter()
+                .map(|raw| {
+                    if rules.alone {
+                        return brand_of(raw, "alone");
+                    }
+                    let key = brand_of(raw, &so_far);
+                    so_far = bottle::sha(format!("{so_far}{raw}").as_bytes());
+                    key
+                })
+                .collect();
+            let mut known: Vec<Option<Vec<u8>>> = keys.par_iter().map(|key| bottle::branded("mix", key).and_then(|hash| bottle::from_nimbus(hash.trim()))).collect();
+            // The strike: the frames not known, all their bands at once.
+            let fresh: Vec<usize> = if rules.alone {
+                (0..frames.len()).filter(|i| known[*i].is_none()).collect()
             } else {
-                // Each frame goes on from what the frames before it taught: one at a time
-                // (its bands side by side). The brand names every frame so far.
-                let mut done = Vec::new();
-                for (i, frame) in frames.iter().enumerate() {
-                    let before: Option<&[u8]> = if i > 0 { Some(&frames[i - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
-                    let key = brand_of(&raws[i], &so_far);
-                    so_far = bottle::sha(format!("{so_far}{}", raws[i]).as_bytes());
-                    let branded = bottle::branded("mix", &key).and_then(|hash| bottle::from_nimbus(hash.trim()));
-                    done.push(match (branded, mix_struck.is_some()) {
-                        // Every frame so far was struck: the memory is not needed yet.
-                        (Some(payload), true) => {
-                            mix_struck.as_mut().unwrap().push(payload.clone());
-                            (payload, true)
-                        }
-                        // The memory is in use: the struck frame teaches it as it would the player.
-                        (Some(payload), false) => {
-                            mix::unpack(geo, &payload, before, &mut mix_memory)?;
-                            (payload, true)
-                        }
-                        (None, _) => {
-                            // The first frame to be packed after struck ones: the memory learns them first.
-                            if let Some(struck_so_far) = mix_struck.take() {
-                                let mut last: Option<Vec<u8>> = None;
-                                for p in struck_so_far {
-                                    last = Some(mix::unpack(geo, &p, last.as_deref(), &mut mix_memory)?);
-                                }
-                            }
-                            let payload = mix::pack(geo, frame, before, rules.bands, &mut mix_memory);
-                            bottle::brand("mix", &key, &fstrike::put_bytes(&payload)?);
-                            (payload, false)
-                        }
-                    });
-                }
-                done
+                // What a frame is packed with comes from every frame before it: from the first
+                // frame not known on, all are packed.
+                let from = if mix_struck.is_some() { known.iter().position(|k| k.is_none()).unwrap_or(frames.len()) } else { 0 };
+                (from..frames.len()).collect()
             };
+            if let (Some(first), false) = (fresh.first(), rules.alone) {
+                if let Some(mut struck_so_far) = mix_struck.take() {
+                    // The first frame to be packed after struck ones: the memory learns them first, as the player would.
+                    struck_so_far.extend(known[..*first].iter().flatten().cloned());
+                    let caught = mix::strike_unpack(geo, struck_so_far.len(), rules.window, None, &mut mix_memory, &mut |f| Ok(std::mem::take(&mut struck_so_far[f])), &|_, _| Ok(()), &mut |_, _| Ok(true))?;
+                    mix_strike.add(&caught);
+                }
+            } else if let (Some(all), false) = (mix_struck.as_mut(), rules.alone) {
+                all.extend(known.iter().flatten().cloned());
+            }
+            if !fresh.is_empty() {
+                let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
+                let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
+                let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new())? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory)? };
+                mix_strike.add(&how);
+                let hashes: Vec<String> = packed.par_iter().map(|p| fstrike::put_bytes(p)).collect::<Result<_, String>>()?;
+                for ((i, payload), hash) in fresh.iter().zip(packed).zip(hashes) {
+                    bottle::brand("mix", &keys[*i], &hash);
+                    known[*i] = None;
+                    done_fresh.push((*i, payload));
+                }
+            }
+            let mut fresh_now = std::mem::take(&mut done_fresh).into_iter().peekable();
+            let done: Vec<(Vec<u8>, bool)> = known
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| match fresh_now.next_if(|f| f.0 == i) {
+                    Some((_, payload)) => (payload, false),
+                    None => (k.expect("a frame is either known or packed"), true),
+                })
+                .collect();
             for ((payload, was_struck), frame) in done.into_iter().zip(&frames) {
                 struck += was_struck as usize;
                 mix_bytes += payload.len();
@@ -607,6 +616,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         let s: Vec<f64> = mix::SPENT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 8000.0).collect();
         let samples = (n * geo.frame_len()) as f64;
         println!("MIX    {mix_bytes} bytes of frames, {:.3} bits a sample{}", 8.0 * mix_bytes as f64 / samples, if rules.alone { "; every frame stands alone" } else { "" });
+        if mix_strike.jobs > 0 {
+            println!("STRIKE {} jobs struck in windows of {} frames; {} workers, in a job {:.0} % of the strikes' {:.1} s", mix_strike.jobs, rules.window, mix_strike.workers, 100.0 * mix_strike.busy_share(), mix_strike.wall);
+        }
         if struck < n {
             let all = s[0] + s[1] + s[2] + s[3];
             let share = |v: f64| format!("{:10.0} bytes {:5.1} %", v, 100.0 * v / all.max(1.0));
@@ -772,6 +784,9 @@ fn show_play(label: &str, s: &player::Stats) {
     if s.blocks > 0 {
         println!("         vectors: {} of {} blocks moved", s.moving_blocks, s.blocks);
     }
+    if let Some(k) = &s.strike {
+        println!("         the strike: {} jobs mapped and struck in a window of {} frames; {} workers, in a job {:.0} % of the time", k.jobs, s.window_peak, k.workers, 100.0 * k.busy_share());
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -809,6 +824,8 @@ fn run() -> Result<(), String> {
             }
             "--fractal-keys" => rules.fractal_keys = true,
             "--mix" => rules.mix = true,
+            "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
+            "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,
             "--alone" => rules.alone = true,
             "--wave" => {
                 rules.fractal.wave_edge = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--wave needs a whole number from 1 to 255")?;
@@ -833,6 +850,11 @@ fn run() -> Result<(), String> {
         Some("pack") => {
             let p = pack(path(0, "the movie")?, out, &profile, explain, &rules)?;
             println!("packed {} frames in {:.1} s", p.frames, p.seconds);
+        }
+        Some("trial") => {
+            // fbottle trial <raw yuv420p> <width> <height> <frames> [bands] [alone]
+            let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "trial: <yuv> <width> <height> <frames> [bands]".to_string()) };
+            trial::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands), rules.alone)?;
         }
         Some("verify") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
@@ -875,6 +897,9 @@ fn run() -> Result<(), String> {
                 })?
             };
             show_play("played", &s);
+            if let Some(p) = mix::profile() {
+                println!("{p}");
+            }
         }
         Some("png") => {
             use std::io::Write;

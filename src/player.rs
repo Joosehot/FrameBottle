@@ -48,6 +48,8 @@ pub struct Stats {
     /// Nimbus, finding vectors, making the guessed frames.
     pub spent: [Duration; 4],
     pub wall: Duration,
+    /// How the strike went (a bottle packed by the mix).
+    pub strike: Option<crate::mix::Struck>,
 }
 
 impl Stats {
@@ -111,6 +113,33 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
     // A bottle packed by the mix: what the mix has learned comes from rebuilding every
     // frame in order, so nothing is struck for it either.
     let learns = n > 0 && crate::pack::mixed(&b.packed(0)?);
+    if learns && smooth < 2 {
+        // THE STRIKE: the film's jobs are mapped (one for each band of each frame, from the
+        // index: which frames lean on the one before, where each frame's bytes lie), and
+        // struck in a rolling window. Each frame is checked by its hash as it is finished.
+        let check = |f: usize, frame: &[u8]| if bottle::sha(frame) == b.index.nodes[f].raw { Ok(()) } else { Err(format!("node {f} did not unpack to its frame")) };
+        let mut payload = |f: usize| -> Result<Vec<u8>, String> {
+            let p = b.packed(f)?;
+            if !crate::pack::mixed(&p) {
+                return Err(format!("node {f} is not packed by the mix"));
+            }
+            Ok(p[3..].to_vec())
+        };
+        let (mut nodes, mut closed) = (0, false);
+        let struck = crate::mix::strike_unpack(&b.geo, n, rules.window, None, &mut crate::mix::Memory::new(), &mut payload, &check, &mut |_, frame| {
+            nodes += 1;
+            closed = !sink(frame);
+            Ok(!closed)
+        })?;
+        stats.nodes = nodes;
+        stats.unpacked = nodes;
+        stats.window_peak = rules.window.min(n);
+        stats.work = began.elapsed();
+        stats.wall = began.elapsed();
+        stats.spent[0] = Duration::from_secs_f64(struck.busy);
+        stats.strike = Some(struck);
+        return Ok(stats);
+    }
     let mut closed = false;
     for start in (0..n).step_by(rules.ahead) {
         let t = Instant::now();

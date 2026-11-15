@@ -897,3 +897,76 @@ Where the mix's bytes are: light 84.6 %, the first colour 8.6 %, the second 6.0 
 vectors 0.7 %; by what is said: is there a miss 54.8 %, its sign 18.7 %, its size 25.9 %.
 
 The mix does not play at the movie's speed: 99 ms a frame is 10 frames a second.
+
+### The mix made light, and the strike (2026-11-15, later)
+
+The section above describes the mix as it was first built ("mix 2"). It unpacked at 99 ms
+a frame. Two things were done about that; the bottle is still exact (every frame is
+checked by its hash as it is rebuilt, and `fbottle raw` gives the source byte for byte).
+
+**1. Where the time went, and what was left out.** Timed stage by stage (24 frames, 12
+threads, the clock's own load included): the learners and mixers 38.7 %, the weighing of
+the guessers 24.4 %, the frame before and the plain guessers 16.0 %, teaching the
+guessers 7.1 %, the learning guessers 5.8 %, the range coder 4.7 %, the contexts 3.3 %.
+No colour transform; putting frames in Nimbus was under 1 %. Each part was then left out
+alone and the first 24 frames packed again (8 046 559 bytes with everything):
+
+| left out | bytes | |
+|---|---|---|
+| the three guessers from the frame before (the learning guessers see it anyway) | 8 067 251 | +0.26 % |
+| those, and left, above, mean (MED, GAP and the two learning guessers stay) | 8 071 107 | +0.7 % (of 8 012 661, without the last learner) |
+| all but the two learning guessers | 8 234 283 | +2.3 % |
+| all but the quick learning guesser | 8 373 413 | +4.1 % |
+| the last learner (the likelihood put right once more) | 8 012 661 | -0.4 % |
+| learner: the misses nearby and how far apart the guessers stand | 8 043 227 | +0.4 % (of 8 012 661) |
+| learner: LOCO-I's slopes | 8 046 903 | +0.4 % |
+| learner: the light's miss, for colour | 8 019 796 | +0.1 % |
+| learner: the four neighbours' misses | 8 064 857 | +0.7 % |
+| learner: where the frame before, the median and the learning guesser stand from the guess | 8 351 030 | +4.2 % |
+| the quick speed of every learner (the slow one stays) | 8 061 965 | +0.6 % |
+| the slow speed of every learner | 8 169 031 | +2.0 % |
+
+The mix now ("mix 3") has four guessers (MED, GAP, the two learning guessers) and three
+learners at the slow speed, no last learner; its rows have room around them so that no
+sample asks where it stands; the frame before is laid out once for a band where the
+vectors point; a band's working room is made once. 24 frames: 8 179 991 bytes (+1.7 %).
+The build asks for AVX2 (`.cargo/config.toml`).
+
+**2. The strike** (`mix::strike`, after StrikeS: map everything first, then strike it).
+One job is one band of one frame. The map is made from the bottle's index (which frames
+lean on the one before, where each frame's bytes lie) and each frame's own head (where
+each band's bytes lie): a job waits for the same band of the frame before (what the band
+has learned) and, when it reads that frame, for the bands above and below it there. Every
+job whose waiting is over is struck at once on every core, and each one that ends lets
+the next go. Frames are let in a rolling window (`--window N`, 32) ahead of the last
+frame handed over, so the memory stays what the window holds. The packer strikes the
+same way (a window of frames at a time; a band's jobs wait only for the band before, as
+the real frames are all there). The strike gives the same bytes as packing frame by
+frame (tested).
+
+Not done: the bits read in a pass of their own before the samples are rebuilt. The
+learners would then see only misses, never samples; tried, 24 frames: 8 901 991 bytes
+(+8.8 % over mix 3), and the work a sample takes stays the same.
+
+guitar_10s.mp4 (1080p, 302 frames), Ryzen 5 7600X (6 cores, 12 threads), all exact:
+
+| | bytes | packing | unpacking | processor time, unpacking | peak memory (pack / unpack) |
+|---|---|---|---|---|---|
+| mix 2 (before) | 100 545 180 | 33.0 s (109 ms a frame) | 29.9 s (99 ms a frame) | | |
+| **mix 3 + the strike, 16 bands** | **101 751 797** | **20.9 s (69 ms)** | **9.7 s (32 ms)** | 97.7 s, the workers in a job 92 % of the time | 321 MB / 135 MB |
+| mix 3 + the strike, `--bands 24` | 101 956 595 | 19.3 s (64 ms) | 9.3 s (31 ms) | in a job 100 % of the time | |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 16.9 s | 0.95 s | 6.4 s | 710 MB / 186 MB |
+| FFV1 (level 3, 16 slices, gop 300) | 124 691 885 | 1.7 s | 1.5 s | 13.6 s | 218 MB / 98 MB |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | about 730 s | 5.4 s | 12.2 s | not measured / 124 MB |
+
+Of the 20.9 s of packing, the strikes themselves take 13.7 s (45 ms a frame); the rest
+is reading the movie, hashing and keeping. Bands and bytes (24 frames): 4 bands
+8 146 381; 8 +0.17 %; 12 +0.32 %; 16 +0.41 %; 23 +0.77 %; 34 +1.16 %; 68 +2.4 %.
+
+What this shows: the mix now plays at the movie's speed (31 frames a second), 3.1 times
+faster than before, and packs 1.6 times faster; the strike keeps the 12 threads in a job 92 to 100 % of the time,
+so what is left is the work each sample takes (one thread alone: about 200 ms a frame).
+x264 unpacks the same clip with 6.4 s of processor time where the mix takes 97.7 s.
+
+`fbottle trial <raw yuv420p> <width> <height> <frames> [bands]` packs and unpacks frames
+in memory both ways (frame by frame, and by the strike) and times them.

@@ -1,0 +1,3 @@
+# The mix counts sixteen things at once where the processor can (AVX2, from 2013 on).
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

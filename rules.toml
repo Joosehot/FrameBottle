@@ -155,6 +155,9 @@ poor_match = 24.0
 
 # The player rolling window in Nimbus, counted in nodes around the playhead.
 [player]
+# The strike (a bottle packed by the mix): the whole film's jobs are mapped, and struck
+# in a rolling window of this many frames ahead of the last frame handed over.
+window = 32
 # Nodes made ready ahead of the playhead (unpacked, and their in-between frames guessed).
 ahead = 24
 # Nodes kept behind the playhead; older ones leave Nimbus.

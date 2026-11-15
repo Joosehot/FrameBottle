@@ -33,6 +33,8 @@ pub struct Rules {
     pub zero_bias: f64,
     pub poor_match: f64,
     pub ahead: usize,
+    /// The strike's rolling window: the frames let in ahead of the last one handed over (the command's --window).
+    pub window: usize,
     pub behind: usize,
     pub bands: usize,
     /// How wrong a guess may be and still be left uncorrected (0: every frame comes back
@@ -186,6 +188,7 @@ impl Rules {
             zero_bias: num(smoother, "zero_bias", "smoother")?,
             poor_match: num(smoother, "poor_match", "smoother")?,
             ahead: (num(player, "ahead", "player")? as usize).max(1),
+            window: (num(player, "window", "player")? as usize).max(1),
             behind: num(player, "behind", "player")? as usize,
             bands: (num(table("guess")?, "bands", "guess")? as usize).clamp(1, 4096),
             tolerance: 0,

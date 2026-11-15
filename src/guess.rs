@@ -94,6 +94,21 @@ impl Encoder {
             self.shift();
         }
     }
+    /// A yes/no whose likelihood of "no" (of 4096) the caller knows.
+    #[inline(always)]
+    pub(crate) fn fixed(&mut self, p: u32, bit: bool) {
+        let bound = (self.range >> BITS) * p;
+        if !bit {
+            self.range = bound;
+        } else {
+            self.low += bound as u64;
+            self.range -= bound;
+        }
+        while self.range < TOP {
+            self.range <<= 8;
+            self.shift();
+        }
+    }
     pub(crate) fn finish(mut self) -> Vec<u8> {
         for _ in 0..5 {
             self.shift();
@@ -136,6 +151,23 @@ impl<'a> Decoder<'a> {
             *p -= *p >> MOVE;
             true
         };
+        while self.range < TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.next() as u32;
+        }
+        bit
+    }
+    /// A yes/no whose likelihood of "no" (of 4096) the caller knows.
+    #[inline(always)]
+    pub(crate) fn fixed(&mut self, p: u32) -> bool {
+        let bound = (self.range >> BITS) * p;
+        let bit = self.code >= bound;
+        if bit {
+            self.code -= bound;
+            self.range -= bound;
+        } else {
+            self.range = bound;
+        }
         while self.range < TOP {
             self.range <<= 8;
             self.code = (self.code << 8) | self.next() as u32;
