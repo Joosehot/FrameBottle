@@ -16,6 +16,7 @@
 //! is measured and reported (PSNR). Only 8-bit YUV 4:2:0 is cut this way.
 
 use crate::guess::{Decoder, Encoder};
+use crate::refiner::{self, Refiner};
 use crate::pack::Geometry;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,6 +145,8 @@ struct Learned {
     /// Is the tile skipped (the picture where the engine predicted it, nothing put
     /// right)? By how many of the tiles to its left and above it were.
     skip: [u16; 3],
+    /// Is a tile's guess refined by Neuras? By whether the tile to the left's was.
+    refined: [u16; 2],
     vector: [([u16; 32], [u16; 2]); 2],
     /// Has the block any wave left? By light or colour, and by flat or moved.
     any: [u16; 4],
@@ -168,7 +171,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], skip: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], skip: [HALF; 3], refined: [HALF; 2], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -825,6 +828,8 @@ enum Kind {
     /// Between the frame before and the frame after: the mean of the frame before one
     /// vector back and the frame after the same vector on.
     Between((i32, i32)),
+    /// The frame before by one vector, and the guess then refined by Neuras.
+    Refined((i32, i32)),
     /// The frame after, by one vector (for a frame between two).
     After((i32, i32)),
 }
@@ -839,6 +844,8 @@ type V = (i32, i32);
 /// predicted: equal checks mean the two predicted the same all the way.
 pub struct Motion {
     fields: std::collections::VecDeque<Vec<Option<V>>>,
+    /// The last three frames others are guessed from, as rebuilt, newest first (for the refiner).
+    frames: std::collections::VecDeque<Vec<u8>>,
     history: usize,
     /// How many frames the newest field's vectors span.
     span: i32,
@@ -848,11 +855,12 @@ pub struct Motion {
 impl Motion {
     /// A memory of `history` frames (0: the usual 4).
     pub fn new(history: usize) -> Motion {
-        Motion { fields: Default::default(), history: if history == 0 { 4 } else { history }, span: 1, check: 0xcbf2_9ce4_8422_2325 }
+        Motion { fields: Default::default(), frames: Default::default(), history: if history == 0 { 4 } else { history }, span: 1, check: 0xcbf2_9ce4_8422_2325 }
     }
     /// At a cut the history is forgotten.
     fn forget(&mut self) {
         self.fields.clear();
+        self.frames.clear();
     }
 }
 
@@ -886,6 +894,44 @@ struct From<'a> {
     whole: (i32, i32),
     /// The motion engine's memory, when it is used.
     trails: Option<Trails<'a>>,
+    /// The last three frames others are guessed from (the oldest again where there are
+    /// fewer), and the Neuras refiner, when it is used.
+    refs: [Option<&'a [u8]>; 3],
+    refine: Option<&'a Refiner>,
+}
+
+/// The four windows the refiner takes for the tile at (x0, y0): the same place in the
+/// last three frames, and the motion engine's guess by the vector `v`.
+fn windows_of(geo: &Geometry, at: &[usize], f: &From, x0: i32, y0: i32, v: V) -> Vec<u8> {
+    let (side, edge) = (refiner::SIDE as i32, refiner::EDGE as i32);
+    let mut w = Vec::with_capacity(refiner::WINDOWS * refiner::SIDE * refiner::SIDE);
+    for r in f.refs {
+        let p = pic(geo, at, r.expect("three frames for the refiner"), 0);
+        for j in 0..side {
+            for k in 0..side {
+                w.push(p.at(x0 - edge + k, y0 - edge + j));
+            }
+        }
+    }
+    let bp = pic(geo, at, f.before.expect("a frame before"), 0);
+    for j in 0..side {
+        for k in 0..side {
+            w.push(bp.quarter(4 * (x0 - edge + k) + v.0, 4 * (y0 - edge + j) + v.1) as u8);
+        }
+    }
+    w
+}
+
+/// Tiles the refiner was offered to, and tiles that took it (for the report).
+pub static REFINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Where samples for training the refiner are written (the command's --dump), and of
+/// how many tiles one is taken.
+static DUMP: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+pub fn dump_to(path: &std::path::Path) -> Result<(), String> {
+    *DUMP.lock().unwrap() = Some(std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    Ok(())
 }
 
 /// The guess of a block from the pixels just above it and just to its left. `get`
@@ -933,7 +979,7 @@ fn from_neighbours(mode: u8, get: &dyn Fn(i32, i32) -> Option<i32>, bx: i32, by:
 /// The guess for the 8 x 8 block at (bx, by) of plane `i`, in a tile whose corner in
 /// that plane is (px0, py0).
 #[allow(clippy::too_many_arguments)]
-fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, usize), (px0, py0): (usize, usize), kind: &Kind) -> [i32; 64] {
+fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, usize), (px0, py0): (usize, usize), kind: &Kind, fine: Option<&[i32; 256]>) -> [i32; 64] {
     let mut guess = [128; 64];
     // A place in quarters of a light pixel is the same place in eighths of a colour pixel.
     let sample = |p: &Pic, x: usize, y: usize, dx: i32, dy: i32| if i == 0 { p.quarter(4 * x as i32 + dx, 4 * y as i32 + dy) } else { p.eighth(8 * x as i32 + dx, 8 * y as i32 + dy) };
@@ -945,6 +991,18 @@ fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, 
             for j in 0..8 {
                 for k in 0..8 {
                     guess[j * 8 + k] = sp.at((bx + k) as i32, (by + j) as i32) as i32;
+                }
+            }
+        }
+        Kind::Refined(v) => {
+            let bp = pic(geo, at, f.before.unwrap(), i);
+            for j in 0..8 {
+                for k in 0..8 {
+                    // The light is the refined tile; the colours are the motion engine's guess.
+                    guess[j * 8 + k] = match (i, fine) {
+                        (0, Some(fine)) => fine[(by - py0 + j) * 16 + bx - px0 + k],
+                        _ => sample(&bp, bx + k, by + j, v.0, v.1),
+                    };
                 }
             }
         }
@@ -1052,6 +1110,7 @@ fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &
     let (mut light_cost, mut light) = (0f64, Vec::new());
     // The blocks of this tile as this try would rebuild them (the next block is guessed from them).
     let mut tried: Vec<(usize, usize, usize, [u8; 64])> = Vec::new();
+    let fine = if let Kind::Refined(v) = kind { Some(f.refine.expect("the refiner").refine(&windows_of(geo, at, f, (tx * TILE) as i32, (ty * TILE) as i32, *v))) } else { None };
     for (i, (bx, by), (px0, py0)) in blocks_of(geo, tx, ty) {
         let p = &geo.planes[i];
         let guess = if let Kind::Flat(mode) = kind {
@@ -1069,7 +1128,7 @@ fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &
             };
             from_neighbours(*mode, &get, bx as i32, by as i32)
         } else {
-            guess_of(geo, at, f, i, (bx, by), (px0, py0), kind)
+            guess_of(geo, at, f, i, (bx, by), (px0, py0), kind, fine.as_ref())
         };
         let sp = pic(geo, at, src, i);
         let mut miss = [0i32; 64];
@@ -1160,7 +1219,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
     for ty in ty0..ty1 {
         let mut left: Option<(i32, i32)> = None;
         let (mut any_left, mut left_stack, mut left_split, mut left_between, mut left_big) = (false, false, false, false, false);
-        let mut left_skip = false;
+        let (mut left_skip, mut left_refined) = (false, false);
         let mut left_models: Option<[Option<V>; 4]> = None;
         for tx in 0..across {
             let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
@@ -1233,6 +1292,11 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                         if vs.iter().any(|v| *v != vs[0]) && sum + how.still < moved {
                             ways.push((Kind::Moved(vs, true), bits));
                         }
+                        if f.refine.is_some() {
+                            // The same vector, and the guess refined by Neuras: one flag more.
+                            ways.push((Kind::Refined((dx, dy)), 3 + vector_bits((dx - from.0, dy - from.1))));
+                            REFINED[0].fetch_add(1, Ordering::Relaxed);
+                        }
                         if let Some(after) = f.after {
                             let ap = pic(geo, &at, after, 0);
                             let d = find_between(&s, &bp, &ap, x0, y0);
@@ -1268,6 +1332,27 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     }
                 }
             }
+            if matches!(want, Kind::Refined(_)) {
+                REFINED[1].fetch_add(1, Ordering::Relaxed);
+            }
+            // A sample for training the refiner: a tile guessed by one vector that still
+            // needed corrections, with its windows and the real window.
+            if let (Some(src), Kind::Moved(v, false), true, None) = (src, want, f.refs[0].is_some(), f.after) {
+                if (tx + 3 * ty) % 5 == 0 && kept.as_ref().is_some_and(|k| k.iter().take(4).any(|b| b.iter().any(|s| *s != 0))) {
+                    if let Some(file) = DUMP.lock().unwrap().as_mut() {
+                        use std::io::Write;
+                        let mut sample = windows_of(geo, &at, f, x0, y0, v[0]);
+                        let sp = pic(geo, &at, src, 0);
+                        let (side, edge) = (refiner::SIDE as i32, refiner::EDGE as i32);
+                        for j in 0..side {
+                            for k in 0..side {
+                                sample.push(sp.at(x0 - edge + k, y0 - edge + j));
+                            }
+                        }
+                        let _ = file.write_all(&sample);
+                    }
+                }
+            }
             // The tile's kind and vectors: written, or read.
             spending(0);
             let mut tile_waves = false;
@@ -1280,8 +1365,12 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             }
             if f.before.is_some() && !skip {
                 let ctx = if !any_left { 2 } else { left.is_some() as usize };
-                if c.bit(&mut l.moved[ctx], matches!(want, Kind::Moved(..))) {
-                    let (wv, wsplit) = if let Kind::Moved(v, s) = want { (v, s) } else { ([(0, 0); 4], false) };
+                if c.bit(&mut l.moved[ctx], matches!(want, Kind::Moved(..) | Kind::Refined(_))) {
+                    let (wv, wsplit) = match want {
+                        Kind::Moved(v, s) => (v, s),
+                        Kind::Refined(v) => ([v; 4], false),
+                        _ => ([(0, 0); 4], false),
+                    };
                     let split = c.bit(&mut l.split[left_split as usize], wsplit);
                     let (mut vs, mut last) = ([(0, 0); 4], from);
                     spending(1);
@@ -1294,6 +1383,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                         vs = [vs[0]; 4];
                     }
                     kind = Kind::Moved(vs, split);
+                    // Is the guess refined by Neuras?
+                    if !split && f.refine.is_some() && c.bit(&mut l.refined[left_refined as usize], matches!(want, Kind::Refined(_))) {
+                        kind = Kind::Refined(vs[0]);
+                    }
                 } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_))) {
                     let wd = if let Kind::Between(d) = want { d } else { (0, 0) };
                     spending(1);
@@ -1315,6 +1408,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 let low = c.bit(&mut l.around[1 + high as usize], wm & 1 == 1);
                 kind = Kind::Flat((high as u8) << 1 | low as u8);
             }
+            let fine = if let Kind::Refined(v) = kind { Some(f.refine.expect("the refiner").refine(&windows_of(geo, &at, f, x0, y0, v))) } else { None };
             // The light of a whole tile guessed from another frame: as one block of 16 x 16?
             let whole_tile = x0 as usize + TILE <= geo.width && y0 as usize + TILE <= geo.height;
             spending(0);
@@ -1324,7 +1418,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 let mut guess = [0i32; 256];
                 for b in 0..4 {
                     let (dx, dy) = ((b % 2) * 8, (b / 2) * 8);
-                    let g = guess_of(geo, &at, f, 0, (x0 as usize + dx, y0 as usize + dy), (x0 as usize, y0 as usize), &kind);
+                    let g = guess_of(geo, &at, f, 0, (x0 as usize + dx, y0 as usize + dy), (x0 as usize, y0 as usize), &kind, fine.as_ref());
                     for j in 0..8 {
                         guess[(dy + j) * 16 + dx..(dy + j) * 16 + dx + 8].copy_from_slice(&g[j * 8..j * 8 + 8]);
                     }
@@ -1363,7 +1457,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     let get = |x: i32, y: i32| -> Option<i32> { (x >= 0 && x < p.w as i32 && y >= band_top as i32 && y < p.h as i32).then(|| buf[(y as usize - band_top) * p.w + x as usize] as i32) };
                     from_neighbours(mode, &get, bx as i32, by as i32)
                 } else {
-                    guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind)
+                    guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind, fine.as_ref())
                 };
                 let mut steps = kept.as_ref().map_or([0i32; 64], |k| k[n]);
                 if skip {
@@ -1390,7 +1484,12 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     }
                 }
             }
-            left = if let Kind::Moved(v, _) = kind { Some(v[1]) } else { None };
+            left = match kind {
+                Kind::Moved(v, _) => Some(v[1]),
+                Kind::Refined(v) => Some(v),
+                _ => None,
+            };
+            left_refined = matches!(kind, Kind::Refined(_));
             left_split = matches!(kind, Kind::Moved(_, true));
             left_stack = kind == Kind::Stack;
             if src.is_some() {
@@ -1402,7 +1501,11 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             left_skip = skip;
             above_skip[tx] = skip;
             left_models = Some(models);
-            field[(ty - ty0) * across + tx] = if let Kind::Moved(v, _) = kind { Some(v[0]) } else { None };
+            field[(ty - ty0) * across + tx] = match kind {
+                Kind::Moved(v, _) => Some(v[0]),
+                Kind::Refined(v) => Some(v),
+                _ => None,
+            };
             left_between = matches!(kind, Kind::Between(_));
             left_big = big;
             any_left = true;
@@ -1497,6 +1600,8 @@ const HEAD: usize = 9;
 const PUT_RIGHT: u8 = 64;
 /// The frame was packed with the Predictive Motion Engine.
 const PREDICT: u8 = 128;
+/// Tiles of the frame may have their guess refined by Neuras.
+const REFINER: u8 = 1;
 
 /// The vector most tiles of the frame have: every third tile each way is looked for in
 /// the frame before, and the commonest answer is taken.
@@ -1604,6 +1709,8 @@ pub struct How {
     pub group: usize,
     /// The packer may keep a tile's light as one block of 16 x 16.
     pub large: bool,
+    /// The packer may have a tile's guess refined by Neuras (the command's --neuras).
+    pub refine: bool,
 }
 
 /// Packs a frame in AV1's way. `before` is the frame before as the player
@@ -1629,7 +1736,14 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
         older: if after.is_some() { None } else { m.fields.get(1).map(|f| &f[..]) },
         between: after.map(|_| (refs.0 as i32, refs.1 as i32, m.span)),
     });
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()), whole, trails };
+    // The last three frames others are guessed from, and the refiner, for a frame guessed
+    // from the one before it alone.
+    let last_three: [Option<&[u8]>; 3] = match motion.as_deref() {
+        Some(m) if !m.frames.is_empty() => std::array::from_fn(|i| m.frames.get(i).or(m.frames.back()).map(|f| &f[..])),
+        _ => [None; 3],
+    };
+    let refine = if how.refine && before.is_some() && after.is_none() && last_three[0].is_some() { refiner::shipped() } else { None };
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()), whole, trails, refs: last_three, refine };
     let plain = PLAIN_BITS.load(Ordering::Relaxed);
     let books = if plain { None } else { books };
     let with_books = books.is_some();
@@ -1665,16 +1779,17 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
         .collect();
     let checks: Vec<u64> = coded.iter().map(|c| c.1).collect();
     let done: Vec<Vec<u8>> = coded.into_iter().map(|c| c.0).collect();
-    if let Some(m) = motion {
-        remember(m, field, &checks, before.is_some(), after.is_some(), refs.0);
-    }
+    let refined = refine.is_some();
     smooth_seams(geo, &mut rebuilt, coarse, &made);
     let off = levels_off(geo, frame, &rebuilt);
     let any_off = off.iter().flatten().any(|o| *o != 0);
     if any_off {
         put_right(geo, &mut rebuilt, &off);
     }
-    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 }) | (if predicts { PREDICT } else { 0 })];
+    if let Some(m) = motion {
+        remember(m, field, &checks, before.is_some(), after.is_some(), refs.0, &rebuilt);
+    }
+    let mut out = vec![(if refined { REFINER } else { 0 }) | (if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 }) | (if predicts { PREDICT } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -1696,9 +1811,13 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
 
 /// After a frame the engine remembers: its checks are folded in, and the vectors of a
 /// frame that others are guessed from become the newest field.
-fn remember(m: &mut Motion, field: Vec<Option<V>>, checks: &[u64], has_before: bool, is_between: bool, span: u8) {
+fn remember(m: &mut Motion, field: Vec<Option<V>>, checks: &[u64], has_before: bool, is_between: bool, span: u8, rebuilt: &[u8]) {
     for c in checks {
         m.check = (m.check ^ c).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    if !is_between {
+        m.frames.push_front(rebuilt.to_vec());
+        m.frames.truncate(3);
     }
     if has_before && !is_between {
         m.fields.push_front(field);
@@ -1724,7 +1843,9 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
         older: if after.is_some() { None } else { motion.fields.get(1).map(|f| &f[..]) },
         between: after.map(|_| (back as i32, on as i32, motion.span)),
     });
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()), whole: (payload[7] as i8 as i32, payload[8] as i8 as i32), trails };
+    let last_three: [Option<&[u8]>; 3] = if predicts && !motion.frames.is_empty() { std::array::from_fn(|i| motion.frames.get(i).or(motion.frames.back()).map(|f| &f[..])) } else { [None; 3] };
+    let refine = if payload[0] & REFINER != 0 { Some(refiner::shipped().ok_or("this frame's guesses were refined by Neuras, and this player has no refiner")?) } else { None };
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()), whole: (payload[7] as i8 as i32, payload[8] as i8 as i32), trails, refs: last_three, refine };
     // The levels to put right, if the frame has them, lie before the bands' lengths.
     let mut off = [[0i8; 32]; 3];
     let mut head = HEAD;
@@ -1735,7 +1856,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
         }
         head += 96;
     }
-    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1, large: false };
+    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1, large: false, refine: false };
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
@@ -1764,12 +1885,13 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
             check
         })
         .collect();
-    if predicts {
-        remember(motion, field, &checks, before.is_some(), after.is_some(), back as u8);
-    }
+    let (has_before, is_between) = (before.is_some(), after.is_some());
     smooth_seams(geo, &mut out, payload[3], &made);
     if payload[0] & PUT_RIGHT != 0 {
         put_right(geo, &mut out, &off);
+    }
+    if predicts {
+        remember(motion, field, &checks, has_before, is_between, back as u8, &out);
     }
     Ok(out)
 }
@@ -1784,7 +1906,7 @@ mod tests {
         let mut s = 7u32;
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
-        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true };
+        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true, refine: false };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
             let (mut engine, mut engine_of_player) = (Motion::new(4), Motion::new(4));

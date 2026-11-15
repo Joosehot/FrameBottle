@@ -36,6 +36,7 @@ mod motor;
 mod pack;
 mod particle;
 mod player;
+mod refiner;
 mod screen;
 mod smooth;
 
@@ -55,6 +56,8 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--grid N]                  the same with a grid of N levels made for each frame
              [--grain]                   with --coarse or --tolerance: fake film grain on what is shown
              [--breakdown]               with --coarse: what every frame's bytes are spent on
+             [--neuras]                  with --coarse: the motion engine, and a tile's guess may be refined by Neuras
+             [--dump FILE]               with --coarse: samples for training the refiner are written to FILE
              [--predict]                 with --coarse: the Predictive Motion Engine (vectors predicted from the frames so far, cuts found)
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--dictionary]              common bit patterns of the corrections are kept by label
@@ -66,6 +69,7 @@ fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
 fbottle info <bottle>
 fbottle forget <bottle>                  empty the bottle's window in Nimbus
+fbottle train-refiner <samples>... -o refiner.bin [--epochs N]   train the Neuras refiner on dumped samples
 fbottle raw <bottle> <file>              the frames as the player shows them, one after the other, as plain bytes
 fbottle smoother <bottle>                how near a guessed frame comes to a real one";
 
@@ -159,6 +163,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let (mut grain_squares, mut grain_samples) = (0f64, 0f64);
     let light_len = geo.planes[0].len();
     let far_light = |a: &[u8], b: &[u8]| a[..light_len].iter().zip(&b[..light_len]).map(|(x, y)| (*x as f64 - *y as f64).powi(2)).sum::<f64>();
+    if rules.blocks.refine && refiner::shipped().is_none() {
+        return Err("--neuras: this program was built without a trained refiner (refiner.bin is empty); train one with fbottle train-refiner and build again".into());
+    }
     if rules.coarse > 0 && !block::fits(geo) {
         return Err(format!("--coarse cuts 8-bit YUV 4:2:0 only; this movie's frames are {}", geo.pix_fmt));
     }
@@ -365,6 +372,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
         node.next = (i + 1 < n).then_some(i as u32 + 1);
     }
+    if rules.blocks.refine {
+        let (offered, took) = (block::REFINED[0].load(std::sync::atomic::Ordering::Relaxed), block::REFINED[1].load(std::sync::atomic::Ordering::Relaxed));
+        println!("NEURAS   the refiner {} was offered to {offered} tiles and {took} took it ({:.1} %); that is {:.1} % of all tiles", refiner::shipped_name(), 100.0 * took as f64 / offered.max(1) as f64, 100.0 * took as f64 / (nodes.len() * geo.width.div_ceil(16) * geo.height.div_ceil(16)).max(1) as f64);
+    }
     if rules.predict {
         println!("PREDICT  the motion engine remembers {} frames; cuts found: {cuts}; check of its predictions {:016x}", rules.history, motion.check);
     }
@@ -438,6 +449,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         light: light.is_some(),
         predict: if rules.predict { rules.history } else { 0 },
         predict_check: motion.check,
+        refiner: rules.blocks.refine.then(refiner::shipped_name),
         grain: if rules.grain { light::grain_of(grain_squares, grain_samples) } else { 0 },
         dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
         patterns: rules.patterns,
@@ -589,6 +601,7 @@ fn run() -> Result<(), String> {
     let mut rules = Rules::parse(motor::DEFAULT_RULES)?;
     let mut paths: Vec<PathBuf> = Vec::new();
     let (mut out, mut profile, mut explain, mut smooth, mut bench) = (None, "size".to_string(), false, 2usize, false);
+    let mut epochs = 3usize;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -599,6 +612,15 @@ fn run() -> Result<(), String> {
             "--dictionary" => rules.dictionary = true,
             "--between" => rules.between = true,
             "--predict" => rules.predict = true,
+            "--neuras" => {
+                rules.predict = true;
+                rules.blocks.refine = true;
+            }
+            "--dump" => {
+                rules.predict = true;
+                block::dump_to(Path::new(it.next().ok_or("--dump needs a file")?))?;
+            }
+            "--epochs" => epochs = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--epochs needs a whole number")?,
             "--breakdown" => rules.breakdown = true,
             "--grain" => rules.grain = true,
             "--light" => rules.light = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--light needs a number of levels from 2 to 256")?,
@@ -683,6 +705,20 @@ fn run() -> Result<(), String> {
                 }
             }
             println!("{n} frames of {}x{} {} written to {}", b.index.width, b.index.height, b.index.pix_fmt, out.display());
+        }
+        Some("train-refiner") => {
+            // Samples dumped from clips (not the clip the refiner is to be tested on) in, a refiner out.
+            let mut samples = Vec::new();
+            for p in &paths {
+                samples.extend(std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?);
+            }
+            if samples.len() < refiner::SAMPLE * 100 {
+                return Err("too few samples to train on (dump some with fbottle pack --coarse N --between --dump FILE)".into());
+            }
+            let trained = refiner::train(&samples, epochs, |line| println!("{line}"));
+            let to = out.ok_or("-o refiner.bin: where the refiner is written")?;
+            std::fs::write(&to, trained.to_bytes()).map_err(|e| format!("{}: {e}", to.display()))?;
+            println!("the refiner is in {}; build the program again to ship it with the player", to.display());
         }
         Some("forget") => {
             let b = Bottle::open(path(0, "the bottle")?)?;

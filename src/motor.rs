@@ -159,6 +159,7 @@ impl Rules {
                 between: num(table("block")?, "between", "block")?,
                 group: (num(table("block")?, "group", "block")? as usize).clamp(1, 32),
                 large: num(table("block")?, "large", "block")? != 0.0,
+                refine: false,
             },
         })
     }

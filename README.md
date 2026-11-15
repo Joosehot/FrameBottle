@@ -700,3 +700,68 @@ Where it stands (`--coarse N --between --dictionary`):
 These four moved little. The frames guessed from the one before still take
 35 kB each and the frames between two 8 kB; AV1's whole average is 7 kB a
 frame.
+
+## The Predictive Motion Engine (`--predict`, 2026-11-15)
+
+**Measured first** (`fbottle pack ... --breakdown` prints it for every frame
+and for the whole bottle). The bottle of `--coarse 8 --between`,
+4 849 799 bytes:
+
+| | bytes | share |
+|---|---|---|
+| waves (the corrections) | 3 005 669 | 62.0 % |
+| vectors | 1 344 325 | 27.7 % |
+| tile kinds and flags | 376 139 | 7.8 % |
+| levels put right | 28 992 | 0.6 % |
+| lengths, headers, the coder's rounding | 43 108 | 0.9 % |
+| the index and the bottle's ends | 51 566 | 1.1 % |
+| light grid | 0 | (the blocks keep none) |
+
+In the frames between two, the vectors took more than the corrections.
+
+**The engine** ([src/block.rs](src/block.rs), `Motion`). It remembers the
+vector of every tile in the last 4 frames that others are guessed from
+(`history` in rules.toml). For each tile four models offer a vector: the
+tile to the left (or the whole picture's move); the same tile's vector
+last time (constant speed); that carried on by how it changed (constant
+change of speed); and, for a frame between two, the part of its group's
+vector that falls to it. The model that was nearest for the tile to the
+left speaks for this one. Only vectors and frames already rebuilt are
+used, in whole numbers, so the player predicts the same; the prediction is
+never stored. What is stored is the miss: the vector's difference from the
+prediction (often none), and a tile exactly where predicted with nothing
+put right is one **skip** flag, learned from the tiles to its left and
+above it.
+
+**Cuts.** A frame whose brightness differs from the frame before by more
+than `cut` (28 levels on average) stands alone, and the history starts
+again there.
+
+**The same on both sides.** Every vector either side predicts is folded
+into a check; the bottle's index holds the packer's, and `verify` fails if
+the player's differs. A test packs and unpacks frames and compares the two
+engines' checks.
+
+Measured on `guitar_10s.mp4`:
+
+| | bytes | PSNR | VMAF |
+|---|---|---|---|
+| as it was (`--coarse 8 --between`) | 4 849 799 | 45.74 dB | 94.40 |
+| **with the engine (`--predict`)** | **4 125 389** | **45.65 dB** | **94.53** |
+| with the engine, coarse 7 | 4 885 390 | 46.21 dB | 95.16 |
+| with the engine, coarse 6 | 5 836 111 | 46.79 dB | 95.76 |
+| AV1 (libaom, cpu-used 5), crf 26 | 1 455 077 | 46.45 dB | 94.99 |
+| AV1 (libaom), crf 32 | 903 837 | 45.48 dB | 93.54 |
+| AV1 (libaom), crf 38 | 600 212 | 44.56 dB | 91.82 |
+
+15 % smaller, not 3 to 5 times: the vectors fell from 1 344 325 to 759 619
+bytes (now 18.4 % of the bottle), the kinds and flags rose a little
+(443 841), and the waves, which the engine does not touch, are 2 800 028
+bytes: 67.9 % of what is left. 78.0 % of the tiles are skipped, 81.8 % of
+the blocks have no wave. At VMAF 94.5 libaom's AV1 is about 1.2 MB: a
+bottle is about 3.4 times that.
+
+A second clip with a cut in it (`cut_6s.mp4`: three seconds of one film,
+three of another): the cut is found, the frame after it stands alone,
+the player's check agrees; 2 337 647 bytes at 45.70 dB without the engine,
+2 330 595 bytes at 45.95 dB with it.
