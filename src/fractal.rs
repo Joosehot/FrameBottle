@@ -24,6 +24,15 @@
 //! and applies them 3 times (the rules that read other frames need only
 //! once).
 //!
+//! **The wave** (Devil's Clockwork's, `--wave N`): when the rules have made
+//! the frame, a wave starts at every seam of a range made anew (its
+//! sources) and moves out a pixel a tick, weaker each tick; the pixels on
+//! the two sides of a seam pull each other level, all at once. A step of N
+//! or more across a seam is a real edge of the picture: there the two sides
+//! cancel and nothing moves. The wave is the player's: it costs no byte
+//! but the two that say how it runs. The packer rebuilds with it, so the
+//! next frame is made from the frame as the wave left it.
+//!
 //! **HotMotor does the search.** For each range the decisions are taken in
 //! order: where from (the four sources, each with its scores in
 //! rules.toml), which place, which turn, what contrast and brightness. At
@@ -190,6 +199,10 @@ pub struct How {
     /// How many times the rules are applied to a frame that stands alone, and to another.
     pub rounds_alone: u8,
     pub rounds: u8,
+    /// The wave: how many ticks it moves out from a seam (0: no wave), and how high a
+    /// step across a seam is an edge of the picture, which it leaves alone.
+    pub wave: u8,
+    pub wave_edge: u8,
     /// The sources' scores (pack, play, size) from rules.toml: skip, moved, own, flat.
     pub sources: [[f64; 3]; 4],
     pub source_weight: f64,
@@ -580,7 +593,80 @@ const ALONE: u8 = 1;
 const OLDER: u8 = 2;
 const VECTORS_TOLD: u8 = 4;
 const SHIFTS_TOLD: u8 = 8;
+const WAVE: u8 = 16;
 const HEAD: usize = 4;
+
+/// The wave over a frame the rules have made. `rules` are its ranges; the seams of
+/// those made anew are the sources. Every pixel is moved at once, from the frame as
+/// the rules left it: across a seam with the step d, the pixel k away from it moves
+/// d * (2 (ticks - k) - 1) / (4 ticks) toward the other side.
+fn wave(geo: &Geometry, cur: &mut [u8], rules: &[(usize, usize, usize, Rule)], ticks: usize, edge: i32) {
+    let at = geo.offsets();
+    for p in 0..3 {
+        let (w, h) = (geo.planes[p].w, geo.planes[p].h);
+        // The colours' ranges are half as wide: the wave moves half as far there.
+        let t = if p == 0 { ticks } else { ticks.div_ceil(2) };
+        if t == 0 || w < 2 * t || h < 2 * t {
+            continue;
+        }
+        // A seam left of a pixel, and one above it.
+        let (mut left, mut above) = (vec![false; w * h], vec![false; w * h]);
+        for (x, y, n, r) in rules {
+            if *r == Rule::Skip {
+                continue;
+            }
+            let (px, py, pn) = if p == 0 { (*x, *y, *n) } else { (x / 2, y / 2, n / 2) };
+            let (x1, y1) = ((px + pn).min(w), (py + pn).min(h));
+            for yy in py..y1 {
+                left[yy * w + px] = px > 0;
+                if x1 < w {
+                    left[yy * w + x1] = true;
+                }
+            }
+            for xx in px..x1 {
+                above[py * w + xx] = py > 0;
+                if y1 < h {
+                    above[y1 * w + xx] = true;
+                }
+            }
+        }
+        let plane = &mut cur[at[p]..at[p] + w * h];
+        let was: Vec<i32> = plane.iter().map(|v| *v as i32).collect();
+        let mut moved = vec![0i32; w * h];
+        // One seam: `q` is the first pixel past it, `step` leads away from it.
+        let mut seam = |q: usize, step: usize| {
+            let p0 = q - step;
+            let d = was[q] - was[p0];
+            // A real edge, or a side that is not level itself: the two cancel.
+            if d == 0 || d.abs() >= edge || 2 * (was[p0] - was[p0 - (t - 1) * step]).abs() >= edge || 2 * (was[q] - was[q + (t - 1) * step]).abs() >= edge {
+                return;
+            }
+            for k in 0..t {
+                let c = d * (2 * (t - k) as i32 - 1);
+                moved[p0 - k * step] += c;
+                moved[q + k * step] -= c;
+            }
+        };
+        for y in 0..h {
+            for x in t..=w - t {
+                if x < w && left[y * w + x] {
+                    seam(y * w + x, 1);
+                }
+            }
+        }
+        for y in t..=h - t {
+            for x in 0..w {
+                if y < h && above[y * w + x] {
+                    seam(y * w + x, w);
+                }
+            }
+        }
+        let scale = 4 * t as i32;
+        for (v, (o, m)) in plane.iter_mut().zip(was.iter().zip(&moved)) {
+            *v = (o + (m + scale / 2).div_euclid(scale)).clamp(0, 255) as u8;
+        }
+    }
+}
 
 /// Does the frame stand alone (no frame before it is needed)?
 pub fn alone(payload: &[u8]) -> bool {
@@ -658,9 +744,12 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, older: Option<&
             RANGES[k].fetch_add(1, Ordering::Relaxed);
         }
     }
-    let mut out = vec![(if has_before { 0 } else { ALONE }) | (if has_older { OLDER } else { 0 }) | (if w.vectors_told { VECTORS_TOLD } else { 0 }) | (if w.shifts_told { SHIFTS_TOLD } else { 0 })];
+    let mut out = vec![(if how.wave > 0 { WAVE } else { 0 }) | (if has_before { 0 } else { ALONE }) | (if has_older { OLDER } else { 0 }) | (if w.vectors_told { VECTORS_TOLD } else { 0 }) | (if w.shifts_told { SHIFTS_TOLD } else { 0 })];
     out.push(if has_before { how.rounds } else { how.rounds_alone });
     out.extend((bands as u16).to_le_bytes());
+    if how.wave > 0 {
+        out.extend([how.wave, how.wave_edge]);
+    }
     for (bytes, _) in &written {
         out.extend((bytes.len() as u32).to_le_bytes());
     }
@@ -684,10 +773,12 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, older: Opti
     let rows = band_rows(geo, bands);
     let across = geo.width.div_ceil(ROOT);
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
-    let mut data = HEAD + 4 * starts.len();
+    // A frame with a wave says how it runs, after the head.
+    let (head, waves) = if flags & WAVE != 0 { (HEAD + 2, payload.get(HEAD..HEAD + 2).map(|b| (b[0] as usize, b[1] as i32)).ok_or("a frame of rules is cut")?) } else { (HEAD, (0, 0)) };
+    let mut data = head + 4 * starts.len();
     let mut coded = Vec::new();
     for i in 0..starts.len() {
-        let len = payload.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a frame of rules is cut")?;
+        let len = payload.get(head + 4 * i..head + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a frame of rules is cut")?;
         coded.push(payload.get(data..data + len).ok_or("a frame of rules is cut")?);
         data += len;
     }
@@ -769,6 +860,9 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, older: Opti
                 put(&mut cur, b);
             }
         }
+    }
+    if waves.0 > 0 {
+        wave(geo, &mut cur, &rules, waves.0.min(8), waves.1);
     }
     Ok(cur)
 }

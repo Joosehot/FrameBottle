@@ -64,6 +64,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--fractal N]               fractal mode: frames as rules HotMotor searches (N: what a bit is worth in squares of error);
                                          the frames that stand alone are blocks (--coarse, 8 if not given)
+             [--wave N]                  with --fractal: the player runs a wave out from the seams of the ranges; a step of N or more is left alone
              [--fractal-keys]            with --fractal: the frames that stand alone are rules too, made from flat grey
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
@@ -717,6 +718,10 @@ fn run() -> Result<(), String> {
                 rules.fractal.lambda = it.next().and_then(|n| n.parse().ok()).filter(|n| *n > 0.0).ok_or("--fractal needs a number above 0")?;
             }
             "--fractal-keys" => rules.fractal_keys = true,
+            "--wave" => {
+                rules.fractal.wave_edge = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--wave needs a whole number from 1 to 255")?;
+                rules.fractal.wave = rules.wave_ticks;
+            }
             "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,
             "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,

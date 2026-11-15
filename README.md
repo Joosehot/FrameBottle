@@ -815,3 +815,17 @@ rule 21.7 %, places and vectors 23.0 %, turns 0.1 %, contrast and brightness 34.
 Of its ranges 77.8 % are `skip`, 20.7 % `moved`, 1.4 % `flat` and 0.1 % `own`: when the
 frame before is at hand, a block of it nearly always weighs less than a domain of the
 frame itself. `fbottle png <bottle> <frame> <file>` writes a rebuilt frame as a picture.
+
+### The wave (`--wave N`, with `--fractal`)
+
+Devil's Clockwork's wave in the player: when the rules have made a frame, a wave starts
+at every seam of a range made anew and moves out a pixel a tick (3 ticks, rules.toml),
+weaker each tick; the two sides of a seam pull each other level, all pixels at once. A
+step of N or more across a seam is an edge of the picture and is left alone. It costs two
+bytes a frame. The packer rebuilds with it, so the next frame is made from what it left.
+
+| bottle (guitar_10s.mp4) | bytes | PSNR | VMAF |
+|---|---|---|---|
+| `--fractal 250` | 1 746 312 | 36.80 dB | 71.06 |
+| `--fractal 250 --wave 12` | 1 717 964 | 36.98 dB | 70.86 |
+| `--fractal 250 --wave 24` | 1 693 484 | 36.99 dB | 70.10 |

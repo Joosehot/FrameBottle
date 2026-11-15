@@ -111,6 +111,8 @@ window = 24
 # grey), and to a frame that starts from the frame before it.
 rounds_alone = 10
 rounds = 3
+# The wave (--wave N): how many ticks, a pixel a tick, it moves out from a seam.
+wave_ticks = 3
 
 # Where a range comes from. The scores are taken off the rule's price in bits (times the
 # weight): a rule that plays quickly and packs quickly may cost a little more error.

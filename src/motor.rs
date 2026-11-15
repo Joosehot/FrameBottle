@@ -67,6 +67,8 @@ pub struct Rules {
     pub fractal_keys: bool,
     pub fractal: crate::fractal::How,
     pub fractal_writing: Vec<Rule>,
+    /// The wave's ticks, for when the command's --wave switches it on.
+    pub wave_ticks: u8,
 }
 
 pub const DEFAULT_RULES: &str = include_str!("../rules.toml");
@@ -156,6 +158,8 @@ impl Rules {
             window: (num(fr, "window", "fractal")? as i32).clamp(0, 256),
             rounds_alone: (num(fr, "rounds_alone", "fractal")? as usize).clamp(1, 255) as u8,
             rounds: (num(fr, "rounds", "fractal")? as usize).clamp(1, 255) as u8,
+            wave: 0,
+            wave_edge: 0,
             sources: std::array::from_fn(|i| source.variants[i].axes),
             source_weight: source.weight,
             profile: *profiles.get("size").ok_or("rules.toml: no [profile.size]")?,
@@ -206,6 +210,7 @@ impl Rules {
             fractal_keys: false,
             fractal,
             fractal_writing: fractal_rules,
+            wave_ticks: (num(fr, "wave_ticks", "fractal")? as usize).clamp(1, 8) as u8,
         })
     }
 }
