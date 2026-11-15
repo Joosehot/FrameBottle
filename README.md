@@ -843,3 +843,17 @@ for a step less). The player is the same. guitar_10s.mp4, `--between --predict`:
 | `--coarse 8`, real bits | 4 700 703 | 46.17 dB | 95.69 |
 | `--coarse 9`, real bits | 4 052 624 | 45.75 dB | 95.22 |
 | `--coarse 10`, real bits | 3 608 666 | 45.35 dB | 94.74 |
+
+### `--tolerance 1` against x264 and AV1 at the same nearness
+
+guitar_10s.mp4, measured from outside, frame by frame (the bottle as the player shows it):
+
+| pack | bytes | PSNR | VMAF |
+|---|---|---|---|
+| Frame Bottle `--tolerance 1` (no sample more than 1 off before mending) | 69 777 286 | 51.31 dB | 98.64 |
+| x264 slow crf 6 | 40 671 712 | 56.05 dB | 98.88 |
+| x264 slow crf 10 | 26 167 152 | 53.34 dB | 98.55 |
+| x264 slow crf 14 | 15 923 385 | 50.75 dB | 97.81 |
+| libaom AV1 cpu-used 6 crf 4 | 22 776 015 | 53.27 dB | 98.79 |
+| libaom AV1 cpu-used 6 crf 10 | 7 339 883 | 49.79 dB | 97.89 |
+| libaom AV1 cpu-used 6 crf 16 | 3 669 642 | 48.17 dB | 96.85 |
