@@ -978,8 +978,67 @@ fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, 
     guess
 }
 
+/// How many bits a yes/no costs the coder when it holds `p` for "no".
+fn bit_cost(p: u16, v: bool) -> f64 {
+    static COST: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let cost = COST.get_or_init(|| (0..=4096).map(|i| -((i.max(1) as f32) / 4096.0).log2()).collect());
+    cost[if v { 4096 - p as usize } else { p as usize }] as f64
+}
+
+/// How many bits the coder would spend on a block's steps, as it has learned so far:
+/// `block` gone through without writing (the book of patterns left aside).
+fn block_bits(l: &Learned, t: &Tables, kind: usize, moved: usize, steps: &[i32; 64]) -> f64 {
+    let want = steps.iter().rposition(|v| *v != 0).map_or(0, |i| i + 1);
+    let mut bits = bit_cost(l.any[kind * 2 + moved], want > 0);
+    if want == 0 {
+        return bits;
+    }
+    let mut node = 1usize;
+    for b in (0..6).rev() {
+        let bit = ((want - 1) >> b) & 1 == 1;
+        bits += bit_cost(l.last[kind][node], bit);
+        node = (node * 2 + bit as usize) & 63;
+    }
+    let mut size_at = [0u8; 64];
+    for i in (0..want).rev() {
+        let at = t.order[i];
+        let (u, v) = (at % 8, at / 8);
+        let get = |du: usize, dv: usize| if u + du < 8 && v + dv < 8 { size_at[(v + dv) * 8 + u + du] as usize } else { 0 };
+        let near = get(1, 0) + get(0, 1) + get(1, 1) + get(2, 0) + get(0, 2);
+        let fine = kind * 6 + l_fine(i);
+        if i + 1 < want {
+            bits += bit_cost(l.left[fine * 6 + near.min(5)], steps[i] != 0);
+            if steps[i] == 0 {
+                continue;
+            }
+        }
+        bits += bit_cost(l.sign[kind], steps[i] < 0);
+        let n = steps[i].unsigned_abs().clamp(1, 65535);
+        let ctx = (kind * 4 + near.min(3)) * 2;
+        bits += bit_cost(l.more[ctx], n > 1);
+        if n > 1 {
+            bits += bit_cost(l.more[ctx + 1], n > 2);
+            if n > 2 {
+                // A whole number as `count` writes it: how many digits, then the digits.
+                let (p, m) = (&l.size[fine], n - 2);
+                let digits = 32 - m.leading_zeros() as usize;
+                for d in 1..=digits.min(16) {
+                    if d < 16 {
+                        bits += bit_cost(p[d - 1], d < digits);
+                    }
+                }
+                for j in (0..digits.min(16) - 1).rev() {
+                    bits += bit_cost(p[16 + j], (m >> j) & 1 == 1);
+                }
+            }
+        }
+        size_at[at] = n.min(3) as u8;
+    }
+    bits
+}
+
 /// A miss as steps of its waves, coarse to fine.
-fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32, price: f64) -> [i32; 64] {
+fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32, price: f64, l: &Learned, (kind, moved): (usize, usize)) -> [i32; 64] {
     let w = t.waves(miss);
     let mut steps = [0i32; 64];
     for (n, s) in steps.iter_mut().enumerate() {
@@ -988,19 +1047,30 @@ fn count_steps(t: &Tables, miss: &[i32; 64], dead: i32, price: f64) -> [i32; 64]
         let (v, step) = (w[t.order[n]], t.step[n]);
         *s = v.signum() * ((v.abs() + step / dead) / step);
     }
-    // Then each wave is weighed on its own, finest first: a step less, if what that
-    // leaves wrong costs less than the bits it saves (a wave gone saves about five,
-    // a step shorter about two).
+    // Then each wave is weighed on its own, finest first, with the whole block's bits
+    // as the coder would spend them now: the nearest number of steps, one less, or
+    // none; whichever leaves the least wrong for its bits.
+    let mut bits = block_bits(l, t, kind, moved, &steps);
     for n in (0..64).rev() {
-        if steps[n] == 0 {
+        let (v, step) = (w[t.order[n]] as f64, t.step[n] as f64);
+        let nearest = (v / step).round() as i32;
+        if nearest == 0 && steps[n] == 0 {
             continue;
         }
-        let (v, step) = (w[t.order[n]] as f64, t.step[n] as f64);
-        let less = steps[n] - steps[n].signum();
-        let (wrong, wrong_less) = ((v - steps[n] as f64 * step).powi(2), (v - less as f64 * step).powi(2));
-        if wrong_less - wrong < price * if less == 0 { 5.0 } else { 2.0 } {
-            steps[n] = less;
+        let wrong = |k: i32| (v - k as f64 * step).powi(2);
+        let (mut best, mut least) = (steps[n], wrong(steps[n]) + price * bits);
+        for k in [0, nearest - nearest.signum(), nearest] {
+            if k == steps[n] || k == best {
+                continue;
+            }
+            let was = std::mem::replace(&mut steps[n], k);
+            let b = block_bits(l, t, kind, moved, &steps);
+            steps[n] = was;
+            if wrong(k) + price * b < least {
+                (best, least, bits) = (k, wrong(k) + price * b, b);
+            }
         }
+        steps[n] = best;
     }
     steps
 }
@@ -1045,7 +1115,7 @@ fn blocks_of(geo: &Geometry, tx: usize, ty: usize) -> Vec<(usize, (usize, usize)
 /// every bit it would take. A block's waves are left out altogether when keeping them
 /// costs more than it mends.
 #[allow(clippy::too_many_arguments)]
-fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &Kind, head_bits: u32, (tx, ty, ty0): (usize, usize, usize), bufs: &[&mut [u8]; 3], (dead, large): (i32, bool), price: f64) -> (f64, Vec<[i32; 64]>, Option<Box<[i32; 256]>>) {
+fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &Kind, head_bits: u32, (tx, ty, ty0): (usize, usize, usize), bufs: &[&mut [u8]; 3], (dead, large): (i32, bool), price: f64, l: &Learned) -> (f64, Vec<[i32; 64]>, Option<Box<[i32; 256]>>) {
     let mut cost = price * head_bits as f64;
     let mut all = Vec::with_capacity(6);
     // The light of the tile: what its four blocks weigh, their guesses and their misses.
@@ -1078,16 +1148,17 @@ fn weigh(geo: &Geometry, t: &Tables, at: &[usize], f: &From, src: &[u8], kind: &
                 miss[j * 8 + k] = sp.at((bx + k) as i32, (by + j) as i32) as i32 - guess[j * 8 + k];
             }
         }
-        let mut steps = count_steps(t, &miss, dead, price);
+        let learned = ((i > 0) as usize, !matches!(kind, Kind::Flat(_)) as usize);
+        let mut steps = count_steps(t, &miss, dead, price, l, learned);
         let wrong_without: i64 = miss.iter().map(|m| (*m as i64) * (*m as i64)).sum();
-        let mut wrong = wrong_without as f64 + price;
+        let mut wrong = wrong_without as f64 + price * block_bits(l, t, learned.0, learned.1, &[0; 64]);
         let mut back = [0i32; 64];
         if steps.iter().any(|s| *s != 0) {
             back = put_back(t, &steps);
             let with: i64 = (0..64).map(|n| { let e = (miss[n] - ((guess[n] + back[n]).clamp(0, 255) - guess[n])) as i64; e * e }).sum();
-            let bits: u32 = 7 + steps.iter().filter(|s| **s != 0).map(|s| 3 + 2 * s.unsigned_abs().ilog2()).sum::<u32>();
-            if (with as f64) + price * bits as f64 <= wrong {
-                wrong = with as f64 + price * bits as f64;
+            let bits = block_bits(l, t, learned.0, learned.1, &steps);
+            if (with as f64) + price * bits <= wrong {
+                wrong = with as f64 + price * bits;
             } else {
                 steps = [0; 64];
                 back = [0; 64];
@@ -1262,7 +1333,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 }
                 let mut least = f64::MAX;
                 for (kind, bits) in &ways {
-                    let (cost, steps, big) = weigh(geo, t, &at, f, src, kind, *bits, (tx, ty, ty0), &bufs, (dead, how.large), price);
+                    let (cost, steps, big) = weigh(geo, t, &at, f, src, kind, *bits, (tx, ty, ty0), &bufs, (dead, how.large), price, &l);
                     if cost < least {
                         (least, want, kept, kept_big) = (cost, *kind, Some(steps), big);
                     }

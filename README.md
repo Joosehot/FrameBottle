@@ -829,3 +829,17 @@ bytes a frame. The packer rebuilds with it, so the next frame is made from what 
 | `--fractal 250` | 1 746 312 | 36.80 dB | 71.06 |
 | `--fractal 250 --wave 12` | 1 717 964 | 36.98 dB | 70.86 |
 | `--fractal 250 --wave 24` | 1 693 484 | 36.99 dB | 70.10 |
+
+### Waves weighed by the coder's real bits
+
+The packer weighs each wave (the nearest number of steps, one less, or none) and whether
+a block keeps any wave at all with the bits the coder would spend as it has learned so
+far (`block_bits` in src/block.rs), in place of fixed guesses (5 bits for a wave gone, 2
+for a step less). The player is the same. guitar_10s.mp4, `--between --predict`:
+
+| bottle | bytes | PSNR | VMAF |
+|---|---|---|---|
+| `--coarse 8`, fixed guesses (before) | 4 125 389 | 45.65 dB | 94.53 |
+| `--coarse 8`, real bits | 4 700 703 | 46.17 dB | 95.69 |
+| `--coarse 9`, real bits | 4 052 624 | 45.75 dB | 95.22 |
+| `--coarse 10`, real bits | 3 608 666 | 45.35 dB | 94.74 |
