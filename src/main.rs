@@ -15,6 +15,10 @@
 //! Its guessers read the frame before, this frame so far, Golden Answer's fraction and
 //! the Hammer: the stack of every pixel's line through all the frames so far.
 //!
+//! Fractal mode (src/fractal.rs) keeps a frame as rules that make it out of itself and
+//! out of the frames before it; HotMotor searches the rules and chooses how they are
+//! written, the lightning brands each frame's rules and Nimbus keeps them.
+//!
 //! The report's numbers are worked out by Nuome's Golden Answer (src/golden.rs).
 
 // Strike's own code, as it is in Strike: the lightning's home and hashes, and Nimbus.
@@ -29,6 +33,7 @@ mod block;
 mod bottle;
 mod chop;
 mod dict;
+mod fractal;
 mod golden;
 mod guess;
 mod light;
@@ -57,6 +62,9 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--breakdown]               with --coarse: what every frame's bytes are spent on
              [--predict]                 with --coarse: the Predictive Motion Engine (vectors predicted from the frames so far, cuts found)
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
+             [--fractal N]               fractal mode: frames as rules HotMotor searches (N: what a bit is worth in squares of error);
+                                         the frames that stand alone are blocks (--coarse, 8 if not given)
+             [--fractal-keys]            with --fractal: the frames that stand alone are rules too, made from flat grey
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
              [--dictionary-first]        with --coarse: the corrections as plain bits, the dictionary does the final packing
@@ -66,6 +74,7 @@ fbottle play <bottle> [--smooth N] [--bench]   N times the movie's frame rate (2
 fbottle test <movie> [--smooth N] [--for size|play] [--tolerance N]   pack, verify, play twice without a window, report
 fbottle info <bottle>
 fbottle forget <bottle>                  empty the bottle's window in Nimbus
+fbottle png <bottle> <frame> <file>      one frame as the player rebuilds it, as a PNG picture
 fbottle raw <bottle> <file>              the frames as the player shows them, one after the other, as plain bytes
 fbottle smoother <bottle>                how near a guessed frame comes to a real one";
 
@@ -198,6 +207,13 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     // The pattern dictionary: every frame's bits go through it, in order.
     let mut dictionary = dict::Dictionary::holding(rules.patterns);
     let mut books: Vec<block::Book> = Vec::new();
+    // Fractal mode: the frame before the last as the player will have it, the names of
+    // the last two, and for each frame of rules its bytes, what its bits went to (the
+    // quadtree and kinds, places, turns, contrast and brightness) and its ranges by rule.
+    let mut carry2: Option<Vec<u8>> = None;
+    let (mut carry_name, mut carry2_name) = (String::from("-"), String::from("-"));
+    let mut ruled: Vec<(usize, [u64; 8])> = Vec::new();
+    let fractal_how = fractal::How { profile, ..rules.fractal.clone() };
     // A group of frames is packed as blocks and its frames become nodes, in their own order.
     macro_rules! finish_group {
         () => {{
@@ -245,6 +261,71 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
+        if rules.fractal_on {
+            // Fractal mode: each frame is rules over the last two frames as the player
+            // will have them, so one at a time. A frame after a cut stands alone.
+            for frame in std::mem::take(&mut frames) {
+                let light: Vec<u8> = frame[..light_len].iter().step_by(7).copied().collect();
+                let unlike = light_before.as_ref().map_or(0.0, |b| b.iter().zip(&light).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / light.len() as f64);
+                light_before = Some(light);
+                if unlike > rules.cut {
+                    cuts += 1;
+                    (carry, carry2) = (None, None);
+                }
+                if carry.is_none() && !rules.fractal_keys {
+                    // The frame that stands alone is kept as blocks.
+                    group.push(frame);
+                    finish_group!();
+                    carry2 = None;
+                    carry_name = bottle::sha(carry.as_ref().unwrap());
+                    continue;
+                }
+                if carry.is_none() {
+                    (carry_name, carry2_name) = ("-".into(), "-".into());
+                }
+                // Strike: the lightning brands the frame's rules by everything that decides
+                // them; a frame searched once is struck from Nimbus.
+                let key = bottle::sha(
+                    format!("fbottle fractal 1
+{fractal_how:?}
+{:?}
+{}
+{} {}x{} {}
+{}
+{carry_name}
+{}", rules.fractal_writing, rules.beam, geo.pix_fmt, geo.width, geo.height, rules.bands, bottle::sha(&frame), if carry2.is_some() { &carry2_name } else { "-" })
+                        .as_bytes(),
+                );
+                let branded = bottle::branded("fractal", &key).and_then(|text| {
+                    let mut lines = text.lines();
+                    let payload = bottle::from_nimbus(lines.next()?)?;
+                    let counts: Vec<u64> = lines.next()?.split(' ').filter_map(|n| n.parse().ok()).collect();
+                    Some((payload, <[u64; 8]>::try_from(counts).ok()?))
+                });
+                let (payload, counts) = match branded {
+                    Some(found) => {
+                        struck += 1;
+                        found
+                    }
+                    None => {
+                        let payload = fractal::pack(geo, &frame, carry.as_deref(), carry2.as_deref(), rules.bands, &fractal_how, rules);
+                        let counts: [u64; 8] = std::array::from_fn(|i| if i < 4 { &fractal::SPENT[i] } else { &fractal::RANGES[i - 4] }.swap(0, std::sync::atomic::Ordering::Relaxed));
+                        let hash = fstrike::put_bytes(&payload)?;
+                        bottle::brand("fractal", &key, &format!("{hash}
+{}", counts.map(|c| c.to_string()).join(" ")));
+                        (payload, counts)
+                    }
+                };
+                let rebuilt = fractal::unpack(geo, &payload, carry.as_deref(), carry2.as_deref())?;
+                ruled.push((payload.len(), counts));
+                keep([vec![4, 0, 0], payload].concat(), &rebuilt, None, species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+                hammer.strike(&rebuilt);
+                carry2 = carry.take();
+                carry2_name = std::mem::replace(&mut carry_name, bottle::sha(&rebuilt));
+                carry = Some(rebuilt);
+            }
+            continue;
+        }
         if rules.coarse > 0 {
             // Blocks: frames are packed in groups (one frame a group without --between, and
             // the first frame always alone), each from the frames as the player will have them.
@@ -446,7 +527,25 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     };
     let size = bottle::glue(&out, index, &share_hashes)?;
     println!("GLUE   {} shares struck from Nimbus into {} ({size} bytes)", share_hashes.len(), out.display());
-    if rules.breakdown && !spent.is_empty() {
+    if rules.fractal_on {
+        // Where the bytes are, as the fractal mode counts them.
+        let bytes = |millibits: u64| millibits as f64 / 8000.0;
+        let file = size as f64;
+        let share = |v: f64| format!("{:9.0} bytes {:5.1} %", v, 100.0 * v / file);
+        let total: usize = ruled.iter().map(|r| r.0).sum();
+        let sum = |i: usize| ruled.iter().map(|r| r.1[i]).sum::<u64>();
+        let ranges: u64 = (4..8).map(sum).sum();
+        println!("FRACTAL  {} frames of rules ({} bytes, {:.0} a frame), {} frames that stand alone ({} bytes); cuts found: {cuts}", ruled.len(), total, total as f64 / ruled.len().max(1) as f64, n - ruled.len(), sizes[0]);
+        println!("BREAKDOWN, the whole bottle ({size} bytes):");
+        println!("  the frames that stand alone      {}", share(sizes[0] as f64));
+        println!("  quadtree flags and kinds of rule {}", share(bytes(sum(0))));
+        println!("  domain places and vectors        {}", share(bytes(sum(1))));
+        println!("  turns (isometries)               {}", share(bytes(sum(2))));
+        println!("  contrast and brightness (s, o)   {}", share(bytes(sum(3))));
+        println!("  lengths, headers, coder rounding {}", share(total as f64 - bytes(sum(0) + sum(1) + sum(2) + sum(3))));
+        println!("  the index and the bottle's ends  {}", share(file - total as f64 - sizes[0] as f64));
+        println!("  ranges by rule: skip {:.1} %, moved {:.1} %, own (a domain of the frame itself) {:.1} %, flat {:.1} % of {ranges}", 100.0 * sum(4) as f64 / ranges.max(1) as f64, 100.0 * sum(5) as f64 / ranges.max(1) as f64, 100.0 * sum(6) as f64 / ranges.max(1) as f64, 100.0 * sum(7) as f64 / ranges.max(1) as f64);
+    } else if rules.breakdown && !spent.is_empty() {
         // Where the bytes are: per frame, then in all.
         let bytes = |millibits: u64| millibits as f64 / 8000.0;
         let mut all = [0f64; 6];
@@ -613,10 +712,23 @@ fn run() -> Result<(), String> {
                 block::FOUR_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             "--line" => guess::BY_LINE.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--fractal" => {
+                rules.fractal_on = true;
+                rules.fractal.lambda = it.next().and_then(|n| n.parse().ok()).filter(|n| *n > 0.0).ok_or("--fractal needs a number above 0")?;
+            }
+            "--fractal-keys" => rules.fractal_keys = true,
             "--coarse" => rules.coarse = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--coarse needs a whole number from 1 to 255")?,
             "--tolerance" => rules.tolerance = it.next().and_then(|n| n.parse().ok()).filter(|n| *n <= 40).ok_or("--tolerance needs a whole number from 0 to 40")?,
             "--smooth" => smooth = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--smooth needs a whole number, 1 or more")?,
             _ => paths.push(PathBuf::from(a)),
+        }
+    }
+    if rules.fractal_on {
+        if rules.between || rules.predict || rules.dictionary || rules.tolerance > 0 || rules.light > 0 || rules.grid > 0 {
+            return Err("--fractal goes alone (with --coarse for the frames that stand alone, and --fractal-keys)".into());
+        }
+        if rules.coarse == 0 {
+            rules.coarse = 8;
         }
     }
     let path = |i: usize, what: &str| paths.get(i).ok_or(format!("{what} is missing\n{USAGE}"));
@@ -666,6 +778,54 @@ fn run() -> Result<(), String> {
                 })?
             };
             show_play("played", &s);
+        }
+        Some("png") => {
+            use std::io::Write;
+            let b = Bottle::open(path(0, "the bottle")?)?;
+            let k: usize = path(1, "the frame's number")?.to_string_lossy().parse().map_err(|_| "the frame's number is not a number")?;
+            let out = path(2, "the file to write")?;
+            if k >= b.index.nodes.len() || !block::fits(&b.geo) {
+                return Err(format!("the bottle has {} frames of {}; png shows 8-bit YUV 4:2:0", b.index.nodes.len(), b.index.pix_fmt));
+            }
+            let mut chain = bottle::Chain::mending(&b);
+            let mut frame = Vec::new();
+            for from in (0..=k).step_by(24) {
+                let frames = b.frames(from, (from + 24).min(k + 1), &mut chain)?;
+                let shown: Vec<Vec<u8>> = chain.mended.drain(..).collect();
+                frame = if shown.is_empty() { frames } else { shown }.pop().unwrap();
+            }
+            // The picture in red, green and blue (BT.709, video range), row by row.
+            let (w, h) = (b.geo.width, b.geo.height);
+            let (cw, at) = (b.geo.planes[1].w, b.geo.offsets());
+            let mut rows = Vec::with_capacity((3 * w + 1) * h);
+            for y in 0..h {
+                rows.push(0u8);
+                for x in 0..w {
+                    let l = 1.164 * (frame[at[0] + y * w + x] as f64 - 16.0);
+                    let (u, v) = (frame[at[1] + (y / 2) * cw + x / 2] as f64 - 128.0, frame[at[2] + (y / 2) * cw + x / 2] as f64 - 128.0);
+                    for c in [l + 1.793 * v, l - 0.213 * u - 0.533 * v, l + 2.112 * u] {
+                        rows.push(c.round().clamp(0.0, 255.0) as u8);
+                    }
+                }
+            }
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(&rows).map_err(|e| e.to_string())?;
+            let z = z.finish().map_err(|e| e.to_string())?;
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            let mut chunk = |name: &[u8; 4], data: &[u8]| {
+                png.extend((data.len() as u32).to_be_bytes());
+                let mut crc = flate2::Crc::new();
+                crc.update(name);
+                crc.update(data);
+                png.extend(name);
+                png.extend(data);
+                png.extend(crc.sum().to_be_bytes());
+            };
+            chunk(b"IHDR", &[&(w as u32).to_be_bytes()[..], &(h as u32).to_be_bytes()[..], &[8, 2, 0, 0, 0]].concat());
+            chunk(b"IDAT", &z);
+            chunk(b"IEND", &[]);
+            std::fs::write(out, &png).map_err(|e| format!("{}: {e}", out.display()))?;
+            println!("frame {k} of {} written to {} ({} bytes)", path(0, "the bottle")?.display(), out.display(), png.len());
         }
         Some("raw") => {
             // The frames as the player shows them, for measuring from outside.

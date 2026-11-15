@@ -60,6 +60,13 @@ pub struct Rules {
     /// The most patterns the bit dictionary holds (0: the usual 4096).
     pub patterns: usize,
     pub blocks: crate::block::How,
+    /// Fractal mode: is it used (the command's --fractal), are the frames that stand
+    /// alone rules too (--fractal-keys), its settings, and the decisions on how a
+    /// frame's rules are written.
+    pub fractal_on: bool,
+    pub fractal_keys: bool,
+    pub fractal: crate::fractal::How,
+    pub fractal_writing: Vec<Rule>,
 }
 
 pub const DEFAULT_RULES: &str = include_str!("../rules.toml");
@@ -118,6 +125,41 @@ impl Rules {
             }
             rules.push(Rule { name: name.to_string(), weight: num(r, "weight", &at)?, variants });
         }
+        // Fractal mode's own decisions: where a range comes from, and how the rules are written.
+        let fr = doc.get("fractal").and_then(|f| f.as_table()).ok_or("rules.toml: no [fractal]")?;
+        let mut fractal_rules = Vec::new();
+        for (name, values) in [("source", &["skip", "moved", "own", "flat"][..]), ("vectors", &["plain", "told"][..]), ("shifts", &["plain", "told"][..])] {
+            let at = format!("fractal.rule.{name}");
+            let r = fr.get("rule").and_then(|r| r.get(name)).and_then(|r| r.as_table()).ok_or(format!("rules.toml: no [{at}]"))?;
+            let mut variants = Vec::new();
+            for v in r.get("variants").and_then(|v| v.as_array()).ok_or(format!("rules.toml: {at} has no variants"))? {
+                let v = v.as_table().ok_or(format!("rules.toml: a variant of {at} is not a table"))?;
+                let value = v.get("value").and_then(|x| x.as_str()).ok_or(format!("rules.toml: a variant of {at} has no value"))?;
+                if !values.contains(&value) {
+                    return Err(format!("rules.toml: {at} has the unknown value {value} (known: {})", values.join(", ")));
+                }
+                variants.push(Variant { value: value.to_string(), axes: axes(v, &at)? });
+            }
+            if name == "source" && variants.iter().map(|v| v.value.as_str()).ne(values.iter().copied()) {
+                return Err(format!("rules.toml: {at} needs the variants {} in that order", values.join(", ")));
+            }
+            if variants.is_empty() {
+                return Err(format!("rules.toml: {at} has no variants"));
+            }
+            fractal_rules.push(Rule { name: name.to_string(), weight: num(r, "weight", &at)?, variants });
+        }
+        let source = fractal_rules.remove(0);
+        let fractal = crate::fractal::How {
+            lambda: num(fr, "lambda", "fractal")?,
+            beam: (num(fr, "beam", "fractal")? as usize).max(1),
+            range: (num(fr, "range", "fractal")? as i32).clamp(0, 64),
+            window: (num(fr, "window", "fractal")? as i32).clamp(0, 256),
+            rounds_alone: (num(fr, "rounds_alone", "fractal")? as usize).clamp(1, 255) as u8,
+            rounds: (num(fr, "rounds", "fractal")? as usize).clamp(1, 255) as u8,
+            sources: std::array::from_fn(|i| source.variants[i].axes),
+            source_weight: source.weight,
+            profile: *profiles.get("size").ok_or("rules.toml: no [profile.size]")?,
+        };
         let table = |name: &str| doc.get(name).and_then(|j| j.as_table()).ok_or(format!("rules.toml: no [{name}]"));
         let (judge, smoother, player) = (table("judge")?, table("smoother")?, table("player")?);
         let block = num(smoother, "block", "smoother")? as usize;
@@ -160,6 +202,10 @@ impl Rules {
                 group: (num(table("block")?, "group", "block")? as usize).clamp(1, 32),
                 large: num(table("block")?, "large", "block")? != 0.0,
             },
+            fractal_on: false,
+            fractal_keys: false,
+            fractal,
+            fractal_writing: fractal_rules,
         })
     }
 }
@@ -190,8 +236,14 @@ impl Candidate {
 /// rules.toml, so the result is deterministic. Returns the finalists, best
 /// first.
 pub fn search(rules: &Rules, profile: &[f64; 3], judge: &mut dyn FnMut(&Choice) -> (f64, Vec<String>)) -> Vec<Candidate> {
+    search_over(&rules.rules, rules.beam, profile, judge)
+}
+
+/// The same search over any list of rules (fractal mode's decisions on how a frame's
+/// rules are written go through it).
+pub fn search_over(list: &[Rule], width: usize, profile: &[f64; 3], judge: &mut dyn FnMut(&Choice) -> (f64, Vec<String>)) -> Vec<Candidate> {
     let mut beam = vec![Candidate { choice: Vec::new(), local: 0.0, judged: 0.0, notes: Vec::new() }];
-    for rule in &rules.rules {
+    for rule in list {
         let mut grown = Vec::new();
         for c in &beam {
             for v in &rule.variants {
@@ -205,7 +257,7 @@ pub fn search(rules: &Rules, profile: &[f64; 3], judge: &mut dyn FnMut(&Choice) 
         }
         // A stable sort keeps the earlier variant first on a tie.
         grown.sort_by(|a, b| b.score().partial_cmp(&a.score()).unwrap_or(std::cmp::Ordering::Equal));
-        grown.truncate(rules.beam);
+        grown.truncate(width);
         beam = grown;
     }
     beam

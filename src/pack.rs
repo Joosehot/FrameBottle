@@ -307,7 +307,12 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, hammer: Option<
 
 /// Does this packed tile lean on the tile before it?
 pub fn leans(packed: &[u8]) -> bool {
-    packed.first() == Some(&1) || (guessed(packed) && crate::guess::from_before(&packed[3..])) || (blocks(packed) && crate::block::from_before(&packed[3..]))
+    packed.first() == Some(&1) || (fractal(packed) && !crate::fractal::alone(&packed[3..])) || (guessed(packed) && crate::guess::from_before(&packed[3..])) || (blocks(packed) && crate::block::from_before(&packed[3..]))
+}
+
+/// Is this packed tile a frame of fractal rules (not exact)?
+pub fn fractal(packed: &[u8]) -> bool {
+    packed.len() > 3 && packed[0] == 4
 }
 
 /// Is this packed tile a frame of blocks (AV1's way, not exact)?
@@ -369,6 +374,9 @@ pub fn choice_name(packed: &[u8]) -> String {
     }
     if blocks(packed) {
         return "blocks".into();
+    }
+    if fractal(packed) {
+        return "fractal rules".into();
     }
     format!("{}+{}+{}", FROMS[packed[0] as usize], PREDICTS[packed[1] as usize], CODERS[packed[2] as usize])
 }

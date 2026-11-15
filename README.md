@@ -776,3 +776,42 @@ two other guitar films, it did not: on 5 934 tiles kept out the motion
 engine's guess was wrong by 8.491 (mean square) and the refined guess by
 8.494. The owner's decision: Neuras is left out of Frame Bottle. The code
 is in the history (commit 9faccb3).
+
+## Fractal mode (`--fractal N`)
+
+A frame as rules and nothing else: no vectors-and-waves (src/fractal.rs). The frame is
+cut into ranges of 16 x 16, split in four down to 4 x 4, and each range is one rule:
+`skip` (the same place in the frame before), `moved` (a block of one of the last two
+rebuilt frames, its contrast scaled and its brightness shifted), `own` (a domain of the
+frame itself, twice the size, turned one of 8 ways: the classic fractal rule) or `flat`.
+The player applies the rules 3 times to the frame before (10 times from flat grey for a
+frame that stands alone, with `--fractal-keys`; otherwise such a frame is kept as blocks).
+
+- **HotMotor searches the rules**: source, place, turn, contrast and brightness, decision
+  by decision; a quick judge and the beam first, then the exact judge (squares of error
+  plus N for every bit). The sources' scores are in rules.toml.
+- **HotMotor packs the rules**: for each frame it chooses how they are written (vectors
+  and shifts plain or told from the rule before) by the bytes that come out.
+- **Strike**: the lightning brands each frame's rules, Nimbus keeps them. Packing the
+  same clip again: 301 of 302 frames struck, 4.4 s in place of 60 s.
+
+The search runs on the processor (every core), not on the graphics card.
+
+Measured on guitar_10s.mp4 (1080p, 302 frames), from outside, frame by frame:
+
+| bottle | bytes | PSNR | VMAF | packed in |
+|---|---|---|---|---|
+| `--fractal 500` | 1 405 362 | 35.23 dB | 61.80 | 50 s |
+| `--fractal 250` | 1 746 312 | 36.80 dB | 71.06 | 60 s |
+| `--fractal 150` | 2 119 391 | 37.89 dB | 76.55 | 50 s |
+| `--coarse 8 --between --predict` (the best so far) | 4 125 389 | 45.65 dB | 94.53 | |
+| no waves, vectors only (the experiment before) | 2 080 000 | 35.94 dB | 67.2 | |
+| libaom AV1 crf 32 | 903 837 | | 93.54 | |
+| libaom AV1 crf 26 | 1 455 077 | 46.45 dB | 94.99 | |
+
+The player rebuilds a `--fractal 250` bottle at 8.7 ms a frame (115 frames a second).
+Where its bytes are: the frame that stands alone 15.4 %, quadtree flags and kinds of
+rule 21.7 %, places and vectors 23.0 %, turns 0.1 %, contrast and brightness 34.8 %.
+Of its ranges 77.8 % are `skip`, 20.7 % `moved`, 1.4 % `flat` and 0.1 % `own`: when the
+frame before is at hand, a block of it nearly always weighs less than a domain of the
+frame itself. `fbottle png <bottle> <frame> <file>` writes a rebuilt frame as a picture.

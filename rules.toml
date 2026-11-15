@@ -96,6 +96,49 @@ history = 4
 # (in levels). The frame after a cut stands alone, and the history starts again.
 cut = 28
 
+# Fractal mode (--fractal): a frame as rules that make it out of itself and out of the
+# frames before it. HotMotor searches each range's rule and chooses how they are written.
+[fractal]
+# What a bit of a rule is worth, in squares of error (the command's --fractal N sets it).
+lambda = 150
+# How many places the beam keeps after the quick judge, for the exact judge to weigh.
+beam = 4
+# How far a block is looked for in the frames before, in pixels each way.
+range = 7
+# How far a domain is looked for in the frame itself, in half-size pixels each way.
+window = 24
+# How many times the player applies the rules to a frame that stands alone (from flat
+# grey), and to a frame that starts from the frame before it.
+rounds_alone = 10
+rounds = 3
+
+# Where a range comes from. The scores are taken off the rule's price in bits (times the
+# weight): a rule that plays quickly and packs quickly may cost a little more error.
+[fractal.rule.source]
+weight = 0.5
+variants = [
+  { value = "skip",  pack = 1.0, play = 1.0, size = 1.0 },
+  { value = "moved", pack = 0.6, play = 0.9, size = 0.6 },
+  { value = "own",   pack = 0.2, play = 0.3, size = 0.5 },
+  { value = "flat",  pack = 1.0, play = 1.0, size = 0.3 },
+]
+
+# How a frame's rules are written: a vector as it is, or told from the rule before.
+[fractal.rule.vectors]
+weight = 0.1
+variants = [
+  { value = "told",  pack = 0.9, play = 0.9, size = 0.7 },
+  { value = "plain", pack = 1.0, play = 1.0, size = 0.4 },
+]
+
+# The same for a rule's brightness shift.
+[fractal.rule.shifts]
+weight = 0.1
+variants = [
+  { value = "plain", pack = 1.0, play = 1.0, size = 0.5 },
+  { value = "told",  pack = 0.9, play = 0.9, size = 0.5 },
+]
+
 # The smoother: vectors between node A and node B.
 [smoother]
 # A vector is found per block of this many pixels.
