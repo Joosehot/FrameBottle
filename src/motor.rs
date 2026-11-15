@@ -44,6 +44,11 @@ pub struct Rules {
     pub dictionary: bool,
     /// Every second frame is guessed from the frames on both sides (the command's --between).
     pub between: bool,
+    /// The Predictive Motion Engine is used (the command's --predict); how many frames it
+    /// remembers; how unlike the frame before a frame after a cut is.
+    pub predict: bool,
+    pub history: usize,
+    pub cut: f64,
     /// What every frame's bytes are spent on is printed (the command's --breakdown).
     pub breakdown: bool,
     /// Dimmed light: the number of brightness levels on the film's curve (0: not used).
@@ -137,6 +142,9 @@ impl Rules {
             coarse: 0,
             dictionary: false,
             between: false,
+            predict: false,
+            history: (num(table("predict")?, "history", "predict")? as usize).clamp(1, 16),
+            cut: num(table("predict")?, "cut", "predict")?,
             breakdown: false,
             light: 0,
             grid: 0,

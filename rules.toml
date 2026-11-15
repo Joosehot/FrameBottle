@@ -88,6 +88,14 @@ group = 4
 # bytes for 0.06 dB), so it is off; the player reads either.
 large = 0
 
+# The Predictive Motion Engine (--predict).
+[predict]
+# How many frames of each tile's vectors it remembers.
+history = 4
+# A cut: the brightness differs from the frame before by more than this on average
+# (in levels). The frame after a cut stands alone, and the history starts again.
+cut = 28
+
 # The smoother: vectors between node A and node B.
 [smoother]
 # A vector is found per block of this many pixels.

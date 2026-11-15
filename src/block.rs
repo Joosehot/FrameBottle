@@ -141,6 +141,9 @@ struct Learned {
     after: u16,
     /// Which guess from the pixels around a tile that is in no other frame.
     around: [u16; 3],
+    /// Is the tile skipped (the picture where the engine predicted it, nothing put
+    /// right)? By how many of the tiles to its left and above it were.
+    skip: [u16; 3],
     vector: [([u16; 32], [u16; 2]); 2],
     /// Has the block any wave left? By light or colour, and by flat or moved.
     any: [u16; 4],
@@ -165,7 +168,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], skip: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -826,6 +829,52 @@ enum Kind {
     After((i32, i32)),
 }
 
+/// A vector, in quarter pixels.
+type V = (i32, i32);
+
+/// The Predictive Motion Engine's memory: the vector of every tile in the last few
+/// frames that others are guessed from, newest first (None where a tile had none).
+/// It is made only of what was rebuilt, so the packer's and the player's are the
+/// same, and nothing of it is stored. `check` folds in every vector either of them
+/// predicted: equal checks mean the two predicted the same all the way.
+pub struct Motion {
+    fields: std::collections::VecDeque<Vec<Option<V>>>,
+    history: usize,
+    /// How many frames the newest field's vectors span.
+    span: i32,
+    pub check: u64,
+}
+
+impl Motion {
+    /// A memory of `history` frames (0: the usual 4).
+    pub fn new(history: usize) -> Motion {
+        Motion { fields: Default::default(), history: if history == 0 { 4 } else { history }, span: 1, check: 0xcbf2_9ce4_8422_2325 }
+    }
+    /// At a cut the history is forgotten.
+    fn forget(&mut self) {
+        self.fields.clear();
+    }
+}
+
+/// What the engine reads for one frame: the newest field and the one before it, and for
+/// a frame between two how far back and on its two lie and how many frames the
+/// newest field spans.
+#[derive(Clone, Copy)]
+struct Trails<'a> {
+    last: Option<&'a [Option<V>]>,
+    older: Option<&'a [Option<V>]>,
+    between: Option<(i32, i32, i32)>,
+}
+
+/// A vector for a part of the way: v * part / whole, to the nearest quarter pixel.
+fn part_of(v: V, part: i32, whole: i32) -> V {
+    let one = |c: i32| {
+        let n = 2 * c * part;
+        (n + whole.max(1) * n.signum()) / (2 * whole.max(1))
+    };
+    (one(v.0), one(v.1))
+}
+
 /// The frames a tile may be guessed from, as the player has them.
 #[derive(Clone, Copy)]
 struct From<'a> {
@@ -835,6 +884,8 @@ struct From<'a> {
     /// The vector most tiles of the frame have (the whole picture's move): what a
     /// tile's vector is told apart from when the tile to its left has none.
     whole: (i32, i32),
+    /// The motion engine's memory, when it is used.
+    trails: Option<Trails<'a>>,
 }
 
 /// The guess of a block from the pixels just above it and just to its left. `get`
@@ -1097,19 +1148,60 @@ fn cut_tile(sp: &Pic, x0: i32, y0: i32, n: usize) -> Vec<u8> {
 /// One band of tile rows `ty0..ty1`: packed (with `src`) or rebuilt (without).
 /// `bufs` are the band's rows of the three planes as the player has them.
 #[allow(clippy::too_many_arguments)]
-fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, mut book: Option<&mut Book>, c: &mut Coder) {
+fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0: usize, ty1: usize, bufs: [&mut [u8]; 3], made: &Marks, mut book: Option<&mut Book>, field: &mut [Option<V>], check: &mut u64, c: &mut Coder) {
     let at = geo.offsets();
     let mut l = Learned::new();
     let across = geo.width.div_ceil(TILE);
     let dead = how.dead.max(1) as i32;
     // What a bit is worth in squares of error: more, the coarser the steps.
     let price = how.weigh * (t.step[0] * t.step[0]) as f64;
+    // Which tiles of the row above were skipped (none above the band's first row).
+    let mut above_skip = vec![false; across];
     for ty in ty0..ty1 {
         let mut left: Option<(i32, i32)> = None;
         let (mut any_left, mut left_stack, mut left_split, mut left_between, mut left_big) = (false, false, false, false, false);
+        let mut left_skip = false;
+        let mut left_models: Option<[Option<V>; 4]> = None;
         for tx in 0..across {
             let (x0, y0) = ((tx * TILE) as i32, (ty * TILE) as i32);
-            let from = left.unwrap_or(f.whole);
+            // The engine's models for this tile's vector: the tile to the left (or the
+            // whole picture's move); the same tile's vector last time (constant speed);
+            // that carried on by how it changed (constant change of speed); and for a
+            // frame between two, the part of the group's vector that falls to it.
+            let spatial = left.unwrap_or(f.whole);
+            let mut models: [Option<V>; 4] = [Some(spatial), None, None, None];
+            let (mut guess_between, mut guess_after) = ((0, 0), (0, 0));
+            if let Some(tr) = &f.trails {
+                let last = tr.last.and_then(|fd| fd[ty * across + tx]);
+                if let Some((back, on, span)) = tr.between {
+                    models[3] = last.map(|v| part_of(v, back, span));
+                    guess_between = last.map_or((0, 0), |v| part_of(v, back + on, 2 * span));
+                    guess_after = last.map_or((0, 0), |v| part_of((-v.0, -v.1), on, span));
+                } else {
+                    models[1] = last;
+                    models[2] = last.zip(tr.older.and_then(|fd| fd[ty * across + tx])).map(|(a, b)| (2 * a.0 - b.0, 2 * a.1 - b.1));
+                }
+            }
+            // The model that was nearest for the tile to the left speaks for this one: only
+            // what is already rebuilt decides, so the player picks the same.
+            let mut pick = [3, 1, 0].into_iter().find(|g| models[*g].is_some()).unwrap_or(0);
+            if let (Some(lv), Some(lm)) = (left, &left_models) {
+                let mut nearest = i32::MAX;
+                for g in [3, 1, 2, 0] {
+                    if let (Some(was), Some(_)) = (lm[g], models[g]) {
+                        let off = (was.0 - lv.0).abs() + (was.1 - lv.1).abs();
+                        if off < nearest {
+                            (nearest, pick) = (off, g);
+                        }
+                    }
+                }
+            }
+            let from = models[pick].unwrap_or(spatial);
+            if f.trails.is_some() {
+                for v in [from, guess_between, guess_after] {
+                    *check = (*check ^ (v.0 as u32 as u64) ^ ((v.1 as u32 as u64) << 32)).wrapping_mul(0x0000_0100_0000_01B3);
+                }
+            }
             // The packer tries the ways a tile can be guessed and keeps the one that weighs least.
             let mut want = Kind::Flat(0);
             let mut kept: Option<Vec<[i32; 64]>> = None;
@@ -1122,6 +1214,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     let bp = pic(geo, &at, before, 0);
                     let (dx, dy, moved) = find(&s, 16, &bp, x0, y0, (how.range as i32, how.still), from);
                     ways.push((Kind::Moved([(dx, dy); 4], false), 2 + vector_bits((dx - from.0, dy - from.1))));
+                    if f.trails.is_some() && (dx, dy) != from {
+                        // Exactly where the engine predicted: no vector to keep.
+                        ways.push((Kind::Moved([from; 4], false), 1));
+                    }
                     // A tile that is where it was (within a grey level a pixel) is not looked at further.
                     if moved > 256 {
                         // The tile split in four, each quarter with its own vector, found near the tile's.
@@ -1140,9 +1236,17 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                         if let Some(after) = f.after {
                             let ap = pic(geo, &at, after, 0);
                             let d = find_between(&s, &bp, &ap, x0, y0);
-                            ways.push((Kind::Between(d), 3 + vector_bits(d)));
+                            ways.push((Kind::Between(d), 3 + vector_bits((d.0 - guess_between.0, d.1 - guess_between.1))));
                             let (ax, ay, _) = find(&s, 16, &ap, x0, y0, (how.range as i32, how.still), (-dx, -dy));
-                            ways.push((Kind::After((ax, ay)), 4 + vector_bits((ax, ay))));
+                            ways.push((Kind::After((ax, ay)), 4 + vector_bits((ax - guess_after.0, ay - guess_after.1))));
+                            if f.trails.is_some() {
+                                if d != guess_between {
+                                    ways.push((Kind::Between(guess_between), 3));
+                                }
+                                if (ax, ay) != guess_after {
+                                    ways.push((Kind::After(guess_after), 4));
+                                }
+                            }
                         }
                         if f.stack.is_some() {
                             ways.push((Kind::Stack, 3));
@@ -1168,7 +1272,13 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             spending(0);
             let mut tile_waves = false;
             let mut kind = Kind::Flat(0);
-            if f.before.is_some() {
+            // Skipped: the picture where the engine predicted it, and nothing put right.
+            let want_skip = want == Kind::Moved([from; 4], false) && kept_big.is_none() && kept.as_ref().is_some_and(|k| k.iter().all(|b| b.iter().all(|s| *s == 0)));
+            let skip = f.trails.is_some() && f.before.is_some() && c.bit(&mut l.skip[left_skip as usize + above_skip[tx] as usize], want_skip);
+            if skip {
+                kind = Kind::Moved([from; 4], false);
+            }
+            if f.before.is_some() && !skip {
                 let ctx = if !any_left { 2 } else { left.is_some() as usize };
                 if c.bit(&mut l.moved[ctx], matches!(want, Kind::Moved(..))) {
                     let (wv, wsplit) = if let Kind::Moved(v, s) = want { (v, s) } else { ([(0, 0); 4], false) };
@@ -1187,12 +1297,12 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                 } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_))) {
                     let wd = if let Kind::Between(d) = want { d } else { (0, 0) };
                     spending(1);
-                    kind = Kind::Between((c.signed(&mut l.vector[0], wd.0), c.signed(&mut l.vector[1], wd.1)));
+                    kind = Kind::Between((guess_between.0 + c.signed(&mut l.vector[0], wd.0 - guess_between.0), guess_between.1 + c.signed(&mut l.vector[1], wd.1 - guess_between.1)));
                     spending(0);
                 } else if f.after.is_some() && c.bit(&mut l.after, matches!(want, Kind::After(_))) {
                     let wv = if let Kind::After(v) = want { v } else { (0, 0) };
                     spending(1);
-                    kind = Kind::After((c.signed(&mut l.vector[0], wv.0), c.signed(&mut l.vector[1], wv.1)));
+                    kind = Kind::After((guess_after.0 + c.signed(&mut l.vector[0], wv.0 - guess_after.0), guess_after.1 + c.signed(&mut l.vector[1], wv.1 - guess_after.1)));
                     spending(0);
                 } else if f.stack.is_some() && c.bit(&mut l.stack[left_stack as usize], want == Kind::Stack) {
                     kind = Kind::Stack;
@@ -1208,7 +1318,7 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             // The light of a whole tile guessed from another frame: as one block of 16 x 16?
             let whole_tile = x0 as usize + TILE <= geo.width && y0 as usize + TILE <= geo.height;
             spending(0);
-            let big = !matches!(kind, Kind::Flat(_)) && whole_tile && c.bit(&mut l.big[left_big as usize], kept_big.is_some());
+            let big = !skip && !matches!(kind, Kind::Flat(_)) && whole_tile && c.bit(&mut l.big[left_big as usize], kept_big.is_some());
             if big {
                 let (p, band_top) = (&geo.planes[0], ty0 * TILE);
                 let mut guess = [0i32; 256];
@@ -1256,7 +1366,11 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     guess_of(geo, &at, f, i, (bx, by), (px0, py0), &kind)
                 };
                 let mut steps = kept.as_ref().map_or([0i32; 64], |k| k[n]);
-                block(c, &mut l, t, &mut book, (i > 0) as usize, !matches!(kind, Kind::Flat(_)) as usize, &mut steps);
+                if skip {
+                    steps = [0; 64];
+                } else {
+                    block(c, &mut l, t, &mut book, (i > 0) as usize, !matches!(kind, Kind::Flat(_)) as usize, &mut steps);
+                }
                 let waves_left = steps.iter().any(|s| *s != 0);
                 tile_waves |= waves_left;
                 // A block that is only the same block of the frame before is not made anew.
@@ -1285,6 +1399,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                     count(7, 1);
                 }
             }
+            left_skip = skip;
+            above_skip[tx] = skip;
+            left_models = Some(models);
+            field[(ty - ty0) * across + tx] = if let Kind::Moved(v, _) = kind { Some(v[0]) } else { None };
             left_between = matches!(kind, Kind::Between(_));
             left_big = big;
             any_left = true;
@@ -1377,6 +1495,8 @@ fn slots(books: Option<&mut Vec<Book>>, bands: usize, four: bool) -> Vec<Option<
 const HEAD: usize = 9;
 /// After the frame is rebuilt its brightness and colours are put right level by level.
 const PUT_RIGHT: u8 = 64;
+/// The frame was packed with the Predictive Motion Engine.
+const PREDICT: u8 = 128;
 
 /// The vector most tiles of the frame have: every third tile each way is looked for in
 /// the frame before, and the commonest answer is taken.
@@ -1490,14 +1610,26 @@ pub struct How {
 /// rebuilt it. Returns the bytes (flags, bands, coarse, slope, each band's
 /// length, the bands) and the frame as the player will rebuild it.
 #[allow(clippy::too_many_arguments)]
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>, refs: (u8, u8)) -> (Vec<u8>, Vec<u8>) {
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, bands: usize, coarse: u8, how: &How, books: Option<&mut Vec<Book>>, refs: (u8, u8), mut motion: Option<&mut Motion>) -> (Vec<u8>, Vec<u8>) {
     let after = after.filter(|_| before.is_some());
     // The whole picture's move, for a frame guessed from the one before it alone.
     let whole = match (before, after) {
         (Some(b), None) => whole_move(geo, frame, b, how),
         _ => (0, 0),
     };
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()), whole };
+    let predicts = motion.is_some();
+    if before.is_none() {
+        // A frame that stands alone starts the film or follows a cut: the history is forgotten.
+        if let Some(m) = motion.as_deref_mut() {
+            m.forget();
+        }
+    }
+    let trails = motion.as_deref().filter(|_| before.is_some()).map(|m| Trails {
+        last: m.fields.front().map(|f| &f[..]),
+        older: if after.is_some() { None } else { m.fields.get(1).map(|f| &f[..]) },
+        between: after.map(|_| (refs.0 as i32, refs.1 as i32, m.span)),
+    });
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == frame.len()), whole, trails };
     let plain = PLAIN_BITS.load(Ordering::Relaxed);
     let books = if plain { None } else { books };
     let with_books = books.is_some();
@@ -1511,26 +1643,38 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
     let made = marks(geo);
     let work = cut(geo, &mut rebuilt, rows);
     let places = slots(books, work.len(), four);
-    let done: Vec<Vec<u8>> = work
+    let across = geo.width.div_ceil(TILE);
+    let mut field: Vec<Option<V>> = vec![None; across * tile_rows];
+    let coded: Vec<(Vec<u8>, u64)> = work
         .into_par_iter()
         .zip(places)
-        .map(|((ty0, bufs), book)| {
+        .zip(field.par_chunks_mut(across * rows / TILE))
+        .map(|(((ty0, bufs), book), field)| {
             let mut c = if plain { Coder::Bits(Vec::new(), 0) } else { Coder::Write(Encoder::new()) };
-            band(geo, &t, Some(frame), &from, how, ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
-            match c {
-                Coder::Write(e) => e.finish(),
-                Coder::Bits(bytes, _) => bytes,
-                _ => unreachable!(),
-            }
+            let mut check = 0u64;
+            band(geo, &t, Some(frame), &from, how, ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, field, &mut check, &mut c);
+            (
+                match c {
+                    Coder::Write(e) => e.finish(),
+                    Coder::Bits(bytes, _) => bytes,
+                    _ => unreachable!(),
+                },
+                check,
+            )
         })
         .collect();
+    let checks: Vec<u64> = coded.iter().map(|c| c.1).collect();
+    let done: Vec<Vec<u8>> = coded.into_iter().map(|c| c.0).collect();
+    if let Some(m) = motion {
+        remember(m, field, &checks, before.is_some(), after.is_some(), refs.0);
+    }
     smooth_seams(geo, &mut rebuilt, coarse, &made);
     let off = levels_off(geo, frame, &rebuilt);
     let any_off = off.iter().flatten().any(|o| *o != 0);
     if any_off {
         put_right(geo, &mut rebuilt, &off);
     }
-    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 })];
+    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 }) | (if predicts { PREDICT } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -1550,14 +1694,37 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
     (out, rebuilt)
 }
 
+/// After a frame the engine remembers: its checks are folded in, and the vectors of a
+/// frame that others are guessed from become the newest field.
+fn remember(m: &mut Motion, field: Vec<Option<V>>, checks: &[u64], has_before: bool, is_between: bool, span: u8) {
+    for c in checks {
+        m.check = (m.check ^ c).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    if has_before && !is_between {
+        m.fields.push_front(field);
+        m.fields.truncate(m.history);
+        m.span = span.max(1) as i32;
+    }
+}
+
 /// The frame as the player rebuilds it.
-pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, books: &mut Vec<Book>) -> Result<Vec<u8>, String> {
+pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Option<&[u8]>, stack: Option<&[u8]>, books: &mut Vec<Book>, motion: &mut Motion) -> Result<Vec<u8>, String> {
     if payload.len() < HEAD || !fits(geo) {
         return Err("not a frame of blocks".into());
     }
     let before = if from_before(payload) { Some(before.filter(|b| b.len() == geo.frame_len()).ok_or("a frame of blocks was rebuilt without the frame before it")?) } else { None };
     let after = if between(payload) { Some(after.filter(|a| a.len() == geo.frame_len()).ok_or("a frame between two was rebuilt without the frame after it")?) } else { None };
-    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()), whole: (payload[7] as i8 as i32, payload[8] as i8 as i32) };
+    let predicts = payload[0] & PREDICT != 0;
+    if predicts && before.is_none() {
+        motion.forget();
+    }
+    let (back, on) = refs(payload);
+    let trails = (predicts && before.is_some()).then(|| Trails {
+        last: motion.fields.front().map(|f| &f[..]),
+        older: if after.is_some() { None } else { motion.fields.get(1).map(|f| &f[..]) },
+        between: after.map(|_| (back as i32, on as i32, motion.span)),
+    });
+    let from = From { before, after, stack: stack.filter(|s| before.is_some() && s.len() == geo.frame_len()), whole: (payload[7] as i8 as i32, payload[8] as i8 as i32), trails };
     // The levels to put right, if the frame has them, lie before the bands' lengths.
     let mut off = [[0i8; 32]; 3];
     let mut head = HEAD;
@@ -1583,10 +1750,23 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
         data += len;
     }
     let places = slots(if payload[0] & BOOKS != 0 { Some(books) } else { None }, work.len(), payload[0] & FOUR != 0);
-    work.into_par_iter().zip(coded).zip(places).for_each(|(((ty0, bufs), bytes), book)| {
-        let mut c = if payload[0] & PLAIN != 0 { Coder::ReadBits(bytes, 0) } else { Coder::Read(Decoder::new(bytes)) };
-        band(geo, &t, None, &from, &how, ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, &mut c);
-    });
+    let across = geo.width.div_ceil(TILE);
+    let mut field: Vec<Option<V>> = vec![None; across * tile_rows];
+    let checks: Vec<u64> = work
+        .into_par_iter()
+        .zip(coded)
+        .zip(places)
+        .zip(field.par_chunks_mut(across * rows / TILE))
+        .map(|((((ty0, bufs), bytes), book), field)| {
+            let mut c = if payload[0] & PLAIN != 0 { Coder::ReadBits(bytes, 0) } else { Coder::Read(Decoder::new(bytes)) };
+            let mut check = 0u64;
+            band(geo, &t, None, &from, &how, ty0, (ty0 + rows / TILE).min(tile_rows), bufs, &made, book, field, &mut check, &mut c);
+            check
+        })
+        .collect();
+    if predicts {
+        remember(motion, field, &checks, before.is_some(), after.is_some(), back as u8);
+    }
     smooth_seams(geo, &mut out, payload[3], &made);
     if payload[0] & PUT_RIGHT != 0 {
         put_right(geo, &mut out, &off);
@@ -1607,16 +1787,26 @@ mod tests {
         let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
-            let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer), (0, 0));
-            assert_eq!(unpack(&geo, &first, None, None, None, &mut player).unwrap(), a2);
-            let (second, b2) = pack(&geo, &b, Some(&a2), None, Some(&a2), 3, coarse, &how, with.then_some(&mut packer), (0, 0));
-            assert_eq!(unpack(&geo, &second, Some(&a2), None, Some(&a2), &mut player).unwrap(), b2);
+            let (mut engine, mut engine_of_player) = (Motion::new(4), Motion::new(4));
+            let (first, a2) = pack(&geo, &a, None, None, None, 3, coarse, &how, with.then_some(&mut packer), (0, 0), with.then_some(&mut engine));
+            assert_eq!(unpack(&geo, &first, None, None, None, &mut player, &mut engine_of_player).unwrap(), a2);
+            let (second, b2) = pack(&geo, &b, Some(&a2), None, Some(&a2), 3, coarse, &how, with.then_some(&mut packer), (2, 0), with.then_some(&mut engine));
+            assert_eq!(unpack(&geo, &second, Some(&a2), None, Some(&a2), &mut player, &mut engine_of_player).unwrap(), b2);
             // A frame between the two: it is guessed from both.
             let m: Vec<u8> = a.iter().zip(&b).map(|(x, y)| ((*x as u16 + *y as u16) / 2) as u8).collect();
-            let (third, m2) = pack(&geo, &m, Some(&a2), Some(&b2), Some(&b2), 3, coarse, &how, with.then_some(&mut packer), (1, 1));
+            let (third, m2) = pack(&geo, &m, Some(&a2), Some(&b2), Some(&b2), 3, coarse, &how, with.then_some(&mut packer), (1, 1), with.then_some(&mut engine));
             assert_eq!(refs(&third), (1, 1));
             assert!(between(&third));
-            assert_eq!(unpack(&geo, &third, Some(&a2), Some(&b2), Some(&b2), &mut player).unwrap(), m2);
+            assert_eq!(unpack(&geo, &third, Some(&a2), Some(&b2), Some(&b2), &mut player, &mut engine_of_player).unwrap(), m2);
+            // One more frame guessed from `b`, so that the engine has a history to carry on.
+            let c3: Vec<u8> = b.iter().map(|v| v.wrapping_add(1)).collect();
+            let (fourth, c2) = pack(&geo, &c3, Some(&b2), None, Some(&b2), 3, coarse, &how, with.then_some(&mut packer), (2, 0), with.then_some(&mut engine));
+            assert_eq!(unpack(&geo, &fourth, Some(&b2), None, Some(&b2), &mut player, &mut engine_of_player).unwrap(), c2);
+            // The player's engine predicted exactly what the packer's did, all the way.
+            assert_eq!(engine.check, engine_of_player.check, "the two engines predicted the same vectors");
+            if with {
+                assert_ne!(engine.check, Motion::new(4).check, "the engine did predict");
+            }
         }
     }
 }

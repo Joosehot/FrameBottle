@@ -91,6 +91,12 @@ pub struct Index {
     /// The brightness plane is kept as level numbers (dimmed light, or a grid for each frame).
     #[serde(default)]
     pub light: bool,
+    /// Packed with the Predictive Motion Engine: how many frames its memory holds (0: not
+    /// used), and the check of every vector the packer's engine predicted.
+    #[serde(default)]
+    pub predict: usize,
+    #[serde(default)]
+    pub predict_check: u64,
     /// Fake film grain is laid on what is shown: its strength in 16ths of a level (0: none).
     #[serde(default)]
     pub grain: u8,
@@ -237,6 +243,8 @@ pub struct Chain {
     pub dictionary: crate::dict::Dictionary,
     /// The books of block patterns, one for each band (for a bottle of blocks that has them).
     pub books: Vec<crate::block::Book>,
+    /// The Predictive Motion Engine's memory (for a bottle packed with it).
+    pub motion: crate::block::Motion,
     /// For a bottle with a tolerance: each frame fed is also mended (what the
     /// tolerance lost put right as far as it can be) and waits here to be shown.
     /// For a bottle whose frames are shown otherwise than they are kept (a tolerance is
@@ -257,7 +265,7 @@ pub struct Chain {
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), mending: None, mended: Vec::new(), grid: None, ahead: None, cache: Default::default(), tiles: Default::default(), opened: 0 }
+        Chain { at: 0, before: None, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), motion: crate::block::Motion::new(0), mending: None, mended: Vec::new(), grid: None, ahead: None, cache: Default::default(), tiles: Default::default(), opened: 0 }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
@@ -265,6 +273,7 @@ impl Chain {
         let i = &b.index;
         c.mending = (i.tolerance > 0 || i.light || i.grain > 0).then(|| Shows { geo: b.geo.clone(), tolerance: i.tolerance, light: i.light, grain: i.grain });
         c.dictionary = crate::dict::Dictionary::holding(b.index.patterns);
+        c.motion = crate::block::Motion::new(b.index.predict);
         c
     }
     /// The next frame is known: it becomes the frame before, and is laid on the stack.
@@ -391,6 +400,7 @@ impl Bottle {
             *chain = Chain::new();
             chain.mending = mending;
             chain.dictionary = crate::dict::Dictionary::holding(self.index.patterns);
+            chain.motion = crate::block::Motion::new(self.index.predict);
             let mut at = 0;
             while at < from {
                 let end = (at + 24).min(from);
@@ -482,7 +492,7 @@ impl Bottle {
             };
             chain.hammer.strike(&after);
             let packed = waiting[i].as_ref().unwrap();
-            out[i] = crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), Some(&after), chain.hammer.picture(), &mut chain.books)?;
+            out[i] = crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), Some(&after), chain.hammer.picture(), &mut chain.books, &mut chain.motion)?;
             chain.at += 1;
             chain.refer(&after);
             if i + 1 < out.len() {
@@ -547,9 +557,14 @@ impl Bottle {
                 return Err(format!("node {i} does not say which two frames it lies between"));
             }
             let (before, after) = (self.frame_of(i - back, chain)?, self.frame_of(i + on, chain)?);
-            crate::block::unpack(&self.geo, p, Some(&before), Some(&after), chain.hammer.picture(), &mut chain.books)?
+            crate::block::unpack(&self.geo, p, Some(&before), Some(&after), chain.hammer.picture(), &mut chain.books, &mut chain.motion)?
         } else {
-            let f = crate::block::unpack(&self.geo, p, chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books)?;
+            if !crate::block::from_before(p) {
+                // A frame that stands alone (the first, or after a cut): the stack starts again.
+                chain.hammer = crate::guess::Hammer::new();
+                chain.before = None;
+            }
+            let f = crate::block::unpack(&self.geo, p, chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books, &mut chain.motion)?;
             chain.hammer.strike(&f);
             chain.refer(&f);
             f
@@ -566,7 +581,7 @@ impl Bottle {
     fn rebuild(&self, node: usize, packed: Option<&[u8]>, frame: &mut Vec<u8>, chain: &mut Chain) -> Result<(), String> {
         if let Some(packed) = packed {
             *frame = if crate::pack::blocks(packed) {
-                crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books)?
+                crate::block::unpack(&self.geo, &packed[3..], chain.before.as_deref(), None, chain.hammer.picture(), &mut chain.books, &mut chain.motion)?
             } else {
                 crate::guess::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.hammer.guess())?
             };

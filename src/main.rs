@@ -55,6 +55,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--grid N]                  the same with a grid of N levels made for each frame
              [--grain]                   with --coarse or --tolerance: fake film grain on what is shown
              [--breakdown]               with --coarse: what every frame's bytes are spent on
+             [--predict]                 with --coarse: the Predictive Motion Engine (vectors predicted from the frames so far, cuts found)
              [--between]                 with --coarse: every second frame is guessed from the frames on both sides
              [--dictionary]              common bit patterns of the corrections are kept by label
              [--four]                    the dictionary with only four ready-made patterns of block corrections
@@ -100,12 +101,12 @@ fn keep(mut packed: Vec<u8>, rebuilt: &[u8], dictionary: Option<&mut dict::Dicti
 /// last frame kept before it (`carry`); then the middle one from those two, and so on
 /// inward, each between the two nearest frames already packed. Returns each frame's
 /// bytes and the frame as the player will rebuild it, in the frames' own order.
-fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &mut Option<Vec<u8>>, hammer: &mut guess::Hammer, books: &mut Vec<block::Book>, sizes: &mut [usize; 3], spent: &mut Vec<[u64; 8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &mut Option<Vec<u8>>, hammer: &mut guess::Hammer, books: &mut Vec<block::Book>, motion: &mut block::Motion, sizes: &mut [usize; 3], spent: &mut Vec<[u64; 8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let m = frames.len();
     let mut done: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None; m];
     let mut spent_of = vec![[0u64; 8]; m];
     block::spent();
-    let last = block::pack(geo, &frames[m - 1], carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), (0, 0));
+    let last = block::pack(geo, &frames[m - 1], carry.as_deref(), None, hammer.picture(), rules.bands, rules.coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), (m as u8, 0), rules.predict.then_some(&mut *motion));
     spent_of[m - 1] = block::spent();
     hammer.strike(&last.1);
     sizes[if carry.is_none() { 0 } else { 1 }] += last.0.len();
@@ -124,7 +125,7 @@ fn pack_group(geo: &pack::Geometry, rules: &Rules, frames: &[Vec<u8>], carry: &m
         let packed = {
             let before: &[u8] = if lo < 0 { carry.as_deref().expect("a group after the first frame") } else { &done[lo as usize].as_ref().unwrap().1 };
             let after = &done[hi].as_ref().unwrap().1;
-            block::pack(geo, &frames[k], Some(before), Some(after), hammer.picture(), rules.bands, coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), ((k as isize - lo) as u8, (hi - k) as u8))
+            block::pack(geo, &frames[k], Some(before), Some(after), hammer.picture(), rules.bands, coarse, &rules.blocks, rules.dictionary.then_some(&mut *books), ((k as isize - lo) as u8, (hi - k) as u8), rules.predict.then_some(&mut *motion))
         };
         spent_of[k] = block::spent();
         sizes[2] += packed.0.len();
@@ -179,6 +180,11 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     // frame that waits to be guessed from both sides, and how many frames have come.
     let mut carry: Option<Vec<u8>> = None;
     let mut group: Vec<Vec<u8>> = Vec::new();
+    // The Predictive Motion Engine's memory, the light of the frame before (for finding
+    // cuts), and the cuts found.
+    let mut motion = block::Motion::new(rules.history);
+    let mut light_before: Option<Vec<u8>> = None;
+    let mut cuts = 0usize;
     // For --breakdown: what each frame's bits were spent on, and each frame's bytes
     // (with whether it stores levels to put right, and whether it lies between two).
     let mut spent: Vec<[u64; 8]> = Vec::new();
@@ -196,7 +202,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     macro_rules! finish_group {
         () => {{
             let frames_of_group = std::mem::take(&mut group);
-            let packed = pack_group(geo, rules, &frames_of_group, &mut carry, &mut hammer, &mut books, &mut sizes, &mut spent);
+            let packed = pack_group(geo, rules, &frames_of_group, &mut carry, &mut hammer, &mut books, &mut motion, &mut sizes, &mut spent);
             for ((payload, rebuilt), frame) in packed.into_iter().zip(&frames_of_group) {
                 payload_bytes.push((payload.len(), payload[0] & 64 != 0, payload[0] & 32 != 0));
                 if rules.grain {
@@ -243,6 +249,21 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             // Blocks: frames are packed in groups (one frame a group without --between, and
             // the first frame always alone), each from the frames as the player will have them.
             for frame in std::mem::take(&mut frames) {
+                if rules.predict {
+                    // A cut: the picture is another one altogether. What is waiting is
+                    // finished, and this frame stands alone, with a new history.
+                    let light: Vec<u8> = frame[..light_len].iter().step_by(7).copied().collect();
+                    let unlike = light_before.as_ref().map_or(0.0, |b| b.iter().zip(&light).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / light.len() as f64);
+                    light_before = Some(light);
+                    if unlike > rules.cut {
+                        if !group.is_empty() {
+                            finish_group!();
+                        }
+                        cuts += 1;
+                        carry = None;
+                        hammer = guess::Hammer::new();
+                    }
+                }
                 group.push(frame);
                 let full = if carry.is_none() || !rules.between { 1 } else { rules.blocks.group.max(1) };
                 if group.len() >= full {
@@ -344,6 +365,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         (node.col, node.row) = ((i % cols) as u32, (i / cols) as u32);
         node.next = (i + 1 < n).then_some(i as u32 + 1);
     }
+    if rules.predict {
+        println!("PREDICT  the motion engine remembers {} frames; cuts found: {cuts}; check of its predictions {:016x}", rules.history, motion.check);
+    }
     if sizes[0] > 0 {
         println!("SIZES  the first frame {} bytes; the frames guessed from the one before {} bytes; the frames between two {} bytes", sizes[0], sizes[1], sizes[2]);
     }
@@ -412,6 +436,8 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         coarse: rules.coarse,
         between: rules.coarse > 0 && rules.between,
         light: light.is_some(),
+        predict: if rules.predict { rules.history } else { 0 },
+        predict_check: motion.check,
         grain: if rules.grain { light::grain_of(grain_squares, grain_samples) } else { 0 },
         dictionary: if rules.dictionary { Some(fstrike::put_bytes(&dictionary.bytes())?) } else { None },
         patterns: rules.patterns,
@@ -501,6 +527,13 @@ fn verify(b: &Bottle, movie_path: &Path, far: &mut (u8, f64, u64), mended: &mut 
         }
         seen += frames.len();
     }
+    if b.index.predict > 0 {
+        // The player's engine must have predicted every vector the packer's did.
+        if chain.motion.check != b.index.predict_check {
+            return Err("the player's motion engine did not predict what the packer's did".into());
+        }
+        println!("motion engine: the player predicted exactly what the packer did (check {:016x})", chain.motion.check);
+    }
     if let Some(name) = &b.index.dictionary {
         // The player's dictionary must have ended as the packer's did.
         if bottle::sha(&chain.dictionary.bytes()) != *name {
@@ -565,6 +598,7 @@ fn run() -> Result<(), String> {
             "--bench" => bench = true,
             "--dictionary" => rules.dictionary = true,
             "--between" => rules.between = true,
+            "--predict" => rules.predict = true,
             "--breakdown" => rules.breakdown = true,
             "--grain" => rules.grain = true,
             "--light" => rules.light = it.next().and_then(|n| n.parse().ok()).filter(|n| (2..=256).contains(n)).ok_or("--light needs a number of levels from 2 to 256")?,
