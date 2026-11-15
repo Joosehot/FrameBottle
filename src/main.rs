@@ -62,6 +62,8 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--alone]                   with --mix: every frame stands alone (nothing is read from the frame before)
              [--relight]                 with --mix: a light map (an offset and a gain for each tile of 32 x 32) laid on the frame before;
                                          --relight-offset: offsets only
+             [--golden]                  with --mix: fixed weights for each stretch of film in place of learning (faster to unpack, larger);
+                                         --chunk N: the frames of a stretch (60); each stretch starts with a frame that stands alone
              [--quarter]                 with --mix: vectors to a quarter of a pixel
              [--two]                     with --mix: only the two learning guessers are weighed for the guess
              [--bands N]                 with --mix: the bands a frame is cut into (16)
@@ -190,7 +192,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         species.id, species.kind, species.k, species.out, species.into, species.affinity
     );
     let mut reader = chop::frames(movie_path, geo)?;
-    let batch = if rules.mix { rules.window } else { rayon::current_num_threads() * 2 };
+    let batch = if rules.mix && rules.golden { rules.chunk } else if rules.mix { rules.window } else { rayon::current_num_threads() * 2 };
     let mut nodes: Vec<Node> = Vec::new();
     let mut share_ids: HashMap<String, u32> = HashMap::new();
     let mut share_hashes: Vec<String> = Vec::new();
@@ -285,8 +287,15 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             if !block::fits(geo) || rules.coarse > 0 || rules.tolerance > 0 || light.is_some() || rules.dictionary {
                 return Err("--mix packs 8-bit YUV 4:2:0 exactly, with --alone or without, and nothing else".into());
             }
+            if rules.golden {
+                // A stretch of fixed weights stands on its own: nothing goes on from the stretch before.
+                carry_exact = None;
+                so_far.clear();
+                mix_struck = Some(Vec::new());
+                mix_memory = mix::Memory::new();
+            }
             let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
-            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter)).as_bytes());
+            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter, rules.golden, rules.chunk)).as_bytes());
             // The map: each frame's brand (alone: its own; else it names every frame so far),
             // and what Nimbus already holds under it.
             let keys: Vec<String> = raws
@@ -321,7 +330,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
-                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter };
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
                 let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
@@ -625,6 +634,9 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         if lit[1] > 0 {
             println!("LIGHT  {} of {} tiles put right by the light map ({:.1} %)", lit[0], lit[1], 100.0 * lit[0] as f64 / lit[1] as f64);
         }
+        if mix_strike.map > 0.0 {
+            println!("GOLD   stretches of {} frames; every vector found first in {:.1} s, the fixed weights worked out in {:.1} s (here, by least squares: Golden Answer solves up to three letters today, these are 14)", rules.chunk, mix_strike.map, mix_strike.solve);
+        }
         if mix_strike.jobs > 0 {
             println!("STRIKE {} jobs struck in windows of {} frames; {} workers, in a job {:.0} % of the strikes' {:.1} s", mix_strike.jobs, rules.window, mix_strike.workers, 100.0 * mix_strike.busy_share(), mix_strike.wall);
         }
@@ -837,6 +849,8 @@ fn run() -> Result<(), String> {
             "--relight-offset" => rules.relight = 1,
             "--two" => rules.two = true,
             "--quarter" => rules.quarter = true,
+            "--golden" => rules.golden = true,
+            "--chunk" => rules.chunk = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--chunk needs a whole number, 1 or more")?,
             "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
             "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,
             "--alone" => rules.alone = true,

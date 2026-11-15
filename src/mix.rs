@@ -237,6 +237,8 @@ pub struct Model {
     lit_on: [[u16; 4]; 3],
     lit_num: [[([u16; 32], [u16; 2]); 2]; 3],
     lit: [Vec<(i32, i32)>; 3],
+    /// The fixed weights of the stretch of film the band is in.
+    gold: Gold,
 }
 
 /// A band's working room: the rows as they are rebuilt, the frame before where the
@@ -276,6 +278,7 @@ impl Model {
             lit_on: [[2048; 4]; 3],
             lit_num: [[([2048; 32], [2048; 2]); 2]; 3],
             lit: Default::default(),
+            gold: [[0; FEATS]; 6],
         }
     }
 
@@ -505,6 +508,213 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
     }
 }
 
+/// GOLD: the fixed weights of a stretch of film, worked out once by the packer and kept
+/// in the head of the stretch's first frame: for each plane the weights of a frame that
+/// leans on the one before, then of a frame that stands alone (65536 is one).
+pub type Gold = [[i32; FEATS]; 6];
+const GOLD_BYTES: usize = 6 * FEATS * 4;
+/// For each set of weights: the 16 x 16 sums of products of the things weighed, then
+/// the 16 sums of each with what they should have summed to.
+type Sums = [[f64; 17 * FEATS]; 6];
+/// How large the misses nearby were, in 5 steps (of the 9).
+const NEAR5: [usize; 9] = [0, 1, 2, 2, 3, 3, 3, 4, 4];
+
+fn gold_bytes(g: &Gold) -> Vec<u8> {
+    g.iter().flatten().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+fn gold_of(bytes: &[u8]) -> Gold {
+    std::array::from_fn(|s| std::array::from_fn(|k| i32::from_le_bytes(bytes[4 * (s * FEATS + k)..4 * (s * FEATS + k) + 4].try_into().unwrap())))
+}
+
+/// Where a frame's table of band lengths starts: after the head, and the weights when
+/// the frame carries them.
+fn table_at(flags: u8) -> usize {
+    HEAD + if flags & GOLD != 0 && flags & FROM_BEFORE == 0 { GOLD_BYTES } else { 0 }
+}
+
+/// The weights that make the squares of the misses smallest, from the sums (the
+/// answer to 14 equations in 14 letters).
+fn solve(sums: &[f64; 17 * FEATS]) -> [i32; FEATS] {
+    let n = 14;
+    let mut a = vec![vec![0f64; n + 1]; n];
+    for i in 0..n {
+        for j in 0..n {
+            a[i][j] = sums[i * FEATS + j];
+        }
+        a[i][i] += 1.0;
+        a[i][n] = sums[16 * FEATS + i];
+    }
+    for i in 0..n {
+        let p = (i..n).max_by(|x, y| a[*x][i].abs().partial_cmp(&a[*y][i].abs()).unwrap()).unwrap();
+        a.swap(i, p);
+        for r in 0..n {
+            if r != i && a[i][i] != 0.0 {
+                let k = a[r][i] / a[i][i];
+                for c in i..=n {
+                    a[r][c] -= k * a[i][c];
+                }
+            }
+        }
+    }
+    let mut w = [0i32; FEATS];
+    for i in 0..n {
+        w[i] = if a[i][i] != 0.0 { (65536.0 * a[i][n] / a[i][i]).round().clamp(-524288.0, 524288.0) as i32 } else { 0 };
+    }
+    w
+}
+
+/// The packer's dry run: nothing is written, the yes/nos are what they are.
+struct Dry;
+impl Bits for Dry {
+    const WRITE: bool = true;
+    #[inline(always)]
+    fn bit(&mut self, _: i32, v: bool, _: (usize, usize)) -> bool {
+        v
+    }
+    #[inline(always)]
+    fn plain(&mut self, _: &mut u16, v: bool, _: (usize, usize)) -> bool {
+        v
+    }
+}
+
+/// One yes/no said by one learner alone (no mixing), and the learner taught.
+#[inline(always)]
+fn one<C: Bits>(c: &mut C, t: &Tables, p: &mut [u16; 2], v: bool, what: (usize, usize), ticks: &mut u64) -> bool {
+    let said = ((p[0] >> 4) as i32).clamp(1, 4095);
+    let bit = if profiled() {
+        let from = now();
+        let bit = c.bit(said, v, what);
+        *ticks += now() - from;
+        bit
+    } else {
+        c.bit(said, v, what)
+    };
+    let target = if bit { 65535i32 } else { 0 };
+    *p = [(p[0] as i32 + (((target - p[0] as i32) * t.part[p[1] as usize]) >> 16)) as u16, (p[1] + 1).min(SLOW)];
+    bit
+}
+
+impl Model {
+    /// A miss, written or read, each yes/no by one learner.
+    #[inline(always)]
+    fn miss_gold<C: Bits>(&mut self, c: &mut C, t: &Tables, pk: usize, at: usize, signs: usize, v: i32) -> i32 {
+        if !one(c, t, &mut self.e[at * SLOTS], v != 0, (pk, 4), &mut self.coder_ticks) {
+            return 0;
+        }
+        let negative = one(c, t, &mut self.a[signs * SLOTS + 1], v < 0, (pk, 5), &mut self.coder_ticks);
+        let size = v.unsigned_abs().clamp(1, 128);
+        let want = if C::WRITE { LO.iter().rposition(|lo| *lo <= size).unwrap_or(0).min(13) } else { 0 };
+        let mut b = 0;
+        while b < 13 && one(c, t, &mut self.e[at * SLOTS + 2 + b], want > b, (pk, 6), &mut self.coder_ticks) {
+            b += 1;
+        }
+        let mut inside = 0u32;
+        for j in (0..EXTRA[b]).rev() {
+            inside = (inside << 1) | c.plain(&mut self.extra[b][j], (size.wrapping_sub(LO[b]) >> j) & 1 == 1, (pk, 6)) as u32;
+        }
+        let size = (LO[b] + inside) as i32;
+        if negative { -size } else { size }
+    }
+}
+
+/// One plane of a band with the fixed weights: the guess is one weighed sum, nothing is
+/// learned for it, and each yes/no of a miss is said by one learner. `sums`: the packer
+/// adding up what the weights are worked out from (every fourth sample of every fourth row).
+#[allow(clippy::too_many_arguments)]
+fn plane_gold<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], px: &mut Vec<u8>, res: &mut [i8], first: Option<&[i8]>, mut sums: Option<&mut Sums>) {
+    let t = tables();
+    let rows = cur.len() / w;
+    let sw = w + 2 * PAD;
+    px.resize((rows + PAD) * sw, 0);
+    if T {
+        px[..PAD * sw].copy_from_slice(&before[..PAD * sw]);
+    } else {
+        px[..PAD * sw].fill(128);
+    }
+    let set = if T { pk } else { 3 + pk };
+    let weights = m.gold[set];
+    let prof = profiled();
+    let (mut ticks, mut tick) = ([0u64; 8], if prof { now() } else { 0 });
+    let coder_before = m.coder_ticks;
+    macro_rules! lap {
+        ($k:expr) => {
+            if prof {
+                let t = now();
+                ticks[$k] += t - tick;
+                tick = t;
+            }
+        };
+    }
+    for yy in 0..rows {
+        let o = (yy + PAD) * sw + PAD;
+        (px[o - 1], px[o - 2]) = (px[o - sw], px[o - sw]);
+        for x in 0..w {
+            let i = o + x;
+            let p = |k: usize| px[k] as i32;
+            let (west, north, nw, ne, ww, nn) = (p(i - 1), p(i - sw), p(i - sw - 1), p(i - sw + 1), p(i - 2), p(i - 2 * sw));
+            let med = median(west, north, west + north - nw);
+            let (base, stayed, feats): (i32, usize, [i32; FEATS]) = if T {
+                let q = |k: usize| before[k] as i32;
+                let t0 = q(i);
+                let (cw, cn, cnw, cne) = (west - q(i - 1), north - q(i - sw), nw - q(i - sw - 1), ne - q(i - sw + 1));
+                let stayed = (cw == 0) as usize + (cn == 0) as usize + (cnw == 0) as usize + (cne == 0) as usize;
+                (t0, stayed, [cw, cn, cnw, cne, q(i + 1) - t0, q(i + sw) - t0, q(i - 1) - t0, q(i - sw) - t0, med - t0, q(i + sw + 1) - t0, q(i + sw - 1) - t0, ww - q(i - 2), nn - q(i - 2 * sw), 0, 0, 0])
+            } else {
+                (west, 0, [north - west, nw - west, ne - west, ww - west, nn - west, p(i - 2 * sw + 1) - west, med - west, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            };
+            lap!(0);
+            let mut lean = 0i32;
+            for k in 0..FEATS {
+                lean = lean.wrapping_add(weights[k].wrapping_mul(feats[k]));
+            }
+            let guess = (base + (lean.wrapping_add(32768) >> 16)).clamp(0, 255);
+            lap!(1);
+            // Where the sample stands: how the frame before (alone: what is above) and the median
+            // stand from the guess, how large the misses nearby were, how many neighbours stayed.
+            let r = |k: usize| res[k] as i32;
+            let (rw, rn, rnw, rne) = (r(i - 1), r(i - sw), r(i - sw - 1), r(i - sw + 1));
+            let near = STEP[(((2 * (rw.unsigned_abs() + rn.unsigned_abs()) + rnw.unsigned_abs() + rne.unsigned_abs() + 1) / 3) as usize).min(23)] as usize;
+            let five = |r: i32| (r.clamp(-2, 2) + 2) as usize;
+            let at = (((five((if T { base } else { north }) - guess) * 5 + five(med - guess)) * 5 + NEAR5[near]) * 5 + stayed) * 3 + pk;
+            let sign_first = first.map_or(1, |f| (f[i] as i32).signum() + 1);
+            let signs = A_SIZE + (((rw.signum() + 1) * 3 + rn.signum() + 1) * 3 + sign_first) as usize * 3 + pk;
+            let real = if C::WRITE { cur[yy * w + x] } else { 0 };
+            let want = if C::WRITE { real.wrapping_sub(guess as u8) as i8 as i32 } else { 0 };
+            lap!(3);
+            let got = m.miss_gold(c, t, pk, at, signs, want);
+            lap!(4);
+            let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
+            px[i] = real;
+            res[i] = got as i8;
+            if let Some(all) = sums.as_deref_mut() {
+                if x & 3 == 0 && yy & 3 == 0 {
+                    let (s, want) = (&mut all[set], (real as i32 - base) as f64);
+                    for j in 0..FEATS {
+                        let fj = feats[j] as f64;
+                        for k in 0..FEATS {
+                            s[j * FEATS + k] += fj * feats[k] as f64;
+                        }
+                        s[16 * FEATS + j] += fj * want;
+                    }
+                }
+            }
+        }
+        (px[o + w], px[o + w + 1]) = (px[o + w - 1], px[o + w - 1]);
+        if !C::WRITE {
+            cur[yy * w..(yy + 1) * w].copy_from_slice(&px[o..o + w]);
+        }
+    }
+    if prof {
+        ticks[5] = m.coder_ticks - coder_before;
+        ticks[4] -= ticks[5];
+        ticks[7] = (rows * w) as u64;
+        for (total, t) in TICKS.iter().zip(ticks) {
+            total.fetch_add(t, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The profile, in words (after a run with FB_PROFILE set).
 pub fn profile() -> Option<String> {
     let t: Vec<f64> = TICKS.iter().map(|a| a.load(Ordering::Relaxed) as f64).collect();
@@ -658,14 +868,18 @@ pub struct How {
     /// Vectors to a quarter of a pixel (the frame before between its pixels by H.264's
     /// six-pixel filter, as the blocks do it; colour by the four pixels around).
     pub quarter: bool,
+    /// Fixed weights (worked out by the packer for a stretch of film, kept in its first
+    /// frame's head) in place of the learning and the weighing, and one learner for each
+    /// yes/no in place of three mixed.
+    pub gold: bool,
 }
 
 impl How {
     fn flags(self) -> u8 {
-        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 })
+        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 })
     }
     fn of(flags: u8) -> How {
-        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0 }
+        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0 }
     }
 }
 
@@ -780,7 +994,7 @@ fn colour_rows(geo: &Geometry, y0: usize, y1: usize) -> (usize, usize) {
 
 /// One band: its vectors, its light, its two colours; written, or read into `cur`.
 #[allow(clippy::too_many_arguments)]
-fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], prev: Option<Before>, mut vectors: Vec<(i32, i32)>, y0: usize, y1: usize, how: How) {
+fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], prev: Option<Before>, mut vectors: Vec<(i32, i32)>, y0: usize, y1: usize, how: How, mut gather: Option<&mut Sums>) {
     let (w, h) = (geo.width, geo.height);
     let (cw, ch) = (geo.planes[1].w, geo.planes[1].h);
     let (c0, _) = colour_rows(geo, y0, y1);
@@ -807,6 +1021,34 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
         }
     }
     let [res_light, res_first, res_second] = res;
+    if how.gold {
+        match prev {
+            Some(p) => {
+                moved(mv, p.planes[0], p.first[0], (w, h), y0, rows, &vectors, across, 4, false);
+                if how.light > 0 {
+                    relight(c, m, 0, w, rows, light, mv, how.light > 1);
+                }
+                plane_gold::<C, true>(c, m, 0, w, light, mv, &mut *px, res_light, None, gather.as_deref_mut());
+                moved(mv, p.planes[1], p.first[1], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
+                if how.light > 0 {
+                    relight(c, m, 1, cw, colour_rows, first, mv, how.light > 1);
+                }
+                plane_gold::<C, true>(c, m, 1, cw, first, mv, &mut *px, res_first, None, gather.as_deref_mut());
+                moved(mv, p.planes[2], p.first[2], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
+                if how.light > 0 {
+                    relight(c, m, 2, cw, colour_rows, second, mv, how.light > 1);
+                }
+                plane_gold::<C, true>(c, m, 2, cw, second, mv, &mut *px, res_second, Some(res_first), gather.as_deref_mut());
+            }
+            None => {
+                plane_gold::<C, false>(c, m, 0, w, light, &[], &mut *px, res_light, None, gather.as_deref_mut());
+                plane_gold::<C, false>(c, m, 1, cw, first, &[], &mut *px, res_first, None, gather.as_deref_mut());
+                plane_gold::<C, false>(c, m, 2, cw, second, &[], &mut *px, res_second, Some(res_first), gather.as_deref_mut());
+            }
+        }
+        m.room = room;
+        return;
+    }
     match prev {
         Some(p) => {
             moved(mv, p.planes[0], p.first[0], (w, h), y0, rows, &vectors, across, 4, false);
@@ -839,6 +1081,7 @@ const STILL: u8 = 4;
 const LIGHT: u8 = 8;
 const TWO: u8 = 16;
 const QUARTER: u8 = 32;
+const GOLD: u8 = 64;
 const HEAD: usize = 3;
 
 /// Does rebuilding this frame need the frame before it?
@@ -880,7 +1123,9 @@ impl Memory {
 
 /// Packs a frame exactly. `before`: the frame before it (None: the frame stands alone).
 /// The bytes: flags, the number of bands, each band's length, the bands.
+#[allow(dead_code)]
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, memory: &mut Memory, how: How) -> Vec<u8> {
+    assert!(!how.gold, "fixed weights are worked out for a stretch of frames: strike_pack");
     let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 } | how.flags()];
     out.extend((bands as u16).to_le_bytes());
     if before == Some(frame) {
@@ -900,7 +1145,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, m
             let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter));
             let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
             let mut c = Writer(Encoder::new(), [0.0; 7]);
-            band(geo, &mut c, m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how);
+            band(geo, &mut c, m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how, None);
             (c.0.finish(), c.1)
         })
         .collect();
@@ -929,10 +1174,12 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
     }
     let rows = band_rows(geo, u16::from_le_bytes([payload[1], payload[2]]) as usize);
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
-    let mut data = HEAD + 4 * starts.len();
+    let table = table_at(payload[0]);
+    let gold = if table > HEAD { Some(gold_of(payload.get(HEAD..table).ok_or("a mixed frame is cut")?)) } else { None };
+    let mut data = table + 4 * starts.len();
     let mut coded = Vec::new();
     for i in 0..starts.len() {
-        let len = payload.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a mixed frame is cut")?;
+        let len = payload.get(table + 4 * i..table + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a mixed frame is cut")?;
         coded.push(payload.get(data..data + len).ok_or("a mixed frame is cut")?);
         data += len;
     }
@@ -948,8 +1195,11 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
             let (c0, c1) = colour_rows(geo, *y0, y1);
             let mut cur = [vec![0u8; (y1 - y0) * geo.width], vec![0u8; (c1 - c0) * cw], vec![0u8; (c1 - c0) * cw]];
             let [a, b, d] = &mut cur;
+            if let Some(g) = gold {
+                m.gold = g;
+            }
             let mut c = Reader(Decoder::new(bytes));
-            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1, How::of(payload[0]));
+            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1, How::of(payload[0]), None);
             cur
         })
         .collect();
@@ -968,6 +1218,8 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
 /// What a frame's jobs wait for.
 #[derive(Clone, Copy, PartialEq)]
 enum Waits {
+    /// Nothing: the frame stands alone.
+    Alone,
     /// The same band of the frame before.
     Band,
     /// That, and the bands above and below it.
@@ -982,6 +1234,9 @@ pub struct Struck {
     pub busy: f64,
     pub workers: usize,
     pub jobs: usize,
+    /// The packer, with fixed weights: the time of finding every vector, and of working out the weights.
+    pub map: f64,
+    pub solve: f64,
 }
 
 impl Struck {
@@ -990,7 +1245,7 @@ impl Struck {
         self.busy / (self.wall * self.workers as f64).max(1e-9)
     }
     pub fn add(&mut self, o: &Struck) {
-        *self = Struck { wall: self.wall + o.wall, busy: self.busy + o.busy, workers: o.workers.max(self.workers), jobs: self.jobs + o.jobs };
+        *self = Struck { wall: self.wall + o.wall, busy: self.busy + o.busy, workers: o.workers.max(self.workers), jobs: self.jobs + o.jobs, map: self.map + o.map, solve: self.solve + o.solve };
     }
 }
 
@@ -1058,7 +1313,7 @@ fn strike(n: usize, bands: usize, window: usize, admit: &mut dyn FnMut(usize) ->
                     for k in 0..bands {
                         let lo = if w == Waits::Around { k.saturating_sub(1) } else { k };
                         let hi = if w == Waits::Around { (k + 1).min(bands - 1) } else { k };
-                        let not_yet = if f == 0 { 0 } else { (lo..=hi).filter(|j| !done[(f - 1) * bands + j]).count() };
+                        let not_yet = if f == 0 || w == Waits::Alone { 0 } else { (lo..=hi).filter(|j| !done[(f - 1) * bands + j]).count() };
                         waiting[f * bands + k] = not_yet as u8;
                         if not_yet == 0 {
                             push(f, k);
@@ -1079,7 +1334,7 @@ fn strike(n: usize, bands: usize, window: usize, admit: &mut dyn FnMut(usize) ->
                     if left[f] == 1 {
                         push(f, bands);
                     }
-                    if f + 1 < admitted {
+                    if f + 1 < admitted && waits[f + 1] != Waits::Alone {
                         let around = waits[f + 1] == Waits::Around;
                         for j in if around { k.saturating_sub(1) } else { k }..=if around { (k + 1).min(bands - 1) } else { k } {
                             waiting[(f + 1) * bands + j] -= 1;
@@ -1191,7 +1446,12 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
     let bands = starts.len();
     memory.ready(bands, false);
-    let models: Vec<std::sync::Mutex<Model>> = std::mem::take(&mut memory.0).into_iter().map(std::sync::Mutex::new).collect();
+    // What the bands have learned: a set for each stretch of film in the window (a frame that
+    // stands alone starts a stretch, and its jobs wait for nothing).
+    let ring = window.max(1) + 1;
+    let models: Vec<std::sync::Mutex<Option<Model>>> = std::mem::take(&mut memory.0).into_iter().map(Some).chain((0..(ring - 1) * bands).map(|_| None)).map(std::sync::Mutex::new).collect();
+    let stretch: Places<usize> = Places::new(n, || 0);
+    let mut stretches = 0usize;
     // Each frame's bytes with where its bands lie, and the frame itself.
     let coded: Places<(Vec<u8>, Vec<(usize, usize)>)> = Places::new(n, || (Vec::new(), Vec::new()));
     let sheets: Places<Sheet> = Places::new(n, Sheet::none);
@@ -1208,11 +1468,15 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
         if from_before(&p) && f == 0 && !before.is_some_and(|b| b.len() == geo.frame_len()) {
             return Err("a mixed frame was rebuilt without the frame before it".into());
         }
+        let table = table_at(p[0]);
+        if p.len() < table {
+            return Err("a mixed frame is cut".into());
+        }
         let mut places = Vec::new();
         if p[0] & STILL == 0 {
-            let mut data = HEAD + 4 * bands;
+            let mut data = table + 4 * bands;
             for i in 0..bands {
-                let len = p.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a mixed frame is cut")?;
+                let len = p.get(table + 4 * i..table + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a mixed frame is cut")?;
                 if data + len > p.len() {
                     return Err("a mixed frame is cut".into());
                 }
@@ -1220,7 +1484,15 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
                 data += len;
             }
         }
-        let waits = if from_before(&p) && p[0] & STILL == 0 { Waits::Around } else { Waits::Band };
+        let waits = if !from_before(&p) {
+            stretches += 1;
+            Waits::Alone
+        } else if p[0] & STILL == 0 {
+            Waits::Around
+        } else {
+            Waits::Band
+        };
+        unsafe { *stretch.get_mut(f) = stretches };
         // Nobody reads these before the frame's jobs are let go, after this.
         unsafe {
             *coded.get_mut(f) = (p, places);
@@ -1244,7 +1516,7 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
             let base: *const u8 = if f == 0 { before.unwrap().as_ptr() } else { unsafe { sheets.get(f - 1) }.0 };
             Some(Before { planes: near.map(|(at, len, _)| unsafe { std::slice::from_raw_parts(base.add(at), len) }), first: near.map(|n| n.2) })
         };
-        let mut m = models[k].lock().unwrap();
+        let mut slot = models[(unsafe { *stretch.get(f) } % ring) * bands + k].lock().unwrap();
         if p[0] & STILL != 0 {
             let before = prev.ok_or("a still frame was rebuilt without the frame before it")?;
             for (p, to) in cur.into_iter().enumerate() {
@@ -1254,10 +1526,15 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
             return Ok(());
         }
         if prev.is_none() {
-            *m = Model::new();
+            let mut fresh = Model::new();
+            if table_at(p[0]) > HEAD {
+                fresh.gold = gold_of(&p[HEAD..table_at(p[0])]);
+            }
+            *slot = Some(fresh);
         }
+        let m = slot.as_mut().ok_or("a mixed frame was rebuilt without the frames before it")?;
         let mut c = Reader(Decoder::new(&p[places[k].0..places[k].0 + places[k].1]));
-        band(geo, &mut c, &mut m, cur, prev, Vec::new(), y0, y1, How::of(p[0]));
+        band(geo, &mut c, m, cur, prev, Vec::new(), y0, y1, How::of(p[0]), None);
         Ok(())
     };
     let mut deliver = |f: usize| -> Result<bool, String> {
@@ -1275,7 +1552,9 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
         }
     };
     let struck = strike(n, bands, window, &mut admit, &run, &mut deliver);
-    memory.0 = models.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    // What the last stretch's bands have learned goes on to the next strike.
+    let last = stretches % ring;
+    memory.0 = models.into_iter().skip(last * bands).take(bands).filter_map(|m| m.into_inner().unwrap()).collect();
     struck
 }
 
@@ -1300,6 +1579,49 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
     };
     let still: Vec<bool> = (0..n).into_par_iter().map(|f| prev_of(f) == Some(frames[f])).collect();
     let done: Places<(Vec<u8>, [f64; 7])> = Places::new(n * bands, || (Vec::new(), [0.0; 7]));
+    // Fixed weights: every vector is found first (the map), then every fourth frame's sums are
+    // added up (and the frames that stand alone), and the weights worked out from them.
+    let (mut map_time, mut solve_time) = (0.0, 0.0);
+    let mut found: Vec<Vec<(i32, i32)>> = Vec::new();
+    let mut gold: Gold = [[0; FEATS]; 6];
+    if how.gold {
+        if before.is_some() && !alone {
+            return Err("a stretch of fixed weights starts with a frame that stands alone".into());
+        }
+        let from = std::time::Instant::now();
+        found = (0..n * bands)
+            .into_par_iter()
+            .map(|j| {
+                let (f, y0) = (j / bands, starts[j % bands]);
+                prev_of(f).map_or(Vec::new(), |p| find(geo.width, geo.height, planes(geo, frames[f])[0], planes(geo, p)[0], y0, (y0 + rows).min(geo.height), how.quarter))
+            })
+            .collect();
+        map_time = from.elapsed().as_secs_f64();
+        let from = std::time::Instant::now();
+        let sampled: Vec<usize> = (0..n).filter(|f| prev_of(*f).is_none() || f % 4 == 1).flat_map(|f| (0..bands).map(move |k| f * bands + k)).collect();
+        let sums: Box<Sums> = sampled
+            .par_iter()
+            .map(|j| {
+                let (f, k) = (j / bands, j % bands);
+                let (y0, y1) = (starts[k], (starts[k] + rows).min(geo.height));
+                let prev = prev_of(f).map(|b| Before { planes: planes(geo, b), first: [0; 3] });
+                let [mut a, mut b, mut d] = cut(geo, planes(geo, frames[f]), y0, y1).map(|p| p.to_vec());
+                let mut sums: Box<Sums> = Box::new([[0.0; 17 * FEATS]; 6]);
+                band(geo, &mut Dry, &mut Model::new(), [&mut a, &mut b, &mut d], prev, found[*j].clone(), y0, y1, How { light: 0, ..how }, Some(&mut sums));
+                sums
+            })
+            .reduce(
+                || Box::new([[0.0; 17 * FEATS]; 6]),
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().flatten().zip(b.iter().flatten()) {
+                        *x += y;
+                    }
+                    a
+                },
+            );
+        gold = std::array::from_fn(|s| solve(&sums[s]));
+        solve_time = from.elapsed().as_secs_f64();
+    }
     let run = |f: usize, k: usize| -> Result<(), String> {
         if k == bands || still[f] {
             return Ok(());
@@ -1311,20 +1633,27 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
         if prev.is_none() {
             *m = Model::new();
         }
-        let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter));
+        if how.gold {
+            m.gold = gold;
+        }
+        let vectors = if how.gold { found[f * bands + k].clone() } else { prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter)) };
         let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
         let mut c = Writer(Encoder::new(), [0.0; 7]);
-        band(geo, &mut c, &mut m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how);
+        band(geo, &mut c, &mut m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how, None);
         // This job alone writes the place.
         unsafe { *done.get_mut(f * bands + k) = (c.0.finish(), c.1) };
         Ok(())
     };
-    let struck = strike(n, bands, n, &mut |_| Ok(Waits::Band), &run, &mut |_| Ok(true))?;
+    let mut struck = strike(n, bands, n, &mut |_| Ok(Waits::Band), &run, &mut |_| Ok(true))?;
+    (struck.map, struck.solve) = (map_time, solve_time);
     memory.0 = models.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut out = Vec::with_capacity(n);
     for f in 0..n {
         let mut bytes = vec![if prev_of(f).is_some() { FROM_BEFORE } else { 0 } | how.flags()];
         bytes.extend((bands_said as u16).to_le_bytes());
+        if how.gold && prev_of(f).is_none() {
+            bytes.extend(gold_bytes(&gold));
+        }
         if still[f] {
             bytes[0] |= STILL;
             out.push(bytes);
@@ -1373,7 +1702,7 @@ mod tests {
                 }
             }
             let wild = noise(false);
-            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true }), (16, How { light: 2, two: false, quarter: false }), (1, How { light: 0, two: false, quarter: true })] {
+            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false }), (16, How { light: 2, two: false, quarter: false, gold: false }), (1, How { light: 0, two: false, quarter: true, gold: false })] {
                 // The player goes through the frames in the packer's order, with its own memory.
                 let (mut packer, mut player) = (Memory::new(), Memory::new());
                 let first = pack(&geo, &a, None, bands, &mut packer, how);
@@ -1399,6 +1728,25 @@ mod tests {
                     })
                     .unwrap();
                     assert_eq!(back, film, "{w}x{h}, {bands} bands, a window of {window}");
+                }
+                // Fixed weights: two stretches, each starting with a frame that stands alone.
+                let gold = How { gold: true, ..how };
+                let refs: Vec<&[u8]> = film.iter().map(|f| &f[..]).collect();
+                let mut packed = strike_pack(&geo, &refs[..3], None, false, bands, &mut Memory::new(), gold).unwrap().0;
+                packed.extend(strike_pack(&geo, &refs[3..], None, false, bands, &mut Memory::new(), gold).unwrap().0);
+                for window in [1, 3, 8] {
+                    let mut back = Vec::new();
+                    strike_unpack(&geo, film.len(), window, None, &mut Memory::new(), &mut |f| Ok(packed[f].clone()), &|_, _| Ok(()), &mut |_, frame| {
+                        back.push(frame);
+                        Ok(true)
+                    })
+                    .unwrap();
+                    assert_eq!(back, film, "{w}x{h}, {bands} bands, fixed weights, a window of {window}");
+                }
+                let (mut player, mut last) = (Memory::new(), None::<Vec<u8>>);
+                for (f, p) in packed.iter().enumerate() {
+                    last = Some(unpack(&geo, p, last.as_deref(), &mut player).unwrap());
+                    assert_eq!(last.as_ref(), Some(&film[f]), "{w}x{h}, {bands} bands, fixed weights, frame by frame");
                 }
             }
         }

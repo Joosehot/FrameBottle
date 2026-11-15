@@ -1,5 +1,8 @@
 //! A trial bench for the exact packers: frames from a raw yuv420p file, packed and
-//! unpacked in memory, with the size, the times and whether every sample came back.
+//! unpacked in memory by the strike, with the size, the times and whether every sample
+//! came back. FB_HOW: the light map (0, 1, 2), then t (two guessers), q (vectors to a
+//! quarter), g (fixed weights). FB_CHUNK: the frames of a stretch (each starts with a
+//! frame that stands alone). FB_WINDOW: the player's window.
 
 use crate::mix;
 use crate::pack::Geometry;
@@ -15,55 +18,36 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         file.read_exact(&mut f).map_err(|e| e.to_string())?;
         all.push(f);
     }
-    // FB_HOW: the light map (0, 1, 2), then t for the two learning guessers alone.
     let said = std::env::var("FB_HOW").unwrap_or_default();
-    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q') };
+    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g') };
+    let chunk: usize = std::env::var("FB_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(frames).max(1);
+    let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+    let refs: Vec<&[u8]> = all.iter().map(|f| &f[..]).collect();
     let from = Instant::now();
-    let mut memory = mix::Memory::new();
-    let mut packed = Vec::new();
-    for k in 0..frames {
-        let before = if k > 0 && !alone { Some(all[k - 1].as_slice()) } else { None };
-        packed.push(mix::pack(&geo, &all[k], before, bands, &mut memory, how));
+    let (mut packed, mut packing) = (Vec::new(), mix::Struck::default());
+    for stretch in refs.chunks(chunk) {
+        let (p, how_it_went) = mix::strike_pack(&geo, stretch, None, alone, bands, &mut mix::Memory::new(), how)?;
+        packed.extend(p);
+        packing.add(&how_it_went);
     }
     let pack_time = from.elapsed().as_secs_f64();
     let from = Instant::now();
-    let mut memory = mix::Memory::new();
-    let mut last: Option<Vec<u8>> = None;
     let mut same = 0;
-    for k in 0..frames {
-        let f = mix::unpack(&geo, &packed[k], last.as_deref(), &mut memory)?;
-        same += (f == all[k]) as usize;
-        last = Some(f);
-    }
-    let unpack_time = from.elapsed().as_secs_f64();
-    let bytes: usize = packed.iter().map(|p| p.len()).sum();
-    let later: usize = packed.iter().skip(frames / 2).map(|p| p.len()).sum();
-    println!(
-        "mix {how:?}, {bands} bands{}: {bytes} bytes for {frames} frames ({} a frame in the later half); pack {:.1} ms a frame, unpack {:.1} ms a frame; {same} of {frames} identical",
-        if alone { ", alone" } else { "" },
-        later / (frames - frames / 2).max(1),
-        1000.0 * pack_time / frames as f64,
-        1000.0 * unpack_time / frames as f64
-    );
-    let from = Instant::now();
-    let (struck, how) = mix::strike_pack(&geo, &all.iter().map(|f| &f[..]).collect::<Vec<_>>(), None, alone, bands, &mut mix::Memory::new(), how)?;
-    let strike_pack_time = from.elapsed().as_secs_f64();
-    let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
-    let from = Instant::now();
-    let mut same = 0;
-    let unstruck = mix::strike_unpack(&geo, frames, window, None, &mut mix::Memory::new(), &mut |f| Ok(struck[f].clone()), &|_, _| Ok(()), &mut |f, frame| {
+    let unpacking = mix::strike_unpack(&geo, frames, window, None, &mut mix::Memory::new(), &mut |f| Ok(packed[f].clone()), &|_, _| Ok(()), &mut |f, frame| {
         same += (frame == all[f]) as usize;
         Ok(true)
     })?;
-    let strike_unpack_time = from.elapsed().as_secs_f64();
+    let unpack_time = from.elapsed().as_secs_f64();
+    let bytes: usize = packed.iter().map(|p| p.len()).sum();
     println!(
-        "the strike, a window of {window}: the same bytes: {}; pack {:.1} ms a frame ({} workers, busy {:.0} %), unpack {:.1} ms a frame (busy {:.0} %); {same} of {frames} identical",
-        struck == packed,
-        1000.0 * strike_pack_time / frames as f64,
-        how.workers,
-        100.0 * how.busy_share(),
-        1000.0 * strike_unpack_time / frames as f64,
-        100.0 * unstruck.busy_share()
+        "{how:?}, {bands} bands, stretches of {chunk}, a window of {window}: {bytes} bytes for {frames} frames; pack {:.1} ms a frame (vectors {:.1}, weights {:.1}; busy {:.0} %), unpack {:.1} ms a frame ({} workers, busy {:.0} %); {same} of {frames} identical",
+        1000.0 * pack_time / frames as f64,
+        1000.0 * packing.map / frames as f64,
+        1000.0 * packing.solve / frames as f64,
+        100.0 * packing.busy_share(),
+        1000.0 * unpack_time / frames as f64,
+        unpacking.workers,
+        100.0 * unpacking.busy_share()
     );
     let lit: Vec<u64> = mix::LIT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
     if lit[1] > 0 {

@@ -78,6 +78,9 @@ pub struct Rules {
     pub two: bool,
     /// With the mix: vectors to a quarter of a pixel (--quarter).
     pub quarter: bool,
+    /// With the mix: fixed weights for each stretch of film (--golden), and a stretch's frames (--chunk).
+    pub golden: bool,
+    pub chunk: usize,
     pub alone: bool,
     /// The wave's ticks, for when the command's --wave switches it on.
     pub wave_ticks: u8,
@@ -227,6 +230,8 @@ impl Rules {
             relight: 0,
             two: false,
             quarter: false,
+            golden: false,
+            chunk: 60,
             alone: false,
             wave_ticks: (num(fr, "wave_ticks", "fractal")? as usize).clamp(1, 8) as u8,
         })

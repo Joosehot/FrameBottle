@@ -1014,3 +1014,53 @@ What this shows: with `--quarter` the bottle is 4.6 % smaller than x264 lossless
 (the search between the pixels). The light map does nothing for a clip whose light is
 steady (the learning guessers follow the light themselves) and takes 1.0 to 1.4 % off a
 fade. Weighing only two guessers costs 1.2 % and does not make unpacking faster here.
+
+### Fixed weights for a stretch of film (`--golden`, 2026-11-15, night)
+
+A second way for `--mix` to guess, made to unpack fast (the owner's design: the answer
+is worked out once by the packer, the player learns nothing for the guess).
+
+- **A stretch** is `--chunk N` frames (60); its first frame stands alone, and nothing
+  goes on from the stretch before: not the frame, not what the bands learned.
+- **The packer** first finds every vector of the stretch (the map), then adds up, over
+  every fourth frame (and the one that stands alone), what the best weights are worked
+  out from, and solves them: 13 weights for a frame that leans on the one before, 7 for
+  one that stands alone, for each plane. They are kept in the head of the stretch's
+  first frame (384 bytes).
+- **The guess** is one weighed sum with those weights. No learning guessers, no
+  weighing of guessers, no putting right by the surroundings, no GAP.
+- **A miss's yes/nos** are each said by one learner (how the frame before and the median
+  stand from the guess, how large the misses nearby were, how many neighbours stayed);
+  no mixers.
+- **The player's strike**: a frame that stands alone waits for nothing, so stretches are
+  unpacked side by side; what the bands of each stretch in the window have learned is
+  kept apart.
+
+The weights are solved here, by least squares (14 equations in 14 letters). Nuome's
+Golden Answer solves systems of up to three letters today; asking it needs a module in
+Nuome for larger systems, which is not written.
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, a window of 32, all exact (every frame
+checked by its hash; `fbottle raw` gives the source byte for byte):
+
+| | bytes | packing | unpacking |
+|---|---|---|---|
+| `--mix --quarter` | 96 201 938 | 26.4 s | 9.9 s (32.8 ms a frame) |
+| **`--mix --quarter --golden`** (stretches of 60) | **111 645 569** | **20.0 s** | **3.75 s (12.4 ms a frame)** |
+| the same, `--chunk 30` | 111 681 392 | 20.1 s | 3.61 s |
+| the same, `--chunk 120` | 111 429 479 | 19.7 s | 3.76 s |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 16.9 s | 0.95 s |
+| FFV1 (level 3, 16 slices, gop 300) | 124 691 885 | 1.7 s | 1.5 s |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | about 730 s | 5.4 s |
+
+Where the packing's 20.0 s go (stretches of 60): finding every vector 9.1 s, working out
+the weights 1.1 s, the strikes (guessing and writing) 3.9 s, the rest (reading the
+movie, hashing, keeping, gluing) about 6 s. Where the player's time goes (timed stage by
+stage, the clock's own load included): the one learner 29 %, the frame before and the
+median 20 %, the contexts 20 %, the range coder 19 %, the weighed sum 13 %.
+
+What this shows: unpacking is 2.6 times faster than the mix that learns (80 frames a
+second) and packing 1.3 times faster; the bottle is 16.1 % larger than that mix and
+10.7 % larger than x264 lossless, and still 10.6 % smaller than AV1 lossless. Stretches
+cost little: 30 frames instead of 120 is 0.2 %. Tried before building, on the mix that
+learns (24 frames): fixed weights alone +5.1 %, one learner alone +5.7 %, both +10.0 %.
