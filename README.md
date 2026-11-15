@@ -857,3 +857,43 @@ guitar_10s.mp4, measured from outside, frame by frame (the bottle as the player 
 | libaom AV1 cpu-used 6 crf 4 | 22 776 015 | 53.27 dB | 98.79 |
 | libaom AV1 cpu-used 6 crf 10 | 7 339 883 | 49.79 dB | 97.89 |
 | libaom AV1 cpu-used 6 crf 16 | 3 669 642 | 48.17 dB | 96.85 |
+
+## The mix: exact packing with mixed guessers and mixed learners (`--mix`)
+
+src/mix.rs, for 8-bit YUV 4:2:0. Every frame comes back exactly (checked: 302 of 302
+frames identical, every sample).
+
+- **Ten guessers mixed** for each sample: MED (LOCO-I), GAP (CALIC), left, above, their
+  mean; two learning guessers (a weighed sum of the surroundings whose weights move
+  after every sample; with a frame before they also see how it slopes to the right and
+  below); and from the frame before, at the place a vector per 16 x 16 block points to:
+  the sample, the sample changed as its neighbours changed (median, and mean). Each
+  speaks as loud as it was right on the neighbours; whole numbers only. The guess is
+  then put right by what guesses in the same surroundings missed by.
+- **Five learners mixed** for each yes/no of a miss (is there one, its sign, its size):
+  the misses nearby and how far apart the guessers stand; LOCO-I's three slopes; for
+  colour the light's miss at the same place (and the first colour's for the second);
+  the four neighbours' misses themselves; and where the frame before, the median and
+  the learning guesser stand from the guess. Two logistic mixers and a last learner
+  make one likelihood of them for the range coder.
+- What a band has learned goes on from frame to frame (not with `--alone`).
+- `--alone`: every frame stands alone (archive mode); nothing is read from another frame.
+- The source is YUV already, so there is no colour transform (YCoCg-R is for RGB).
+- Strike: the lightning brands each frame's pack; the same clip again: 302 struck, 1.6 s.
+
+guitar_10s.mp4 (1080p, 302 frames), all exact, all checked against the source:
+
+| pack | bytes | bits a pixel | packing | unpacking |
+|---|---|---|---|---|
+| **Frame Bottle `--mix`** | **100 545 180** | 1.284 | 33.0 s | 29.9 s (99 ms a frame) |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 1.288 | 14.8 s | 0.8 s |
+| FFV1 (level 3, range coder, 16 slices, gop 300) | 124 691 885 | 1.593 | 1.4 s | 1.4 s |
+| AV1 lossless (libaom, lossless=1, cpu-used 2) | 124 942 885 | 1.596 | about 730 s (the machine was busy) | 5.1 s |
+| Frame Bottle `--mix --alone` | 125 624 819 | 1.605 | 24.4 s | 18.9 s (62 ms a frame) |
+| Frame Bottle, exact as before | 128 693 695 | 1.644 | 17.5 s | 5.5 s (18 ms a frame) |
+| FFV1 (the same, gop 1: every frame alone) | 134 800 305 | 1.722 | | |
+
+Where the mix's bytes are: light 84.6 %, the first colour 8.6 %, the second 6.0 %,
+vectors 0.7 %; by what is said: is there a miss 54.8 %, its sign 18.7 %, its size 25.9 %.
+
+The mix does not play at the movie's speed: 99 ms a frame is 10 frames a second.

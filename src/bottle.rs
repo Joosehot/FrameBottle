@@ -242,6 +242,8 @@ pub struct Chain {
     /// being rebuilt stands alone (then nothing older is kept for the next).
     pub before2: Option<Vec<u8>>,
     fresh: bool,
+    /// What the mix has learned from the frames so far (for a bottle packed with it).
+    pub mix: crate::mix::Memory,
     pub hammer: crate::guess::Hammer,
     /// The pattern dictionary as it stands after the frames so far (for a bottle that has one).
     pub dictionary: crate::dict::Dictionary,
@@ -269,7 +271,7 @@ pub struct Chain {
 
 impl Chain {
     pub fn new() -> Chain {
-        Chain { at: 0, before: None, before2: None, fresh: false, hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), motion: crate::block::Motion::new(0), mending: None, mended: Vec::new(), grid: None, ahead: None, cache: Default::default(), tiles: Default::default(), opened: 0 }
+        Chain { at: 0, before: None, before2: None, fresh: false, mix: crate::mix::Memory::new(), hammer: crate::guess::Hammer::new(), dictionary: crate::dict::Dictionary::new(), books: Vec::new(), motion: crate::block::Motion::new(0), mending: None, mended: Vec::new(), grid: None, ahead: None, cache: Default::default(), tiles: Default::default(), opened: 0 }
     }
     /// A chain that also mends the frames of this bottle, if it has a tolerance.
     pub fn mending(b: &Bottle) -> Chain {
@@ -438,7 +440,7 @@ impl Bottle {
         let unpacked: Vec<(Vec<u8>, Option<Vec<u8>>)> = tiles
             .into_par_iter()
             .map(|packed| {
-                if crate::pack::guessed(&packed) || crate::pack::blocks(&packed) || crate::pack::fractal(&packed) {
+                if crate::pack::guessed(&packed) || crate::pack::blocks(&packed) || crate::pack::fractal(&packed) || crate::pack::mixed(&packed) {
                     return Ok((Vec::new(), Some(packed)));
                 }
                 let res = crate::pack::uncode(&self.geo, &packed)?;
@@ -483,7 +485,7 @@ impl Bottle {
                 }
                 let tile = crate::light::strip(tile).1;
                 let mut frame = Vec::new();
-                if crate::pack::guessed(&tile) || crate::pack::blocks(&tile) || crate::pack::fractal(&tile) {
+                if crate::pack::guessed(&tile) || crate::pack::blocks(&tile) || crate::pack::fractal(&tile) || crate::pack::mixed(&tile) {
                     self.rebuild(k, Some(&tile), &mut frame, chain)?;
                 } else {
                     frame = crate::pack::restore(&self.geo, &tile, &crate::pack::uncode(&self.geo, &tile)?);
@@ -584,7 +586,9 @@ impl Bottle {
     /// blocks is rebuilt (`packed`), a leaning tile is put on the frame before it.
     fn rebuild(&self, node: usize, packed: Option<&[u8]>, frame: &mut Vec<u8>, chain: &mut Chain) -> Result<(), String> {
         if let Some(packed) = packed {
-            *frame = if crate::pack::fractal(packed) {
+            *frame = if crate::pack::mixed(packed) {
+                crate::mix::unpack(&self.geo, &packed[3..], chain.before.as_deref(), &mut chain.mix)?
+            } else if crate::pack::fractal(packed) {
                 chain.fresh = crate::fractal::alone(&packed[3..]);
                 crate::fractal::unpack(&self.geo, &packed[3..], chain.before.as_deref(), chain.before2.as_deref())?
             } else if crate::pack::blocks(packed) {

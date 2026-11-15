@@ -67,6 +67,10 @@ pub struct Rules {
     pub fractal_keys: bool,
     pub fractal: crate::fractal::How,
     pub fractal_writing: Vec<Rule>,
+    /// The exact packing by the mix of guessers and learners (the command's --mix), and
+    /// whether every frame stands alone (--alone).
+    pub mix: bool,
+    pub alone: bool,
     /// The wave's ticks, for when the command's --wave switches it on.
     pub wave_ticks: u8,
 }
@@ -210,6 +214,8 @@ impl Rules {
             fractal_keys: false,
             fractal,
             fractal_writing: fractal_rules,
+            mix: false,
+            alone: false,
             wave_ticks: (num(fr, "wave_ticks", "fractal")? as usize).clamp(1, 8) as u8,
         })
     }

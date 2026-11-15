@@ -108,6 +108,9 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
     let mut chain = bottle::Chain::mending(b);
     // The frames are shown otherwise than they are kept.
     let tolerant = b.index.tolerance > 0 || b.index.light || b.index.grain > 0;
+    // A bottle packed by the mix: what the mix has learned comes from rebuilding every
+    // frame in order, so nothing is struck for it either.
+    let learns = n > 0 && crate::pack::mixed(&b.packed(0)?);
     let mut closed = false;
     for start in (0..n).step_by(rules.ahead) {
         let t = Instant::now();
@@ -123,7 +126,7 @@ pub fn play(b: &Bottle, rules: &Rules, smooth: usize, sink: &mut dyn FnMut(Vec<u
         // Only the unbroken run from the start is struck: what follows a gap is unpacked in order.
         // A bottle with a dictionary or with frames between two is rebuilt node by node:
         // its books and its order need every frame, so nothing is struck for it.
-        let have = if b.index.dictionary.is_some() || b.index.between || b.index.light { 0 } else { found.iter().take_while(|f| f.is_some()).count() };
+        let have = if b.index.dictionary.is_some() || b.index.between || b.index.light || learns { 0 } else { found.iter().take_while(|f| f.is_some()).count() };
         let mut frames: Vec<(Vec<u8>, bool)> = found.into_iter().take(have).flatten().map(|f| (f, true)).collect();
         // The frames struck from the window are laid on the chain too: the next ones lean on them.
         for (k, f) in frames.iter().enumerate() {

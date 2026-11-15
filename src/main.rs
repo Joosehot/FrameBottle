@@ -37,6 +37,7 @@ mod fractal;
 mod golden;
 mod guess;
 mod light;
+mod mix;
 mod motor;
 mod pack;
 mod particle;
@@ -55,6 +56,8 @@ const USAGE: &str = "\
 fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance N]
                                          N: a guess wrong by N or less is left uncorrected (0: exact)
              [--coarse N]                AV1's way: blocks, vectors and waves; N is the length of a wave's step
+             [--mix]                     exact, 8-bit YUV 4:2:0: ten guessers mixed, the misses written by five learners mixed
+             [--alone]                   with --mix: every frame stands alone (nothing is read from the frame before)
              [--line]                    exact, but each sample first says whether it stayed what it was
              [--light N]                 exact packing of dimmed light: N brightness levels on a curve (64, 96, 128)
              [--grid N]                  the same with a grid of N levels made for each frame
@@ -214,6 +217,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     let mut carry2: Option<Vec<u8>> = None;
     let (mut carry_name, mut carry2_name) = (String::from("-"), String::from("-"));
     let mut ruled: Vec<(usize, [u64; 8])> = Vec::new();
+    let mut mix_bytes = 0usize;
+    // What the mix has learned so far, and the frames struck while it was not needed yet.
+    let mut mix_memory = mix::Memory::new();
+    let mut mix_struck: Option<Vec<Vec<u8>>> = Some(Vec::new());
     let fractal_how = fractal::How { profile, ..rules.fractal.clone() };
     // A group of frames is packed as blocks and its frames become nodes, in their own order.
     macro_rules! finish_group {
@@ -262,6 +269,73 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             }
         }
         // PACK: every tile on its own. A tile whose pack is branded is struck from Nimbus.
+        if rules.mix {
+            // The mix: exact, each frame from the real frame before it (or alone), so a
+            // batch is packed side by side. The lightning brands each frame's pack.
+            if !block::fits(geo) || rules.coarse > 0 || rules.tolerance > 0 || light.is_some() || rules.dictionary {
+                return Err("--mix packs 8-bit YUV 4:2:0 exactly, with --alone or without, and nothing else".into());
+            }
+            let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
+            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands).as_bytes());
+            let done: Vec<(Vec<u8>, bool)> = if rules.alone {
+                // Every frame alone: a batch side by side.
+                frames
+                    .par_iter()
+                    .zip(&raws)
+                    .map(|(frame, raw)| -> Result<_, String> {
+                        let key = brand_of(raw, "alone");
+                        if let Some(payload) = bottle::branded("mix", &key).and_then(|hash| bottle::from_nimbus(hash.trim())) {
+                            return Ok((payload, true));
+                        }
+                        let payload = mix::pack(geo, frame, None, rules.bands, &mut mix::Memory::new());
+                        bottle::brand("mix", &key, &fstrike::put_bytes(&payload)?);
+                        Ok((payload, false))
+                    })
+                    .collect::<Result<_, String>>()?
+            } else {
+                // Each frame goes on from what the frames before it taught: one at a time
+                // (its bands side by side). The brand names every frame so far.
+                let mut done = Vec::new();
+                for (i, frame) in frames.iter().enumerate() {
+                    let before: Option<&[u8]> = if i > 0 { Some(&frames[i - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
+                    let key = brand_of(&raws[i], &so_far);
+                    so_far = bottle::sha(format!("{so_far}{}", raws[i]).as_bytes());
+                    let branded = bottle::branded("mix", &key).and_then(|hash| bottle::from_nimbus(hash.trim()));
+                    done.push(match (branded, mix_struck.is_some()) {
+                        // Every frame so far was struck: the memory is not needed yet.
+                        (Some(payload), true) => {
+                            mix_struck.as_mut().unwrap().push(payload.clone());
+                            (payload, true)
+                        }
+                        // The memory is in use: the struck frame teaches it as it would the player.
+                        (Some(payload), false) => {
+                            mix::unpack(geo, &payload, before, &mut mix_memory)?;
+                            (payload, true)
+                        }
+                        (None, _) => {
+                            // The first frame to be packed after struck ones: the memory learns them first.
+                            if let Some(struck_so_far) = mix_struck.take() {
+                                let mut last: Option<Vec<u8>> = None;
+                                for p in struck_so_far {
+                                    last = Some(mix::unpack(geo, &p, last.as_deref(), &mut mix_memory)?);
+                                }
+                            }
+                            let payload = mix::pack(geo, frame, before, rules.bands, &mut mix_memory);
+                            bottle::brand("mix", &key, &fstrike::put_bytes(&payload)?);
+                            (payload, false)
+                        }
+                    });
+                }
+                done
+            };
+            for ((payload, was_struck), frame) in done.into_iter().zip(&frames) {
+                struck += was_struck as usize;
+                mix_bytes += payload.len();
+                keep([vec![5, 0, 0], payload].concat(), frame, None, species.k, &mut share_ids, &mut share_hashes, &mut nodes)?;
+            }
+            carry_exact = frames.pop().zip(raws.last().cloned());
+            continue;
+        }
         if rules.fractal_on {
             // Fractal mode: each frame is rules over the last two frames as the player
             // will have them, so one at a time. A frame after a cut stands alone.
@@ -528,6 +602,22 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     };
     let size = bottle::glue(&out, index, &share_hashes)?;
     println!("GLUE   {} shares struck from Nimbus into {} ({size} bytes)", share_hashes.len(), out.display());
+    if rules.mix {
+        // Where the bytes are, as the mix counts them (of the frames packed now, not struck).
+        let s: Vec<f64> = mix::SPENT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 8000.0).collect();
+        let samples = (n * geo.frame_len()) as f64;
+        println!("MIX    {mix_bytes} bytes of frames, {:.3} bits a sample{}", 8.0 * mix_bytes as f64 / samples, if rules.alone { "; every frame stands alone" } else { "" });
+        if struck < n {
+            let all = s[0] + s[1] + s[2] + s[3];
+            let share = |v: f64| format!("{:10.0} bytes {:5.1} %", v, 100.0 * v / all.max(1.0));
+            println!("BREAKDOWN of the {} frames packed now:", n - struck);
+            println!("  light                 {}", share(s[0]));
+            println!("  the first colour      {}", share(s[1]));
+            println!("  the second colour     {}", share(s[2]));
+            println!("  vectors               {}", share(s[3]));
+            println!("  by what is said: is there a miss {}; its sign {}; its size {}", share(s[4]), share(s[5]), share(s[6]));
+        }
+    }
     if rules.fractal_on {
         // Where the bytes are, as the fractal mode counts them.
         let bytes = |millibits: u64| millibits as f64 / 8000.0;
@@ -718,6 +808,8 @@ fn run() -> Result<(), String> {
                 rules.fractal.lambda = it.next().and_then(|n| n.parse().ok()).filter(|n| *n > 0.0).ok_or("--fractal needs a number above 0")?;
             }
             "--fractal-keys" => rules.fractal_keys = true,
+            "--mix" => rules.mix = true,
+            "--alone" => rules.alone = true,
             "--wave" => {
                 rules.fractal.wave_edge = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--wave needs a whole number from 1 to 255")?;
                 rules.fractal.wave = rules.wave_ticks;
