@@ -603,7 +603,7 @@ impl Pic<'_> {
 /// (H.264's own filter: a movie that was H.264 once moved its blocks with exactly
 /// this); a quarter is the mean of the two places next to it.
 #[inline(always)]
-fn quarter_of<G: Fn(i32, i32) -> i32>(g: &G, x4: i32, y4: i32) -> i32 {
+pub(crate) fn quarter_of<G: Fn(i32, i32) -> i32>(g: &G, x4: i32, y4: i32) -> i32 {
     let (x, y, fx, fy) = (x4 >> 2, y4 >> 2, x4 & 3, y4 & 3);
     if fx == 0 && fy == 0 {
         return g(x, y);

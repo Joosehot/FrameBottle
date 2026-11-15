@@ -72,6 +72,12 @@ pub struct Rules {
     /// The exact packing by the mix of guessers and learners (the command's --mix), and
     /// whether every frame stands alone (--alone).
     pub mix: bool,
+    /// With the mix: the light map (0 none, 1 offsets, 2 offsets and gains; --relight), and only
+    /// the two learning guessers weighed (--two).
+    pub relight: u8,
+    pub two: bool,
+    /// With the mix: vectors to a quarter of a pixel (--quarter).
+    pub quarter: bool,
     pub alone: bool,
     /// The wave's ticks, for when the command's --wave switches it on.
     pub wave_ticks: u8,
@@ -218,6 +224,9 @@ impl Rules {
             fractal,
             fractal_writing: fractal_rules,
             mix: false,
+            relight: 0,
+            two: false,
+            quarter: false,
             alone: false,
             wave_ticks: (num(fr, "wave_ticks", "fractal")? as usize).clamp(1, 8) as u8,
         })

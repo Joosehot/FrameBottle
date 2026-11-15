@@ -60,6 +60,10 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--mix]                     exact, 8-bit YUV 4:2:0: four guessers mixed, the misses written by three learners mixed;
                                          every band of every frame is a job, mapped first and struck on all cores
              [--alone]                   with --mix: every frame stands alone (nothing is read from the frame before)
+             [--relight]                 with --mix: a light map (an offset and a gain for each tile of 32 x 32) laid on the frame before;
+                                         --relight-offset: offsets only
+             [--quarter]                 with --mix: vectors to a quarter of a pixel
+             [--two]                     with --mix: only the two learning guessers are weighed for the guess
              [--bands N]                 with --mix: the bands a frame is cut into (16)
              [--window N]                with --mix, and for play: the frames the strike lets in at once (32)
              [--line]                    exact, but each sample first says whether it stayed what it was
@@ -282,7 +286,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 return Err("--mix packs 8-bit YUV 4:2:0 exactly, with --alone or without, and nothing else".into());
             }
             let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
-            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands).as_bytes());
+            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter)).as_bytes());
             // The map: each frame's brand (alone: its own; else it names every frame so far),
             // and what Nimbus already holds under it.
             let keys: Vec<String> = raws
@@ -317,9 +321,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
-                let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new())? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory)? };
+                let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
                 mix_strike.add(&how);
                 let hashes: Vec<String> = packed.par_iter().map(|p| fstrike::put_bytes(p)).collect::<Result<_, String>>()?;
                 for ((i, payload), hash) in fresh.iter().zip(packed).zip(hashes) {
@@ -616,6 +621,10 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         let s: Vec<f64> = mix::SPENT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 8000.0).collect();
         let samples = (n * geo.frame_len()) as f64;
         println!("MIX    {mix_bytes} bytes of frames, {:.3} bits a sample{}", 8.0 * mix_bytes as f64 / samples, if rules.alone { "; every frame stands alone" } else { "" });
+        let lit: Vec<u64> = mix::LIT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        if lit[1] > 0 {
+            println!("LIGHT  {} of {} tiles put right by the light map ({:.1} %)", lit[0], lit[1], 100.0 * lit[0] as f64 / lit[1] as f64);
+        }
         if mix_strike.jobs > 0 {
             println!("STRIKE {} jobs struck in windows of {} frames; {} workers, in a job {:.0} % of the strikes' {:.1} s", mix_strike.jobs, rules.window, mix_strike.workers, 100.0 * mix_strike.busy_share(), mix_strike.wall);
         }
@@ -824,6 +833,10 @@ fn run() -> Result<(), String> {
             }
             "--fractal-keys" => rules.fractal_keys = true,
             "--mix" => rules.mix = true,
+            "--relight" => rules.relight = 2,
+            "--relight-offset" => rules.relight = 1,
+            "--two" => rules.two = true,
+            "--quarter" => rules.quarter = true,
             "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
             "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,
             "--alone" => rules.alone = true,

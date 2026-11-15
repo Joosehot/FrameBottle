@@ -15,12 +15,15 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         file.read_exact(&mut f).map_err(|e| e.to_string())?;
         all.push(f);
     }
+    // FB_HOW: the light map (0, 1, 2), then t for the two learning guessers alone.
+    let said = std::env::var("FB_HOW").unwrap_or_default();
+    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q') };
     let from = Instant::now();
     let mut memory = mix::Memory::new();
     let mut packed = Vec::new();
     for k in 0..frames {
         let before = if k > 0 && !alone { Some(all[k - 1].as_slice()) } else { None };
-        packed.push(mix::pack(&geo, &all[k], before, bands, &mut memory));
+        packed.push(mix::pack(&geo, &all[k], before, bands, &mut memory, how));
     }
     let pack_time = from.elapsed().as_secs_f64();
     let from = Instant::now();
@@ -36,14 +39,14 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
     let bytes: usize = packed.iter().map(|p| p.len()).sum();
     let later: usize = packed.iter().skip(frames / 2).map(|p| p.len()).sum();
     println!(
-        "mix, {bands} bands{}: {bytes} bytes for {frames} frames ({} a frame in the later half); pack {:.1} ms a frame, unpack {:.1} ms a frame; {same} of {frames} identical",
+        "mix {how:?}, {bands} bands{}: {bytes} bytes for {frames} frames ({} a frame in the later half); pack {:.1} ms a frame, unpack {:.1} ms a frame; {same} of {frames} identical",
         if alone { ", alone" } else { "" },
         later / (frames - frames / 2).max(1),
         1000.0 * pack_time / frames as f64,
         1000.0 * unpack_time / frames as f64
     );
     let from = Instant::now();
-    let (struck, how) = mix::strike_pack(&geo, &all.iter().map(|f| &f[..]).collect::<Vec<_>>(), None, alone, bands, &mut mix::Memory::new())?;
+    let (struck, how) = mix::strike_pack(&geo, &all.iter().map(|f| &f[..]).collect::<Vec<_>>(), None, alone, bands, &mut mix::Memory::new(), how)?;
     let strike_pack_time = from.elapsed().as_secs_f64();
     let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     let from = Instant::now();
@@ -62,6 +65,10 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         1000.0 * strike_unpack_time / frames as f64,
         100.0 * unstruck.busy_share()
     );
+    let lit: Vec<u64> = mix::LIT.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
+    if lit[1] > 0 {
+        println!("the light map: {} of {} tiles put right ({:.1} %)", lit[0], lit[1], 100.0 * lit[0] as f64 / lit[1] as f64);
+    }
     if let Some(p) = mix::profile() {
         println!("{p}");
     }

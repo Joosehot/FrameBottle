@@ -232,6 +232,11 @@ pub struct Model {
     coder_ticks: u64,
     /// The band's working room, made once and used for every frame.
     room: Room,
+    /// The light map: is a tile put right (by its left neighbour and the frame before), its
+    /// offset and gain, and the frame before's map for each plane.
+    lit_on: [[u16; 4]; 3],
+    lit_num: [[([u16; 32], [u16; 2]); 2]; 3],
+    lit: [Vec<(i32, i32)>; 3],
 }
 
 /// A band's working room: the rows as they are rebuilt, the frame before where the
@@ -268,6 +273,9 @@ impl Model {
             vector: [([2048; 32], [2048; 2]); 2],
             coder_ticks: 0,
             room: Room::default(),
+            lit_on: [[2048; 4]; 3],
+            lit_num: [[([2048; 32], [2048; 2]); 2]; 3],
+            lit: Default::default(),
         }
     }
 
@@ -346,7 +354,7 @@ fn median(a: i32, b: i32, c: i32) -> i32 {
 /// room around it; `res` takes each sample's miss, with the same room; `first` is the
 /// misses of the first colour (for the second).
 #[allow(clippy::too_many_arguments)]
-fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>) {
+fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool) {
     let t = tables();
     let rows = cur.len() / w;
     let sw = w + 2 * PAD;
@@ -431,7 +439,7 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
             // The mix: each speaks as loud as it was right on the neighbours.
             let (e_w, e_n, e_nw, e_ne) = (ec[x], eu[x + 1], eu[x], eu[x + 2]);
             let (mut sum, mut total) = (0u32, 0u32);
-            for g in 0..NP {
+            for g in if two { 2 } else { 0 }..NP {
                 let wt = t.weight[2 * e_w[g] as usize + 2 * e_n[g] as usize + e_nw[g] as usize + e_ne[g] as usize];
                 sum += wt;
                 total += wt * offers[g] as u32;
@@ -514,7 +522,7 @@ pub fn profile() -> Option<String> {
 
 /// The vector of each block of 16 x 16 of light in rows `y0..y1`: where in the frame
 /// before the block is most like itself. A block that is nearly what it was stays.
-fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize) -> Vec<(i32, i32)> {
+fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize, quarter: bool) -> Vec<(i32, i32)> {
     let mut out = Vec::new();
     for by in (y0..y1).step_by(BLOCK) {
         for bx in (0..w).step_by(BLOCK) {
@@ -544,6 +552,34 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize) -> V
                         }
                     }
                 }
+                // Vectors are counted in quarter pixels from here on.
+                best = (best.0, 4 * best.1, 4 * best.2);
+                if quarter {
+                    // Between the pixels: the eight places half a pixel around the best, then the eight a quarter around that.
+                    let g = |x: i32, y: i32| prev[y.clamp(0, h as i32 - 1) as usize * w + x.clamp(0, w as i32 - 1) as usize] as i32;
+                    let unlike = |qx: i32, qy: i32, limit: u32| -> u32 {
+                        let mut s = 0u32;
+                        for j in 0..bh {
+                            for k in 0..bw {
+                                s += (real[(by + j) * w + bx + k] as i32 - crate::block::quarter_of(&g, 4 * (bx + k) as i32 + qx, 4 * (by + j) as i32 + qy)).unsigned_abs();
+                            }
+                            if s >= limit {
+                                return s;
+                            }
+                        }
+                        s
+                    };
+                    for step in [2, 1] {
+                        let (cx, cy) = (best.1, best.2);
+                        for (ax, ay) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                            let (qx, qy) = (cx + ax * step, cy + ay * step);
+                            let s = unlike(qx, qy, best.0) + (qx.abs() + qy.abs()) as u32 + 2;
+                            if s < best.0 {
+                                best = (s, qx, qy);
+                            }
+                        }
+                    }
+                }
                 // A place only a little more alike is the grain's doing.
                 if best.0 * 10 > still * 9 {
                     best = (still, 0, 0);
@@ -558,7 +594,8 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize) -> V
 /// The frame before as the band's blocks see it: each block's samples from where its
 /// vector points, with two rows above the band, one below and two samples at each side
 /// (from the nearest block's vector). `prev` starts at the plane's row `first`;
-/// `shift`: a block's side as a power of two.
+/// `shift`: a block's side as a power of two. Vectors are in quarter pixels of light
+/// (eighths of a colour pixel).
 #[allow(clippy::too_many_arguments)]
 fn moved(out: &mut Vec<u8>, prev: &[u8], first: usize, (w, h): (usize, usize), y0: usize, rows: usize, vectors: &[(i32, i32)], across: usize, shift: usize, halve: bool) {
     let sw = w + 2 * PAD;
@@ -576,9 +613,27 @@ fn moved(out: &mut Vec<u8>, prev: &[u8], first: usize, (w, h): (usize, usize), y
                 end += 1;
             }
             let (x0, x1) = (if bc == 0 { -(PAD as i32) } else { (bc << shift) as i32 }, if end == block_cols { (w + PAD) as i32 } else { (end << shift) as i32 });
-            let (vx, vy) = if halve { (v.0 >> 1, v.1 >> 1) } else { v };
-            let from = ((y0 as i32 + r + vy).clamp(0, h as i32 - 1) as usize - first) * w;
+            let (unit, part) = if halve { (3, 7) } else { (2, 3) };
+            let (vx, vy) = (v.0 >> unit, v.1 >> unit);
             let to = &mut out[(o as i32 + x0) as usize..(o as i32 + x1) as usize];
+            if v.0 & part != 0 || v.1 & part != 0 {
+                // Between the pixels.
+                let g = |x: i32, y: i32| prev[(y.clamp(0, h as i32 - 1) as usize - first) * w + x.clamp(0, w as i32 - 1) as usize] as i32;
+                let y = y0 as i32 + r;
+                for (k, s) in to.iter_mut().enumerate() {
+                    let x = x0 + k as i32;
+                    *s = if halve {
+                        let (x8, y8) = (8 * x + v.0, 8 * y + v.1);
+                        let (px, py, fx, fy) = (x8 >> 3, y8 >> 3, x8 & 7, y8 & 7);
+                        (((8 - fx) * (8 - fy) * g(px, py) + fx * (8 - fy) * g(px + 1, py) + (8 - fx) * fy * g(px, py + 1) + fx * fy * g(px + 1, py + 1) + 32) >> 6) as u8
+                    } else {
+                        crate::block::quarter_of(&g, 4 * x + v.0, 4 * y + v.1) as u8
+                    };
+                }
+                bc = end;
+                continue;
+            }
+            let from = ((y0 as i32 + r + vy).clamp(0, h as i32 - 1) as usize - first) * w;
             // What lies inside the frame, and the frame's edge for what does not.
             let (a, b) = ((-vx).clamp(x0, x1), (w as i32 - vx).clamp(x0, x1));
             if a < b {
@@ -593,6 +648,131 @@ fn moved(out: &mut Vec<u8>, prev: &[u8], first: usize, (w, h): (usize, usize), y
     }
 }
 
+/// How a frame is packed beyond the mix itself (kept in the frame's flags).
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct How {
+    /// The light map: 0 none, 1 an offset for each tile, 2 an offset and a gain.
+    pub light: u8,
+    /// Only the two learning guessers are weighed for the guess.
+    pub two: bool,
+    /// Vectors to a quarter of a pixel (the frame before between its pixels by H.264's
+    /// six-pixel filter, as the blocks do it; colour by the four pixels around).
+    pub quarter: bool,
+}
+
+impl How {
+    fn flags(self) -> u8 {
+        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 })
+    }
+    fn of(flags: u8) -> How {
+        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0 }
+    }
+}
+
+/// Tiles whose light was put right, and tiles, as the packer counted them.
+pub static LIT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A tile of the light map: 32 x 32 of light, 16 x 16 of colour.
+const TILE: usize = 32;
+/// A tile left as it is: no offset, a gain of one (64).
+const PLAIN: (i32, i32) = (0, 64);
+
+/// The packer's choice for one tile: the offset (and gain, of 64) that bring the frame
+/// before nearest to the real samples, or PLAIN when that is not worth its bits.
+fn light_of(cur: &[u8], w: usize, mv: &[u8], (x0, x1, y0, y1): (usize, usize, usize, usize), gain: bool) -> (i32, i32) {
+    let sw = w + 2 * PAD;
+    let n = ((x1 - x0) * (y1 - y0)) as i64;
+    let (mut sc, mut sm, mut smm, mut scm) = (0i64, 0i64, 0i64, 0i64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let (a, b) = (cur[y * w + x] as i64, mv[(y + PAD) * sw + x + PAD] as i64);
+            sc += a;
+            sm += b;
+            smm += b * b;
+            scm += a * b;
+        }
+    }
+    let far = |o: i32, g: i32| -> i64 {
+        let mut s = 0i64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                s += (cur[y * w + x] as i32 - (((g * mv[(y + PAD) * sw + x + PAD] as i32) >> 6) + o).clamp(0, 255)).abs() as i64;
+            }
+        }
+        s
+    };
+    // A tile must come nearer by an eighth of a step a sample (and the map's own bits) to be put right.
+    let mut best = (PLAIN, far(0, 64) - n / 8 - 16);
+    let o = (2 * (sc - sm) + n).div_euclid(2 * n) as i32;
+    if o != 0 {
+        let s = far(o, 64);
+        if s < best.1 {
+            best = ((o, 64), s);
+        }
+    }
+    let spread = n * smm - sm * sm;
+    if gain && spread > 0 {
+        let g = (64 * (n * scm - sc * sm) + spread / 2).div_euclid(spread).clamp(48, 80) as i32;
+        if g != 64 {
+            let o = ((2 * (64 * sc - g as i64 * sm) + 64 * n).div_euclid(128 * n) as i32).clamp(-255, 255);
+            let s = far(o, g) + n / 16;
+            if s < best.1 {
+                best = ((o, g), s);
+            }
+        }
+    }
+    best.0
+}
+
+/// THE LIGHT MAP: for each tile of a plane, how the light changed since the frame
+/// before: an offset, and a gain (of 64). It is written (told from the same tile's of
+/// the frame before) or read, and then laid on the frame before as the band sees it:
+/// before' = clamp((gain * before) >> 6) + offset). Only what the guessers start from
+/// changes; the misses still lead to the real samples, so nothing is lost.
+#[allow(clippy::too_many_arguments)]
+fn relight<C: Bits>(c: &mut C, m: &mut Model, pk: usize, w: usize, rows: usize, cur: &[u8], mv: &mut [u8], gain: bool) {
+    let sw = w + 2 * PAD;
+    let side = if pk == 0 { TILE } else { TILE / 2 };
+    let (across, down) = (w.div_ceil(side), rows.div_ceil(side));
+    let mut was = std::mem::take(&mut m.lit[pk]);
+    if was.len() != across * down {
+        was = vec![PLAIN; across * down];
+    }
+    let mut map = vec![PLAIN; across * down];
+    let what = (3, 3);
+    let mut lit = 0;
+    for ty in 0..down {
+        for tx in 0..across {
+            let k = ty * across + tx;
+            let want = if C::WRITE { light_of(cur, w, mv, (tx * side, ((tx + 1) * side).min(w), ty * side, ((ty + 1) * side).min(rows)), gain) } else { PLAIN };
+            let at = (tx > 0 && map[k - 1] != PLAIN) as usize + 2 * (was[k] != PLAIN) as usize;
+            if c.plain(&mut m.lit_on[pk][at], want != PLAIN, what) {
+                map[k] = (was[k].0 + number(c, &mut m.lit_num[pk][0], want.0 - was[k].0), was[k].1 + number(c, &mut m.lit_num[pk][1], want.1 - was[k].1));
+                lit += 1;
+            }
+        }
+    }
+    if C::WRITE {
+        LIT[0].fetch_add(lit, Ordering::Relaxed);
+        LIT[1].fetch_add((across * down) as u64, Ordering::Relaxed);
+    }
+    // Laid on the frame before, its room around it too.
+    for r in 0..rows + PAD + 1 {
+        let ty = (r.saturating_sub(PAD)).min(rows - 1) / side;
+        for tx in 0..across {
+            let (o, g) = map[ty * across + tx];
+            if (o, g) == PLAIN {
+                continue;
+            }
+            let (a, b) = (if tx == 0 { 0 } else { tx * side + PAD }, if tx + 1 == across { sw } else { (tx + 1) * side + PAD });
+            for v in &mut mv[r * sw + a..r * sw + b] {
+                *v = (((g * *v as i32) >> 6) + o).clamp(0, 255) as u8;
+            }
+        }
+    }
+    m.lit[pk] = map;
+}
+
 /// The chroma rows that go with the light's rows `y0..y1`.
 fn colour_rows(geo: &Geometry, y0: usize, y1: usize) -> (usize, usize) {
     (y0 / 2, if y1 >= geo.height { geo.planes[1].h } else { y1 / 2 })
@@ -600,7 +780,7 @@ fn colour_rows(geo: &Geometry, y0: usize, y1: usize) -> (usize, usize) {
 
 /// One band: its vectors, its light, its two colours; written, or read into `cur`.
 #[allow(clippy::too_many_arguments)]
-fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], prev: Option<Before>, mut vectors: Vec<(i32, i32)>, y0: usize, y1: usize) {
+fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], prev: Option<Before>, mut vectors: Vec<(i32, i32)>, y0: usize, y1: usize, how: How) {
     let (w, h) = (geo.width, geo.height);
     let (cw, ch) = (geo.planes[1].w, geo.planes[1].h);
     let (c0, _) = colour_rows(geo, y0, y1);
@@ -609,9 +789,11 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
         // The vectors, each told from the one to its left.
         let blocks = across * (y1 - y0).div_ceil(BLOCK);
         vectors.resize(blocks, (0, 0));
+        // (in whole pixels when the frame has no vectors between them)
+        let unit = if how.quarter { 1 } else { 4 };
         for k in 0..blocks {
             let from = if k % across > 0 { vectors[k - 1] } else { (0, 0) };
-            vectors[k] = (from.0 + number(c, &mut m.vector[0], vectors[k].0 - from.0), from.1 + number(c, &mut m.vector[1], vectors[k].1 - from.1));
+            vectors[k] = (from.0 + unit * number(c, &mut m.vector[0], (vectors[k].0 - from.0) / unit), from.1 + unit * number(c, &mut m.vector[1], (vectors[k].1 - from.1) / unit));
         }
     }
     let [light, first, second] = cur;
@@ -628,16 +810,25 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
     match prev {
         Some(p) => {
             moved(mv, p.planes[0], p.first[0], (w, h), y0, rows, &vectors, across, 4, false);
-            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None);
+            if how.light > 0 {
+                relight(c, m, 0, w, rows, light, mv, how.light > 1);
+            }
+            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
             moved(mv, p.planes[1], p.first[1], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
-            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None);
+            if how.light > 0 {
+                relight(c, m, 1, cw, colour_rows, first, mv, how.light > 1);
+            }
+            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
             moved(mv, p.planes[2], p.first[2], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
-            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first));
+            if how.light > 0 {
+                relight(c, m, 2, cw, colour_rows, second, mv, how.light > 1);
+            }
+            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
         }
         None => {
-            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None);
-            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None);
-            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first));
+            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
+            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
+            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
         }
     }
     m.room = room;
@@ -645,6 +836,9 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
 
 const FROM_BEFORE: u8 = 2;
 const STILL: u8 = 4;
+const LIGHT: u8 = 8;
+const TWO: u8 = 16;
+const QUARTER: u8 = 32;
 const HEAD: usize = 3;
 
 /// Does rebuilding this frame need the frame before it?
@@ -686,8 +880,8 @@ impl Memory {
 
 /// Packs a frame exactly. `before`: the frame before it (None: the frame stands alone).
 /// The bytes: flags, the number of bands, each band's length, the bands.
-pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, memory: &mut Memory) -> Vec<u8> {
-    let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 }];
+pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, memory: &mut Memory, how: How) -> Vec<u8> {
+    let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 } | how.flags()];
     out.extend((bands as u16).to_le_bytes());
     if before == Some(frame) {
         out[0] |= STILL;
@@ -703,10 +897,10 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, m
         .map(|(y0, m)| {
             let y0 = *y0;
             let y1 = (y0 + rows).min(geo.height);
-            let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1));
+            let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter));
             let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
             let mut c = Writer(Encoder::new(), [0.0; 7]);
-            band(geo, &mut c, m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1);
+            band(geo, &mut c, m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how);
             (c.0.finish(), c.1)
         })
         .collect();
@@ -755,7 +949,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
             let mut cur = [vec![0u8; (y1 - y0) * geo.width], vec![0u8; (c1 - c0) * cw], vec![0u8; (c1 - c0) * cw]];
             let [a, b, d] = &mut cur;
             let mut c = Reader(Decoder::new(bytes));
-            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1);
+            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1, How::of(payload[0]));
             cur
         })
         .collect();
@@ -1063,7 +1257,7 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
             *m = Model::new();
         }
         let mut c = Reader(Decoder::new(&p[places[k].0..places[k].0 + places[k].1]));
-        band(geo, &mut c, &mut m, cur, prev, Vec::new(), y0, y1);
+        band(geo, &mut c, &mut m, cur, prev, Vec::new(), y0, y1, How::of(p[0]));
         Ok(())
     };
     let mut deliver = |f: usize| -> Result<bool, String> {
@@ -1088,7 +1282,7 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
 /// The packer's strike: the frames packed exactly, each from the one before it
 /// (`before` for the first; `alone`: every frame on its own). The same bytes as
 /// `pack` gives frame by frame.
-pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alone: bool, bands_said: usize, memory: &mut Memory) -> Result<(Vec<Vec<u8>>, Struck), String> {
+pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alone: bool, bands_said: usize, memory: &mut Memory, how: How) -> Result<(Vec<Vec<u8>>, Struck), String> {
     let n = frames.len();
     let rows = band_rows(geo, bands_said);
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
@@ -1117,10 +1311,10 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
         if prev.is_none() {
             *m = Model::new();
         }
-        let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1));
+        let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter));
         let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
         let mut c = Writer(Encoder::new(), [0.0; 7]);
-        band(geo, &mut c, &mut m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1);
+        band(geo, &mut c, &mut m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how);
         // This job alone writes the place.
         unsafe { *done.get_mut(f * bands + k) = (c.0.finish(), c.1) };
         Ok(())
@@ -1129,7 +1323,7 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
     memory.0 = models.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut out = Vec::with_capacity(n);
     for f in 0..n {
-        let mut bytes = vec![if prev_of(f).is_some() { FROM_BEFORE } else { 0 }];
+        let mut bytes = vec![if prev_of(f).is_some() { FROM_BEFORE } else { 0 } | how.flags()];
         bytes.extend((bands_said as u16).to_le_bytes());
         if still[f] {
             bytes[0] |= STILL;
@@ -1173,22 +1367,29 @@ mod tests {
             for i in (0..b.len()).step_by(7) {
                 b[i] = b[i].wrapping_add(3);
             }
+            for (i, v) in b.iter_mut().enumerate().take(w * h / 2) {
+                if i % w < w / 2 {
+                    *v = v.saturating_add(9);
+                }
+            }
             let wild = noise(false);
-            for bands in [1, 3, 16] {
+            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true }), (16, How { light: 2, two: false, quarter: false }), (1, How { light: 0, two: false, quarter: true })] {
                 // The player goes through the frames in the packer's order, with its own memory.
                 let (mut packer, mut player) = (Memory::new(), Memory::new());
-                let first = pack(&geo, &a, None, bands, &mut packer);
+                let first = pack(&geo, &a, None, bands, &mut packer, how);
                 assert_eq!(unpack(&geo, &first, None, &mut player).unwrap(), a, "{w}x{h} alone, {bands} bands");
-                let second = pack(&geo, &b, Some(&a), bands, &mut packer);
+                let second = pack(&geo, &b, Some(&a), bands, &mut packer, how);
                 assert_eq!(unpack(&geo, &second, Some(&a), &mut player).unwrap(), b, "{w}x{h} from before, {bands} bands");
-                let same = pack(&geo, &b, Some(&b), bands, &mut packer);
+                let same = pack(&geo, &b, Some(&b), bands, &mut packer, how);
                 assert_eq!(same.len(), HEAD);
                 assert_eq!(unpack(&geo, &same, Some(&b), &mut player).unwrap(), b);
-                let third = pack(&geo, &wild, Some(&b), bands, &mut packer);
+                let third = pack(&geo, &wild, Some(&b), bands, &mut packer, how);
                 assert_eq!(unpack(&geo, &third, Some(&b), &mut player).unwrap(), wild, "{w}x{h} noise, {bands} bands");
                 // The strike gives the same bytes and the same frames, whatever the window.
-                let film = vec![a.clone(), b.clone(), b.clone(), wild.clone(), a.clone()];
-                let (struck, _) = strike_pack(&geo, &film.iter().map(|f| &f[..]).collect::<Vec<_>>(), None, false, bands, &mut Memory::new()).unwrap();
+                let mut slid = a.clone();
+                slid.copy_within(0..w * h - 3, 3);
+                let film = vec![a.clone(), b.clone(), b.clone(), wild.clone(), a.clone(), slid];
+                let (struck, _) = strike_pack(&geo, &film.iter().map(|f| &f[..]).collect::<Vec<_>>(), None, false, bands, &mut Memory::new(), how).unwrap();
                 assert_eq!(struck[..4], [first.clone(), second.clone(), same.clone(), third.clone()], "{w}x{h}, {bands} bands: the strike packs as the packer does");
                 for window in [1, 2, 8] {
                     let mut back = Vec::new();

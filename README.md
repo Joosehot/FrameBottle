@@ -970,3 +970,47 @@ x264 unpacks the same clip with 6.4 s of processor time where the mix takes 97.7
 
 `fbottle trial <raw yuv420p> <width> <height> <frames> [bands]` packs and unpacks frames
 in memory both ways (frame by frame, and by the strike) and times them.
+
+### Vectors to a quarter of a pixel, a light map, two guessers (2026-11-15, last)
+
+Three options for `--mix`, each a flag in the frame's head, each exact (every frame
+checked by its hash in the player; `fbottle raw` gives the source byte for byte).
+
+- **`--quarter`** (an idea of x264's; the code is this project's own): a block's vector
+  points between the pixels of the frame before, to a quarter of a pixel. Light between
+  the pixels is made by H.264's six-pixel filter (the one the blocks already had, in
+  src/block.rs), colour by the four pixels around. The packer looks at the eight places
+  half a pixel around the best whole-pixel place, then the eight a quarter around that.
+- **`--relight`** (the light trick without loss): a light map for each frame, a tile of
+  32 x 32 of light (16 x 16 of colour) at a time, each plane its own: an offset and a
+  gain (of 64), told from the same tile of the frame before. It is laid only on the
+  frame before as the guessers see it: before' = clamp((gain x before) >> 6) + offset);
+  the misses still lead to the real samples. The packer puts a tile right only when
+  that brings it nearer by an eighth of a step a sample. `--relight-offset`: offsets only.
+- **`--two`**: only the two learning guessers are weighed for the guess.
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, a window of 32:
+
+| | bytes | packing | unpacking | tiles put right |
+|---|---|---|---|---|
+| `--mix` | 101 276 733 | 20.6 s | 10.0 s | |
+| `--mix --relight` | 101 331 624 | 19.7 s | 9.6 s | 3.0 % |
+| **`--mix --quarter`** | **96 201 938** | **26.4 s** | **9.9 s** | |
+| `--mix --quarter --relight` | 96 243 339 | 26.7 s | 10.0 s | 2.8 % |
+| `--mix --quarter --relight --two` | 97 378 785 | 26.5 s | 10.0 s | 2.8 % |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 16.9 s | 0.95 s | |
+| FFV1 (level 3, 16 slices, gop 300) | 124 691 885 | 1.7 s | 1.5 s | |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | about 730 s | 5.4 s | |
+
+(`--mix` alone is 101 276 733 here and 101 751 797 in the table above: a colour block's
+vector is now half the light's exactly, not rounded down to a whole pixel.)
+
+fade_2s.mp4 (60 frames, the light fades): `--mix --quarter` 14 277 266 bytes; with
+`--relight` 14 133 124 (38.3 % of tiles put right); with `--relight-offset` 14 081 171
+(36.9 %).
+
+What this shows: with `--quarter` the bottle is 4.6 % smaller than x264 lossless and
+23.0 % smaller than AV1 lossless, and unpacks as fast as before; packing takes 28 % longer
+(the search between the pixels). The light map does nothing for a clip whose light is
+steady (the learning guessers follow the light themselves) and takes 1.0 to 1.4 % off a
+fade. Weighing only two guessers costs 1.2 % and does not make unpacking faster here.
