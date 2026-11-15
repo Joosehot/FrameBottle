@@ -14,7 +14,6 @@ flate2 = "1"
 zstd = "0.13"
 xz2 = { version = "0.1", features = ["static"] }
 rayon = "1"
-neuras = { path = "../Neuras" }
 gif = "0.13"
 minifb = "0.27"
 

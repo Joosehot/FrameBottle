@@ -765,3 +765,14 @@ A second clip with a cut in it (`cut_6s.mp4`: three seconds of one film,
 three of another): the cut is found, the frame after it stands alone,
 the player's check agrees; 2 337 647 bytes at 45.70 dB without the engine,
 2 330 595 bytes at 45.95 dB with it.
+
+### The Neuras refiner: tried and taken out
+
+A small network built and trained with Neuras's own code (three 3 x 3
+convolutions of 8 channels, 953 parameters) was to make the motion
+engine's guess of a tile better from the same place in the last three
+rebuilt frames, in whole numbers on both sides. Trained on 53 406 tiles of
+two other guitar films, it did not: on 5 934 tiles kept out the motion
+engine's guess was wrong by 8.491 (mean square) and the refined guess by
+8.494. The owner's decision: Neuras is left out of Frame Bottle. The code
+is in the history (commit 9faccb3).

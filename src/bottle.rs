@@ -97,10 +97,6 @@ pub struct Index {
     pub predict: usize,
     #[serde(default)]
     pub predict_check: u64,
-    /// Tiles may be refined by Neuras: the name of the refiner the packer used (the
-    /// player must have the same one).
-    #[serde(default)]
-    pub refiner: Option<String>,
     /// Fake film grain is laid on what is shown: its strength in 16ths of a level (0: none).
     #[serde(default)]
     pub grain: u8,
@@ -358,11 +354,6 @@ impl Bottle {
         flate2::read::ZlibDecoder::new(&z[..]).read_to_end(&mut json).map_err(err)?;
         let index: Index = index_from(&json).map_err(|e| format!("{}: {e}", path.display()))?;
         let geo = Geometry::of(&index.pix_fmt, index.width, index.height).ok_or(format!("unknown pixel format {}", index.pix_fmt))?;
-        if let Some(name) = &index.refiner {
-            if *name != crate::refiner::shipped_name() {
-                return Err(format!("{}: packed with the Neuras refiner {name}; this player has {}", path.display(), crate::refiner::shipped_name()));
-            }
-        }
         // The chain of bonds must pass every node once, in frame order.
         for (i, n) in index.nodes.iter().enumerate() {
             let want = (i + 1 < index.nodes.len()).then_some(i as u32 + 1);
