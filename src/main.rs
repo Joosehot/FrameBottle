@@ -41,6 +41,7 @@ mod mix;
 mod sheets;
 mod tones;
 mod trial;
+mod zeros;
 mod motor;
 mod pack;
 mod particle;
@@ -894,6 +895,11 @@ fn run() -> Result<(), String> {
             // fbottle tones <raw yuv420p> <width> <height> <frames> [bands]
             let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "tones: <yuv> <width> <height> <frames> [bands]".to_string()) };
             tones::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
+        }
+        Some("zeros") => {
+            // fbottle zeros <raw yuv420p> <width> <height> <frames> [bands]
+            let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "zeros: <yuv> <width> <height> <frames> [bands]".to_string()) };
+            zeros::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
         }
         Some("verify") => {
             let b = Bottle::open(path(0, "the bottle")?)?;

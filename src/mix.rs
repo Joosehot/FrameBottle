@@ -759,6 +759,19 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize, quar
             let (bw, bh) = (BLOCK.min(w - bx), BLOCK.min(h - by));
             let unlike = |dx: i32, dy: i32, limit: u32| -> u32 {
                 let mut s = 0u32;
+                let (x, y) = (bx as i32 + dx, by as i32 + dy);
+                if x >= 0 && y >= 0 && x as usize + bw <= w && y as usize + bh <= h {
+                    // Wholly inside the frame before: row against row.
+                    let (x, y) = (x as usize, y as usize);
+                    for j in 0..bh {
+                        let (a, b) = (&real[(by + j) * w + bx..][..bw], &prev[(y + j) * w + x..][..bw]);
+                        s += a.iter().zip(b).map(|(a, b)| a.abs_diff(*b) as u32).sum::<u32>();
+                        if s >= limit {
+                            return s;
+                        }
+                    }
+                    return s;
+                }
                 for j in 0..bh {
                     let py = ((by + j) as i32 + dy).clamp(0, h as i32 - 1) as usize;
                     for k in 0..bw {
@@ -786,12 +799,61 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize, quar
                 best = (best.0, 4 * best.1, 4 * best.2);
                 if quarter {
                     // Between the pixels: the eight places half a pixel around the best, then the eight a quarter around that.
+                    // The frame before around the best place, one pixel wider on every side, and its
+                    // three half-way pictures (to the right of a pixel, below it, the middle of four),
+                    // worked out once: every place tried is one of these or the mean of two.
                     let g = |x: i32, y: i32| prev[y.clamp(0, h as i32 - 1) as usize * w + x.clamp(0, w as i32 - 1) as usize] as i32;
+                    let (x0, y0) = (bx as i32 + best.1 / 4 - 1, by as i32 + best.2 / 4 - 1);
+                    let (aw, ah) = (bw + 2, bh + 2);
+                    let clip = |v: i32| v.clamp(0, 255);
+                    let mut rows = [[0i32; BLOCK + 2]; BLOCK + 8];
+                    for (j, row) in rows.iter_mut().enumerate().take(ah + 6) {
+                        let y = y0 + j as i32 - 2;
+                        for (k, v) in row.iter_mut().enumerate().take(aw) {
+                            let x = x0 + k as i32;
+                            *v = g(x - 2, y) - 5 * g(x - 1, y) + 20 * g(x, y) + 20 * g(x + 1, y) - 5 * g(x + 2, y) + g(x + 3, y);
+                        }
+                    }
+                    let mut whole = [[0u8; BLOCK + 2]; BLOCK + 2];
+                    let (mut right, mut below, mut middle) = (whole, whole, whole);
+                    for j in 0..ah {
+                        for k in 0..aw {
+                            let (x, y) = (x0 + k as i32, y0 + j as i32);
+                            whole[j][k] = g(x, y) as u8;
+                            right[j][k] = clip((rows[j + 2][k] + 16) >> 5) as u8;
+                            below[j][k] = clip((g(x, y - 2) - 5 * g(x, y - 1) + 20 * g(x, y) + 20 * g(x, y + 1) - 5 * g(x, y + 2) + g(x, y + 3) + 16) >> 5) as u8;
+                            middle[j][k] = clip((rows[j][k] - 5 * rows[j + 1][k] + 20 * rows[j + 2][k] + 20 * rows[j + 3][k] - 5 * rows[j + 4][k] + rows[j + 5][k] + 512) >> 10) as u8;
+                        }
+                    }
+                    let centre = (best.1, best.2);
                     let unlike = |qx: i32, qy: i32, limit: u32| -> u32 {
+                        // Where the place lies from the best whole place: a pixel of the pictures, and quarters past it.
+                        let (ox, oy) = (qx - centre.0 + 4, qy - centre.1 + 4);
+                        let (ix, iy, fx, fy) = ((ox >> 2) as usize, (oy >> 2) as usize, ox & 3, oy & 3);
+                        let mean = |a: u8, b: u8| (a as i32 + b as i32 + 1) >> 1;
                         let mut s = 0u32;
                         for j in 0..bh {
                             for k in 0..bw {
-                                s += (real[(by + j) * w + bx + k] as i32 - crate::block::quarter_of(&g, 4 * (bx + k) as i32 + qx, 4 * (by + j) as i32 + qy)).unsigned_abs();
+                                let (y, x) = (iy + j, ix + k);
+                                let there = match (fx, fy) {
+                                    (0, 0) => whole[y][x] as i32,
+                                    (1, 0) => mean(whole[y][x], right[y][x]),
+                                    (2, 0) => right[y][x] as i32,
+                                    (3, 0) => mean(whole[y][x + 1], right[y][x]),
+                                    (0, 1) => mean(whole[y][x], below[y][x]),
+                                    (0, 2) => below[y][x] as i32,
+                                    (0, 3) => mean(whole[y + 1][x], below[y][x]),
+                                    (2, 2) => middle[y][x] as i32,
+                                    (2, 1) => mean(right[y][x], middle[y][x]),
+                                    (2, 3) => mean(middle[y][x], right[y + 1][x]),
+                                    (1, 2) => mean(below[y][x], middle[y][x]),
+                                    (3, 2) => mean(middle[y][x], below[y][x + 1]),
+                                    (1, 1) => mean(right[y][x], below[y][x]),
+                                    (3, 1) => mean(right[y][x], below[y][x + 1]),
+                                    (1, 3) => mean(below[y][x], right[y + 1][x]),
+                                    _ => mean(below[y][x + 1], right[y + 1][x]),
+                                };
+                                s += (real[(by + j) * w + bx + k] as i32 - there).unsigned_abs();
                             }
                             if s >= limit {
                                 return s;

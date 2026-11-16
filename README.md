@@ -1135,3 +1135,34 @@ The last-but-two row is a trial inside the mix (`fbottle trial` with FB_HOW=qc; 
 every frame), and how common the guessed tone is, in 4 steps, is added to the first
 learner's view. 96 151 044 -> 95 870 576 bytes (0.29 % smaller), packing 66.4 -> 67.6 ms
 a frame, unpacking 34.8 -> 34.8 ms a frame, 302 of 302 frames identical.
+
+### Ideas from x264, second round (2026-11-16)
+
+No code of x264 is copied; these are its ways of working, written anew.
+
+**The packer's vector search, cheaper and the same.** x264 keeps the half-way pictures
+of a frame ready, so that a place between the pixels is a lookup or the mean of two.
+Here the search does the same around the best whole place of each block: the frame
+before, one pixel wider than the block, and its three half-way pictures are worked out
+once, and each of the 16 places tried between the pixels reads them. Whole places
+wholly inside the frame are compared row against row. The vectors found are the same,
+so the bottles are byte for byte what they were.
+
+guitar_10s.mp4 (1080p, 302 frames), an empty Nimbus, exact:
+
+| | bytes | packing before | packing now | unpacking |
+|---|---|---|---|---|
+| `--mix --quarter` | 96 201 938 | 26.4 s | 19.8 s | 10.4 s |
+| `--mix --quarter --golden` | 111 645 569 | 20.0 s (vectors 9.1 s) | 14.1 s (vectors 2.3 s) | 3.9 s |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | | 16.9 s | 0.95 s |
+
+**What x264's skips would find here (`fbottle zeros`, a measure only).** x264 skips a
+block that is what it was with one yes/no, says with one flag that a block of misses is
+all nothing, and writes a sign as one plain bit. In this clip, with the mix's misses:
+
+- blocks of 16 x 16 exactly what they were in the frame before: 1.92 %;
+- misses that are nothing: light 73.1 %, colours 89.5 % and 92.8 %;
+- blocks of misses all nothing, 4 x 4 / 8 x 8 / 16 x 16: light 27.1 / 8.4 / 0.9 %,
+  colour 1 46.8 / 20.7 / 3.7 %, colour 2 61.8 / 39.6 / 18.7 %;
+- the mix's bytes: is there a miss 54.2 million, its sign 16.8 million (0.683 bits a
+  sign; plain bits would be 24.6 million), its size 23.8 million, the vectors 1.3 million.
