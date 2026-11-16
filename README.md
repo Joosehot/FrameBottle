@@ -1339,3 +1339,5 @@ Against libaom (crf 26, 32, 38: 1 455 077 / 903 837 / 600 212 bytes at VMAF 94.9
 2 916 439 / 2 468 803 bytes at VMAF 95.69 / 95.22 / 94.74 / 93.71 / 92.63) takes 200.7 %
 more bytes at the same VMAF, averaged over VMAF 92.63 to 94.99 (three times the size).
 Groups of 2 and of 8 were measured at coarse 9 only.
+
+Kept: rules.toml now says `between = 1.6` (it was 2.1), the 0.96 % above. `--bsteps 2.1` gives the old steps.
