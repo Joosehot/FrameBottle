@@ -253,6 +253,13 @@ pub struct Model {
     pyramid: bool,
     /// The plates' way for the band (see How).
     plates: u8,
+    /// The pyramid the mix's way: the learning guessers' weights for each kind of pass and
+    /// plane, what guesses in the same surroundings missed by, and how far each guesser was
+    /// off on each sample of the plane being told.
+    pyr_lw: Vec<[[i32; FEATS]; 3]>,
+    pyr_slow: Vec<[[i32; FEATS]; 3]>,
+    pyr_bias: Vec<(i32, i32)>,
+    pyr_off: Vec<[u8; 4]>,
     /// TRIAL: how often each tone came in each plane of the band so far (halved after every
     /// frame), and from that how common it is, in 4 steps.
     tone: [[u32; 256]; 3],
@@ -302,6 +309,10 @@ impl Model {
             pyr: Vec::new(),
             pyramid: false,
             plates: 0,
+            pyr_lw: Vec::new(),
+            pyr_slow: Vec::new(),
+            pyr_bias: Vec::new(),
+            pyr_off: Vec::new(),
         }
     }
 
@@ -381,6 +392,9 @@ fn median(a: i32, b: i32, c: i32) -> i32 {
 /// misses of the first colour (for the second).
 #[allow(clippy::too_many_arguments)]
 fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool, tones: bool) {
+    if m.pyramid {
+        return plane_pyr_learn::<C, T>(c, m, pk, w, cur, before, res, first);
+    }
     let t = tables();
     let rows = cur.len() / w;
     let sw = w + 2 * PAD;
@@ -817,6 +831,138 @@ fn plane_pyr<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usi
         pass::<C, T>(c, m, pk, 1 + 3 * k, w, cur, before, res, first, &mut sums, (half, step), (half, step), &[(-h, -h), (h, -h), (-h, h), (h, h)]);
         pass::<C, T>(c, m, pk, 2 + 3 * k, w, cur, before, res, first, &mut sums, (half, step), (0, step), &[(-h, 0), (h, 0), (0, -h), (0, h)]);
         pass::<C, T>(c, m, pk, 3 + 3 * k, w, cur, before, res, first, &mut sums, (0, step), (half, step), &[(0, -h), (0, h), (-h, 0), (h, 0), (-h, -h), (h, -h), (-h, h), (h, h)]);
+    }
+}
+
+/// The pyramid with the mix's own way of guessing and writing (TRIAL): the passes of
+/// `plane_pyr`, but a sample is guessed by four guessers mixed (the mean of the four
+/// around it, the frame before moved by how the four changed, and two learning guessers,
+/// with weights of their own for each kind of pass), put right by its surroundings, and
+/// its miss is written by the three learners mixed.
+const PYR_A: usize = 9 * 6 * KINDS * 3;
+const PYR_A_ALL: usize = PYR_A + 27 * KINDS * 3;
+const PYR_D: usize = 625 * 3 * 3;
+
+#[allow(clippy::too_many_arguments)]
+fn pass_learn<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, kind: usize, w: usize, cur: &mut [u8], before: &[u8], res: &mut [i8], first: Option<&[i8]>, xs: (usize, usize), ys: (usize, usize), around: &[(i32, i32)]) {
+    let t = tables();
+    let rows = cur.len() / w;
+    let sw = w + 2 * PAD;
+    let (mut lw, mut lw_slow) = (m.pyr_lw[kind][pk], m.pyr_slow[kind][pk]);
+    let mut off = std::mem::take(&mut m.pyr_off);
+    // The coarse passes, the middles of the finest step, the rest of the finest step.
+    let group = if kind < KINDS - 3 { 0 } else if kind == KINDS - 3 { 1 } else { 2 };
+    for y in (ys.0..rows).step_by(ys.1) {
+        for x in (xs.0..w).step_by(xs.1) {
+            let (i, ip) = (y * w + x, (y + PAD) * sw + PAD + x);
+            // Those around: the sample, the frame before there, the miss there, how far each guesser was off there.
+            let (mut now, mut was, mut miss, mut have, mut were) = ([0i32; 8], [0i32; 8], [0i32; 8], [false; 8], [0u32; 4]);
+            for (j, (dx, dy)) in around.iter().copied().enumerate() {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < rows {
+                    let (ni, np) = (ny as usize * w + nx as usize, (ny as usize + PAD) * sw + PAD + nx as usize);
+                    (now[j], miss[j], have[j]) = (cur[ni] as i32, res[np] as i32, true);
+                    if T {
+                        was[j] = before[np] as i32;
+                    }
+                    if j < 4 {
+                        for g in 0..4 {
+                            were[g] += off[ni][g] as u32;
+                        }
+                    }
+                }
+            }
+            let n4 = have[..4].iter().filter(|h| **h).count() as i32;
+            let mean_of = |v: &[i32; 8]| if n4 == 0 { 0 } else { ((0..4).filter(|j| have[*j]).map(|j| v[j]).sum::<i32>() + 2 * n4 + n4 / 2).div_euclid(n4) - 2 };
+            let (base, stayed, moved, feats): (i32, usize, i32, [i32; FEATS]) = if T {
+                let t0 = before[ip] as i32;
+                let d: [i32; 8] = std::array::from_fn(|j| if have[j] { now[j] - was[j] } else { 0 });
+                let e: [i32; 8] = std::array::from_fn(|j| if have[j] { was[j] - t0 } else { 0 });
+                let stayed = (0..4).filter(|j| have[*j] && d[*j] == 0).count();
+                let by = if n4 == 0 { 0 } else { ((0..4).map(|j| d[j]).sum::<i32>() + 512 * n4 + n4 / 2) / n4 - 512 };
+                (t0, stayed, (t0 + by).clamp(0, 255), std::array::from_fn(|k| if k < 8 { d[k] } else { e[k - 8] }))
+            } else {
+                let base = if n4 == 0 { 128 } else { mean_of(&now) };
+                let f: [i32; 8] = std::array::from_fn(|j| if have[j] { now[j] - base } else { 0 });
+                (base, 0, base, std::array::from_fn(|k| if k < 8 { f[k] } else { 0 }))
+            };
+            let mean4 = if n4 == 0 { base } else { mean_of(&now) };
+            let (mut lean, mut lean_slow, mut norm) = (0i32, 0i32, 32i32);
+            for k in 0..FEATS {
+                lean = lean.wrapping_add(lw[k].wrapping_mul(feats[k]));
+                lean_slow = lean_slow.wrapping_add(lw_slow[k].wrapping_mul(feats[k]));
+                norm += feats[k] * feats[k];
+            }
+            let learned = (base + (lean.wrapping_add(32768) >> 16)).clamp(0, 255);
+            let learned_slow = (base + (lean_slow.wrapping_add(32768) >> 16)).clamp(0, 255);
+            let offers = [mean4, moved, learned, learned_slow];
+            // The mix: each speaks as loud as it was right on those around.
+            let (mut sum, mut total) = (0u32, 0u32);
+            for g in 0..4 {
+                let wt = t.weight[(3 * were[g] as usize / 2).min(1535)];
+                sum += wt;
+                total += wt * offers[g] as u32;
+            }
+            let mixed = ((total + sum / 2) / sum) as i32;
+            let low = mean4.min(moved).min(learned).min(learned_slow);
+            let high = mean4.max(moved).max(learned).max(learned_slow);
+            // Where the sample stands.
+            let near = STEP[((3 * miss[..4].iter().map(|r| r.unsigned_abs()).sum::<u32>() as usize / 2 + 1) / 3).min(23)] as usize;
+            let at_a = ((near * 6 + APART[((high - low) as usize).min(25)] as usize) * KINDS + kind) * 3 + pk;
+            let sign_first = first.map_or(1, |f| (f[ip] as i32).signum() + 1);
+            let signs = PYR_A + ((((miss[0].signum() + 1) * 3 + miss[1].signum() + 1) * 3 + sign_first) as usize * KINDS + kind) * 3 + pk;
+            let b = m.pyr_bias[at_a];
+            let lean = ((2 * b.0 + b.1 * b.0.signum()).unsigned_abs() * t.half[b.1 as usize]) >> 24;
+            let guess = (mixed + if b.0 < 0 { -(lean as i32) } else { lean as i32 }).clamp(0, 255);
+            let five = |r: i32| (r.clamp(-2, 2) + 2) as usize;
+            let at_d = ((((five(miss[0]) * 5 + five(miss[1])) * 5 + five(miss[2])) * 5 + five(miss[3])) * 3 + group) * 3 + pk;
+            let at_e = ((((five(base - guess) * 5 + five(mean4 - guess)) * 5 + five(learned - guess)) * 5 + stayed) * 3 + group) * 3 + pk;
+            let real = if C::WRITE { cur[i] } else { 0 };
+            let want = if C::WRITE { real.wrapping_sub(guess as u8) as i8 as i32 } else { 0 };
+            let got = m.miss(c, t, pk, [at_a, at_d, at_e], signs, (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed), want);
+            c.missed(got.unsigned_abs());
+            let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
+            cur[i] = real;
+            res[ip] = got as i8;
+            let b = &mut m.pyr_bias[at_a];
+            b.0 += got as i8 as i32;
+            b.1 += 1;
+            if b.1 == 32 {
+                *b = (b.0 / 2, 16);
+            }
+            off[i] = offers.map(|o| (real as i32 - o).unsigned_abs() as u8);
+            let over = ((1u32 << 24) / norm as u32) as i64;
+            let pull = ((((real as i32 - learned) * LEARN) as i64 * over) >> 21) as i32;
+            let pull_slow = ((((real as i32 - learned_slow) * (LEARN / 16)) as i64 * over) >> 17) as i32;
+            for k in 0..FEATS {
+                lw[k] = lw[k].wrapping_add(pull.wrapping_mul(feats[k]) >> 3);
+                lw_slow[k] = lw_slow[k].wrapping_add(pull_slow.wrapping_mul(feats[k]) >> 7);
+            }
+        }
+    }
+    (m.pyr_lw[kind][pk], m.pyr_slow[kind][pk]) = (lw, lw_slow);
+    m.pyr_off = off;
+}
+
+/// One plane of a band as a pyramid, the mix's way.
+fn plane_pyr_learn<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], res: &mut [i8], first: Option<&[i8]>) {
+    if m.pyr_lw.is_empty() {
+        m.pyr_lw = vec![[[0; FEATS]; 3]; KINDS];
+        m.pyr_slow = vec![[[0; FEATS]; 3]; KINDS];
+        m.pyr_bias = vec![(0, 0); PYR_A];
+        m.a = vec![[32768, 0]; PYR_A_ALL * SLOTS];
+        m.d = vec![[32768, 0]; PYR_D * SLOTS];
+        m.e = vec![[32768, 0]; PYR_D * SLOTS];
+    }
+    m.pyr_off.clear();
+    m.pyr_off.resize(cur.len(), [0u8; 4]);
+    let s = TOP as i32;
+    pass_learn::<C, T>(c, m, pk, 0, w, cur, before, res, first, (0, TOP), (0, TOP), &[(-s, 0), (0, -s), (-s, -s), (s, -s)]);
+    for (k, step) in [TOP, TOP / 2, TOP / 4].into_iter().enumerate() {
+        let (half, h) = (step / 2, step as i32 / 2);
+        pass_learn::<C, T>(c, m, pk, 1 + 3 * k, w, cur, before, res, first, (half, step), (half, step), &[(-h, -h), (h, -h), (-h, h), (h, h)]);
+        pass_learn::<C, T>(c, m, pk, 2 + 3 * k, w, cur, before, res, first, (half, step), (0, step), &[(-h, 0), (h, 0), (0, -h), (0, h), (-h, -2 * h), (h, -2 * h), (-h, 2 * h), (h, 2 * h)]);
+        pass_learn::<C, T>(c, m, pk, 3 + 3 * k, w, cur, before, res, first, (0, step), (half, step), &[(0, -h), (0, h), (-h, 0), (h, 0), (-h, -h), (h, -h), (-h, h), (h, h)]);
     }
 }
 
@@ -1359,8 +1505,8 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
     }
     let [res_light, res_first, res_second] = res;
     m.plates = how.plates;
+    m.pyramid = how.pyramid;
     if how.gold {
-        m.pyramid = how.pyramid;
         match prev {
             Some(p) => {
                 moved(mv, p.planes[0], p.first[0], (w, h), y0, rows, &vectors, across, 4, false);

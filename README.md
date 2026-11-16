@@ -1232,3 +1232,22 @@ plates have them, its frames are 96 329 247 bytes against 96 151 044.) As a fift
 guesser the plates make the bottle 0.9 % smaller; in place of golden's weights 5.8 %
 smaller for 0.8 s more unpacking; alone, with the mix's learners, 2.7 % larger than the
 mix, though their guess is nearer on average.
+
+**The pyramid with the learning guessers** (FB_HOW=qp, trial only; the owner's choice of
+the two ways on). The same passes, but a sample is guessed by four guessers mixed (the
+mean of the four around it, the frame before moved by how the four changed, and two
+learning guessers with weights of their own for each kind of pass and plane), put right
+by its surroundings, and its miss written by the mix's three learners and two mixers.
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, in memory, 302 of 302 frames identical:
+
+| | bytes of frames | a guess is off by | packing | unpacking |
+|---|---|---|---|---|
+| the mix, row after row (`--mix --quarter`) | 96 151 044 | 0.337 | 40.1 ms a frame | 33.2 ms a frame |
+| the mix as a pyramid | 105 819 480 | 0.345 | 50.3 ms a frame | 44.7 ms a frame |
+
+10.1 % larger and 1.35 times slower to unpack. The guess is 2.4 % further off; the rest
+of the loss is in writing the misses. A quarter of the samples of the finest step (the
+middles of four) have no neighbour nearer than cornerwise, and the coarser steps have
+theirs further still; four more known neighbours for the second kind of pass gave 0.3 %
+(60 frames).
