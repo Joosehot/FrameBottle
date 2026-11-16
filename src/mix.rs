@@ -1119,6 +1119,24 @@ impl Memory {
             self.0 = (0..bands).map(|_| Model::new()).collect();
         }
     }
+    /// For the trials: what the guess missed by on every sample of the frame packed last
+    /// (by `pack`, with the same `bands` said), laid as the frame's planes lie.
+    pub fn misses(&self, geo: &Geometry, bands: usize) -> Vec<i8> {
+        let mut out = vec![0i8; geo.frame_len()];
+        let (rows, at) = (band_rows(geo, bands), geo.offsets());
+        for (m, y0) in self.0.iter().zip((0..geo.height).step_by(rows)) {
+            let y1 = (y0 + rows).min(geo.height);
+            let (c0, c1) = colour_rows(geo, y0, y1);
+            for (k, (first, n)) in [(y0, y1 - y0), (c0, c1 - c0), (c0, c1 - c0)].into_iter().enumerate() {
+                let w = geo.planes[k].w;
+                for yy in 0..n {
+                    let o = (yy + PAD) * (w + 2 * PAD) + PAD;
+                    out[at[k] + (first + yy) * w..][..w].copy_from_slice(&m.room.res[k][o..o + w]);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Packs a frame exactly. `before`: the frame before it (None: the frame stands alone).

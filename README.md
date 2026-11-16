@@ -1064,3 +1064,32 @@ second) and packing 1.3 times faster; the bottle is 16.1 % larger than that mix 
 10.7 % larger than x264 lossless, and still 10.6 % smaller than AV1 lossless. Stretches
 cost little: 30 frames instead of 120 is 0.2 %. Tried before building, on the mix that
 learns (24 frames): fixed weights alone +5.1 %, one learner alone +5.7 %, both +10.0 %.
+
+### A trial: stacked bit sheets (`fbottle sheets`, 2026-11-16)
+
+Apart from the packers (the owner's experiment). Every sample is split into its eight
+bits, sheet 7 (the top bit) down to sheet 0, and each bit is written by a learning
+yes/no coder, two ways: seeing only the same bit of the frame before, or seeing four
+bits (the frame before, left, above, and the sample's bit one sheet higher). Tried on
+the samples themselves and on what the mix's guess missed by (0, -1, 1, -2 ... told as
+0, 1, 2, 3 ...). The clip is yuv420p already, so no colour transform is made.
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, 12 threads, every sample came back:
+
+| | bytes | writing | reading |
+|---|---|---|---|
+| sheets of the samples, the frame before alone | 385 143 386 | 7.9 s | 7.8 s |
+| sheets of the samples, four bits seen | 241 138 540 | 7.4 s | 7.6 s |
+| sheets of the mix's misses, the frame before alone | 130 648 150 | 6.9 s (+ the guess) | 6.7 s (+ the guess) |
+| sheets of the mix's misses, four bits seen | 124 186 304 | 6.8 s (+ the guess) | 6.8 s (+ the guess) |
+| `--mix --quarter` | 96 201 938 | 26.4 s | 9.9 s |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 16.9 s | 0.95 s |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | about 730 s | 5.4 s |
+
+How often a bit is what it was in the frame before (light / colour), sheet 7 to 0: the
+samples 98.6 / 99.7, 97.3 / 99.7, 95.0 / 99.4, 91.8 / 97.8, 87.2 / 96.7, 80.6 / 93.7,
+72.3 / 86.6, 62.9 / 77.5 %; the misses 100, 100, 99.9, 99.3, 98.0, 93.9, 80.2, 82.3 %
+of the light (their top sheets are nearly all zeros: the match says little there).
+Bytes by sheet, the frame before alone, 7 to 0: the samples 8.5, 13.5, 22.6, 35.6, 49.3,
+66.5, 86.6, 102.6 million; the misses 0.05, 0.1, 0.7, 2.6, 6.9, 18.1, 52.4, 49.8 million.
+The mix writes a whole miss at once, so its bytes cannot be told sheet by sheet.

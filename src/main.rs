@@ -38,6 +38,7 @@ mod golden;
 mod guess;
 mod light;
 mod mix;
+mod sheets;
 mod trial;
 mod motor;
 mod pack;
@@ -882,6 +883,11 @@ fn run() -> Result<(), String> {
             // fbottle trial <raw yuv420p> <width> <height> <frames> [bands] [alone]
             let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "trial: <yuv> <width> <height> <frames> [bands]".to_string()) };
             trial::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands), rules.alone)?;
+        }
+        Some("sheets") => {
+            // fbottle sheets <raw yuv420p> <width> <height> <frames> [bands]
+            let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "sheets: <yuv> <width> <height> <frames> [bands]".to_string()) };
+            sheets::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
         }
         Some("verify") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
