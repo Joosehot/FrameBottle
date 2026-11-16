@@ -38,6 +38,7 @@ mod golden;
 mod guess;
 mod light;
 mod mix;
+mod far;
 mod sheets;
 mod tones;
 mod trial;
@@ -820,6 +821,7 @@ fn run() -> Result<(), String> {
     let mut rules = Rules::parse(motor::DEFAULT_RULES)?;
     let mut paths: Vec<PathBuf> = Vec::new();
     let (mut out, mut profile, mut explain, mut smooth, mut bench) = (None, "size".to_string(), false, 2usize, false);
+    let mut plan = far::Plan { past: 1, near: 30, period: 1, sparse: false };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -856,6 +858,10 @@ fn run() -> Result<(), String> {
             "--quarter" => rules.quarter = true,
             "--golden" => rules.golden = true,
             "--plates" => rules.plates = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=2).contains(n)).ok_or("--plates needs 1 (the plates are the guess) or 2 (the plates are a fifth guesser)")?,
+            "--past" => plan.past = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--past needs a number of frames, 1 or more")?,
+            "--near" => plan.near = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--near needs a number of frames, 1 or more")?,
+            "--ahead" => plan.period = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--ahead needs a number of frames, 1 or more")?,
+            "--sparse" => plan.sparse = true,
             "--chunk" => rules.chunk = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--chunk needs a whole number, 1 or more")?,
             "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
             "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,
@@ -893,6 +899,18 @@ fn run() -> Result<(), String> {
             // fbottle sheets <raw yuv420p> <width> <height> <frames> [bands]
             let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "sheets: <yuv> <width> <height> <frames> [bands]".to_string()) };
             sheets::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
+        }
+        Some("far") => {
+            // fbottle far pack <raw yuv420p> <width> <height> <frames> -o <file> [--past N] [--near N] [--ahead N] [--sparse]
+            // fbottle far unpack <file> <raw yuv420p to check against>
+            match paths.first().and_then(|p| p.to_str()) {
+                Some("pack") => {
+                    let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "far pack: <yuv> <width> <height> <frames> -o <file>".to_string()) };
+                    far::pack(path(1, "the raw frames")?, n(2)?, n(3)?, n(4)?, rules.bands, plan, &out.ok_or("far pack needs -o <file>")?)?;
+                }
+                Some("unpack") => far::unpack(path(1, "the packed file")?, path(2, "the raw frames")?)?,
+                _ => return Err("far: pack or unpack".into()),
+            }
         }
         Some("tones") => {
             // fbottle tones <raw yuv420p> <width> <height> <frames> [bands]

@@ -1251,3 +1251,46 @@ of the loss is in writing the misses. A quarter of the samples of the finest ste
 middles of four) have no neighbour nearer than cornerwise, and the coarser steps have
 theirs further still; four more known neighbours for the second kind of pass gave 0.3 %
 (60 frames).
+
+### A trial: the far cache (`fbottle far`, 2026-11-16)
+
+The mix guesses a block from the frame before. Here both sides keep many frames, and
+each block of 16 x 16 may be guessed from any frame kept; which one is told for each
+block (as a step from the block to its left, by a number that learns).
+
+- The past: frames up to `--past N` before the one being told are kept.
+- Thinned: with `--sparse`, of the frames more than `--near N` before only every
+  other one is kept.
+- Ahead: with `--ahead P` the frames are told out of order (frame 0, then every Pth
+  frame, with the frames between halved again and again), so a frame may be guessed
+  from frames up to P after it.
+
+The packer looks at the nearest frame always. Of the others it searches the two whose
+small pictures (the light at a quarter of its size) are most like the block's, and
+takes one when it is alike by 7 eighths of the nearest's unlikeness or less.
+
+It is a bench of its own, not a bottle: `fbottle far pack <yuv> <w> <h> <frames> -o
+<file>` writes its own file, and `fbottle far unpack <file> <yuv>` rebuilds it and
+checks every frame. The frames are packed one after another (16 bands side by side),
+not by the strike. With one frame kept, a frame's bytes are the mix's own
+(`--mix --quarter`; a test holds this).
+
+Measured on 30 seconds of the guitar film (900 frames of 1920 x 1080 at 30 frames a
+second, 2 799 360 000 bytes raw; no film at 60 frames a second was at hand, so the
+windows are the same in seconds: 10 seconds past is 300 frames, the last second 30):
+
+| | bytes | against the mix | pack | unpack | frames kept | most memory (pack / unpack) | blocks from more than 1 s before |
+|---|---|---|---|---|---|---|---|
+| the mix as it is (`--past 1`) | 283 365 992 | | 43.5 s | 37.3 s | 2 | 33 / 33 MB | |
+| the past, every frame (`--past 300 --near 30`) | 282 766 676 | 0.21 % smaller | 48.0 s | 37.9 s | 301 | 959 / 923 MB | 0.543 % |
+| the past, every other frame of the far past (`--sparse`) | 282 742 455 | 0.22 % smaller | 47.6 s | 37.7 s | 166 | 542 / 522 MB | 0.478 % |
+| the past and ahead (`--ahead 2`) | 301 435 551 | 6.38 % larger | 52.5 s | 38.8 s | 302 | 962 / 926 MB | 0.725 % |
+
+Every run: 900 of 900 frames identical to the film. In the past-only runs 1.36 % and
+1.33 % of the blocks were guessed from a frame other than the nearest; with `--ahead 2`
+3.62 %, of them 2.05 % from the frame after.
+
+On the first 60 frames of `guitar_10s.mp4` the order 0, 2, 1, 4, 3 ... had been 3.0 %
+smaller than the mix (18 794 510 against 19 360 120 bytes), and periods of 4 and 8
+larger by 1.8 % and 3.0 %. On the 900 frames the same order is 6.4 % larger: what 60
+frames of one clip showed did not hold on another.

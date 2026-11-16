@@ -237,6 +237,8 @@ pub struct Model {
     /// What guesses in the same surroundings missed by: the sum and how many.
     bias: Vec<(i32, i32)>,
     vector: [([u16; 32], [u16; 2]); 2],
+    /// The far cache: which kept frame a block is guessed from, by whether the block to its left was guessed from the nearest.
+    far: [([u16; 32], [u16; 2]); 2],
     /// For the profile: the ticks the range coder took.
     coder_ticks: u64,
     /// The band's working room, made once and used for every frame.
@@ -300,6 +302,7 @@ impl Model {
             extra: [[2048; 8]; 14],
             bias: vec![(0, 0); A_SIZE],
             vector: [([2048; 32], [2048; 2]); 2],
+            far: [([2048; 32], [2048; 2]); 2],
             coder_ticks: 0,
             room: Room::default(),
             lit_on: [[2048; 4]; 3],
@@ -1149,27 +1152,114 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize, quar
     let mut out = Vec::new();
     for by in (y0..y1).step_by(BLOCK) {
         for bx in (0..w).step_by(BLOCK) {
-            let (bw, bh) = (BLOCK.min(w - bx), BLOCK.min(h - by));
-            let unlike = |dx: i32, dy: i32, limit: u32| -> u32 {
-                let mut s = 0u32;
-                let (x, y) = (bx as i32 + dx, by as i32 + dy);
-                if x >= 0 && y >= 0 && x as usize + bw <= w && y as usize + bh <= h {
-                    // Wholly inside the frame before: row against row.
-                    let (x, y) = (x as usize, y as usize);
-                    for j in 0..bh {
-                        let (a, b) = (&real[(by + j) * w + bx..][..bw], &prev[(y + j) * w + x..][..bw]);
-                        s += a.iter().zip(b).map(|(a, b)| a.abs_diff(*b) as u32).sum::<u32>();
-                        if s >= limit {
-                            return s;
-                        }
-                    }
+            let best = find_block(w, h, real, prev, bx, by, quarter);
+            out.push((best.1, best.2));
+        }
+    }
+    out
+}
+
+/// The block at (bx, by): how unlike the best place in `prev` is (with what its vector
+/// costs), and the vector.
+fn find_block(w: usize, h: usize, real: &[u8], prev: &[u8], bx: usize, by: usize, quarter: bool) -> (u32, i32, i32) {
+    let (bw, bh) = (BLOCK.min(w - bx), BLOCK.min(h - by));
+    let unlike = |dx: i32, dy: i32, limit: u32| -> u32 {
+        let mut s = 0u32;
+        let (x, y) = (bx as i32 + dx, by as i32 + dy);
+        if x >= 0 && y >= 0 && x as usize + bw <= w && y as usize + bh <= h {
+            // Wholly inside the frame before: row against row.
+            let (x, y) = (x as usize, y as usize);
+            for j in 0..bh {
+                let (a, b) = (&real[(by + j) * w + bx..][..bw], &prev[(y + j) * w + x..][..bw]);
+                s += a.iter().zip(b).map(|(a, b)| a.abs_diff(*b) as u32).sum::<u32>();
+                if s >= limit {
                     return s;
                 }
+            }
+            return s;
+        }
+        for j in 0..bh {
+            let py = ((by + j) as i32 + dy).clamp(0, h as i32 - 1) as usize;
+            for k in 0..bw {
+                let px = ((bx + k) as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                s += real[(by + j) * w + bx + k].abs_diff(prev[py * w + px]) as u32;
+            }
+            if s >= limit {
+                return s;
+            }
+        }
+        s
+    };
+    let still = unlike(0, 0, u32::MAX);
+    let mut best = (still, 0, 0);
+    if still > (bw * bh) as u32 {
+        for dy in -REACH..=REACH {
+            for dx in -REACH..=REACH {
+                let s = unlike(dx, dy, best.0) + 4 * (dx.abs() + dy.abs()) as u32;
+                if s < best.0 {
+                    best = (s, dx, dy);
+                }
+            }
+        }
+        // Vectors are counted in quarter pixels from here on.
+        best = (best.0, 4 * best.1, 4 * best.2);
+        if quarter {
+            // Between the pixels: the eight places half a pixel around the best, then the eight a quarter around that.
+            // The frame before around the best place, one pixel wider on every side, and its
+            // three half-way pictures (to the right of a pixel, below it, the middle of four),
+            // worked out once: every place tried is one of these or the mean of two.
+            let g = |x: i32, y: i32| prev[y.clamp(0, h as i32 - 1) as usize * w + x.clamp(0, w as i32 - 1) as usize] as i32;
+            let (x0, y0) = (bx as i32 + best.1 / 4 - 1, by as i32 + best.2 / 4 - 1);
+            let (aw, ah) = (bw + 2, bh + 2);
+            let clip = |v: i32| v.clamp(0, 255);
+            let mut rows = [[0i32; BLOCK + 2]; BLOCK + 8];
+            for (j, row) in rows.iter_mut().enumerate().take(ah + 6) {
+                let y = y0 + j as i32 - 2;
+                for (k, v) in row.iter_mut().enumerate().take(aw) {
+                    let x = x0 + k as i32;
+                    *v = g(x - 2, y) - 5 * g(x - 1, y) + 20 * g(x, y) + 20 * g(x + 1, y) - 5 * g(x + 2, y) + g(x + 3, y);
+                }
+            }
+            let mut whole = [[0u8; BLOCK + 2]; BLOCK + 2];
+            let (mut right, mut below, mut middle) = (whole, whole, whole);
+            for j in 0..ah {
+                for k in 0..aw {
+                    let (x, y) = (x0 + k as i32, y0 + j as i32);
+                    whole[j][k] = g(x, y) as u8;
+                    right[j][k] = clip((rows[j + 2][k] + 16) >> 5) as u8;
+                    below[j][k] = clip((g(x, y - 2) - 5 * g(x, y - 1) + 20 * g(x, y) + 20 * g(x, y + 1) - 5 * g(x, y + 2) + g(x, y + 3) + 16) >> 5) as u8;
+                    middle[j][k] = clip((rows[j][k] - 5 * rows[j + 1][k] + 20 * rows[j + 2][k] + 20 * rows[j + 3][k] - 5 * rows[j + 4][k] + rows[j + 5][k] + 512) >> 10) as u8;
+                }
+            }
+            let centre = (best.1, best.2);
+            let unlike = |qx: i32, qy: i32, limit: u32| -> u32 {
+                // Where the place lies from the best whole place: a pixel of the pictures, and quarters past it.
+                let (ox, oy) = (qx - centre.0 + 4, qy - centre.1 + 4);
+                let (ix, iy, fx, fy) = ((ox >> 2) as usize, (oy >> 2) as usize, ox & 3, oy & 3);
+                let mean = |a: u8, b: u8| (a as i32 + b as i32 + 1) >> 1;
+                let mut s = 0u32;
                 for j in 0..bh {
-                    let py = ((by + j) as i32 + dy).clamp(0, h as i32 - 1) as usize;
                     for k in 0..bw {
-                        let px = ((bx + k) as i32 + dx).clamp(0, w as i32 - 1) as usize;
-                        s += real[(by + j) * w + bx + k].abs_diff(prev[py * w + px]) as u32;
+                        let (y, x) = (iy + j, ix + k);
+                        let there = match (fx, fy) {
+                            (0, 0) => whole[y][x] as i32,
+                            (1, 0) => mean(whole[y][x], right[y][x]),
+                            (2, 0) => right[y][x] as i32,
+                            (3, 0) => mean(whole[y][x + 1], right[y][x]),
+                            (0, 1) => mean(whole[y][x], below[y][x]),
+                            (0, 2) => below[y][x] as i32,
+                            (0, 3) => mean(whole[y + 1][x], below[y][x]),
+                            (2, 2) => middle[y][x] as i32,
+                            (2, 1) => mean(right[y][x], middle[y][x]),
+                            (2, 3) => mean(middle[y][x], right[y + 1][x]),
+                            (1, 2) => mean(below[y][x], middle[y][x]),
+                            (3, 2) => mean(middle[y][x], below[y][x + 1]),
+                            (1, 1) => mean(right[y][x], below[y][x]),
+                            (3, 1) => mean(right[y][x], below[y][x + 1]),
+                            (1, 3) => mean(below[y][x], right[y + 1][x]),
+                            _ => mean(below[y][x + 1], right[y + 1][x]),
+                        };
+                        s += (real[(by + j) * w + bx + k] as i32 - there).unsigned_abs();
                     }
                     if s >= limit {
                         return s;
@@ -1177,103 +1267,23 @@ fn find(w: usize, h: usize, real: &[u8], prev: &[u8], y0: usize, y1: usize, quar
                 }
                 s
             };
-            let still = unlike(0, 0, u32::MAX);
-            let mut best = (still, 0, 0);
-            if still > (bw * bh) as u32 {
-                for dy in -REACH..=REACH {
-                    for dx in -REACH..=REACH {
-                        let s = unlike(dx, dy, best.0) + 4 * (dx.abs() + dy.abs()) as u32;
-                        if s < best.0 {
-                            best = (s, dx, dy);
-                        }
+            for step in [2, 1] {
+                let (cx, cy) = (best.1, best.2);
+                for (ax, ay) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    let (qx, qy) = (cx + ax * step, cy + ay * step);
+                    let s = unlike(qx, qy, best.0) + (qx.abs() + qy.abs()) as u32 + 2;
+                    if s < best.0 {
+                        best = (s, qx, qy);
                     }
-                }
-                // Vectors are counted in quarter pixels from here on.
-                best = (best.0, 4 * best.1, 4 * best.2);
-                if quarter {
-                    // Between the pixels: the eight places half a pixel around the best, then the eight a quarter around that.
-                    // The frame before around the best place, one pixel wider on every side, and its
-                    // three half-way pictures (to the right of a pixel, below it, the middle of four),
-                    // worked out once: every place tried is one of these or the mean of two.
-                    let g = |x: i32, y: i32| prev[y.clamp(0, h as i32 - 1) as usize * w + x.clamp(0, w as i32 - 1) as usize] as i32;
-                    let (x0, y0) = (bx as i32 + best.1 / 4 - 1, by as i32 + best.2 / 4 - 1);
-                    let (aw, ah) = (bw + 2, bh + 2);
-                    let clip = |v: i32| v.clamp(0, 255);
-                    let mut rows = [[0i32; BLOCK + 2]; BLOCK + 8];
-                    for (j, row) in rows.iter_mut().enumerate().take(ah + 6) {
-                        let y = y0 + j as i32 - 2;
-                        for (k, v) in row.iter_mut().enumerate().take(aw) {
-                            let x = x0 + k as i32;
-                            *v = g(x - 2, y) - 5 * g(x - 1, y) + 20 * g(x, y) + 20 * g(x + 1, y) - 5 * g(x + 2, y) + g(x + 3, y);
-                        }
-                    }
-                    let mut whole = [[0u8; BLOCK + 2]; BLOCK + 2];
-                    let (mut right, mut below, mut middle) = (whole, whole, whole);
-                    for j in 0..ah {
-                        for k in 0..aw {
-                            let (x, y) = (x0 + k as i32, y0 + j as i32);
-                            whole[j][k] = g(x, y) as u8;
-                            right[j][k] = clip((rows[j + 2][k] + 16) >> 5) as u8;
-                            below[j][k] = clip((g(x, y - 2) - 5 * g(x, y - 1) + 20 * g(x, y) + 20 * g(x, y + 1) - 5 * g(x, y + 2) + g(x, y + 3) + 16) >> 5) as u8;
-                            middle[j][k] = clip((rows[j][k] - 5 * rows[j + 1][k] + 20 * rows[j + 2][k] + 20 * rows[j + 3][k] - 5 * rows[j + 4][k] + rows[j + 5][k] + 512) >> 10) as u8;
-                        }
-                    }
-                    let centre = (best.1, best.2);
-                    let unlike = |qx: i32, qy: i32, limit: u32| -> u32 {
-                        // Where the place lies from the best whole place: a pixel of the pictures, and quarters past it.
-                        let (ox, oy) = (qx - centre.0 + 4, qy - centre.1 + 4);
-                        let (ix, iy, fx, fy) = ((ox >> 2) as usize, (oy >> 2) as usize, ox & 3, oy & 3);
-                        let mean = |a: u8, b: u8| (a as i32 + b as i32 + 1) >> 1;
-                        let mut s = 0u32;
-                        for j in 0..bh {
-                            for k in 0..bw {
-                                let (y, x) = (iy + j, ix + k);
-                                let there = match (fx, fy) {
-                                    (0, 0) => whole[y][x] as i32,
-                                    (1, 0) => mean(whole[y][x], right[y][x]),
-                                    (2, 0) => right[y][x] as i32,
-                                    (3, 0) => mean(whole[y][x + 1], right[y][x]),
-                                    (0, 1) => mean(whole[y][x], below[y][x]),
-                                    (0, 2) => below[y][x] as i32,
-                                    (0, 3) => mean(whole[y + 1][x], below[y][x]),
-                                    (2, 2) => middle[y][x] as i32,
-                                    (2, 1) => mean(right[y][x], middle[y][x]),
-                                    (2, 3) => mean(middle[y][x], right[y + 1][x]),
-                                    (1, 2) => mean(below[y][x], middle[y][x]),
-                                    (3, 2) => mean(middle[y][x], below[y][x + 1]),
-                                    (1, 1) => mean(right[y][x], below[y][x]),
-                                    (3, 1) => mean(right[y][x], below[y][x + 1]),
-                                    (1, 3) => mean(below[y][x], right[y + 1][x]),
-                                    _ => mean(below[y][x + 1], right[y + 1][x]),
-                                };
-                                s += (real[(by + j) * w + bx + k] as i32 - there).unsigned_abs();
-                            }
-                            if s >= limit {
-                                return s;
-                            }
-                        }
-                        s
-                    };
-                    for step in [2, 1] {
-                        let (cx, cy) = (best.1, best.2);
-                        for (ax, ay) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
-                            let (qx, qy) = (cx + ax * step, cy + ay * step);
-                            let s = unlike(qx, qy, best.0) + (qx.abs() + qy.abs()) as u32 + 2;
-                            if s < best.0 {
-                                best = (s, qx, qy);
-                            }
-                        }
-                    }
-                }
-                // A place only a little more alike is the grain's doing.
-                if best.0 * 10 > still * 9 {
-                    best = (still, 0, 0);
                 }
             }
-            out.push((best.1, best.2));
+        }
+        // A place only a little more alike is the grain's doing.
+        if best.0 * 10 > still * 9 {
+            best = (still, 0, 0);
         }
     }
-    out
+    best
 }
 
 /// The frame before as the band's blocks see it: each block's samples from where its
@@ -2181,6 +2191,248 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
     Ok((out, struck))
 }
 
+/// THE FAR CACHE (--past, --ahead; `fbottle far`): a block may be guessed from any of
+/// the frames kept, not only the frame before. Which one is told for each block.
+
+/// A frame's light at a quarter of its size each way (the mean of every 4 x 4): by
+/// these the packer picks the kept frames worth a real look.
+pub fn thumb(geo: &Geometry, frame: &[u8]) -> Vec<u8> {
+    let (w, h) = (geo.width, geo.height);
+    let mut out = Vec::with_capacity(w.div_ceil(4) * h.div_ceil(4));
+    for y in (0..h).step_by(4) {
+        for x in (0..w).step_by(4) {
+            let (mut sum, mut n) = (0u32, 0u32);
+            for j in y..(y + 4).min(h) {
+                for v in &frame[j * w + x..j * w + (x + 4).min(w)] {
+                    sum += *v as u32;
+                    n += 1;
+                }
+            }
+            out.push(((sum + n / 2) / n) as u8);
+        }
+    }
+    out
+}
+
+/// For each block of light in rows `y0..y1`: which kept frame it is guessed from (0 is
+/// the nearest) and its vector there. The nearest is searched always; of the others the
+/// two whose small pictures are most like the block's (and more like it than the
+/// nearest's) are searched, and one is taken when it is alike by `eighths` eighths of
+/// the nearest's unlikeness or less.
+#[allow(clippy::too_many_arguments)]
+fn choose(w: usize, h: usize, real: &[u8], refs: &[&[u8]], small: &[u8], smalls: &[&[u8]], y0: usize, y1: usize, quarter: bool, eighths: u32) -> (Vec<u16>, Vec<(i32, i32)>) {
+    let (mut which, mut vectors) = (Vec::new(), Vec::new());
+    let tw = w.div_ceil(4);
+    for by in (y0..y1).step_by(BLOCK) {
+        for bx in (0..w).step_by(BLOCK) {
+            let (bw, bh) = (BLOCK.min(w - bx), BLOCK.min(h - by));
+            let near = find_block(w, h, real, refs[0], bx, by, quarter);
+            let mut best = (near.0, 0u16, near.1, near.2);
+            if refs.len() > 1 && near.0 > (bw * bh) as u32 {
+                let unlike = |r: usize| -> u32 {
+                    let mut s = 0;
+                    for j in by / 4..(by + bh).div_ceil(4) {
+                        let (a, b) = (&small[j * tw + bx / 4..j * tw + (bx + bw).div_ceil(4)], &smalls[r][j * tw + bx / 4..j * tw + (bx + bw).div_ceil(4)]);
+                        s += a.iter().zip(b).map(|(a, b)| a.abs_diff(*b) as u32).sum::<u32>();
+                    }
+                    s
+                };
+                let nearest = unlike(0);
+                let mut top = [(u32::MAX, 0usize); 2];
+                for r in 1..refs.len() {
+                    let s = unlike(r);
+                    if s < nearest && s < top[1].0 {
+                        top[1] = (s, r);
+                        if top[1].0 < top[0].0 {
+                            top.swap(0, 1);
+                        }
+                    }
+                }
+                for (s, r) in top {
+                    if s != u32::MAX {
+                        let f = find_block(w, h, real, refs[r], bx, by, quarter);
+                        if 8 * (f.0 + 32) < eighths * near.0 && f.0 < best.0 {
+                            best = (f.0, r as u16, f.1, f.2);
+                        }
+                    }
+                }
+            }
+            which.push(best.1);
+            vectors.push((best.2, best.3));
+        }
+    }
+    (which, vectors)
+}
+
+/// The kept frames as the band's blocks see them: each block's samples from the frame
+/// it is guessed from, where its vector points (as `moved` lays them).
+#[allow(clippy::too_many_arguments)]
+fn moved_far(mv: &mut Vec<u8>, part: &mut Vec<u8>, refs: &[[&[u8]; 3]], p: usize, used: &[u16], which: &[u16], (w, h): (usize, usize), y0: usize, rows: usize, vectors: &[(i32, i32)], across: usize, shift: usize, halve: bool) {
+    if used.len() == 1 {
+        return moved(mv, refs[used[0] as usize][p], 0, (w, h), y0, rows, vectors, across, shift, halve);
+    }
+    let sw = w + 2 * PAD;
+    mv.clear();
+    mv.resize((rows + PAD + 1) * sw, 0);
+    let (block_rows, block_cols) = ((vectors.len() / across).max(1), w.div_ceil(1 << shift).min(across));
+    let mut own = Vec::with_capacity(vectors.len());
+    for r in used {
+        // The blocks of other frames stay where they are here (their samples are not taken).
+        own.clear();
+        own.extend(vectors.iter().zip(which).map(|(v, x)| if x == r { *v } else { (0, 0) }));
+        moved(part, refs[*r as usize][p], 0, (w, h), y0, rows, &own, across, shift, halve);
+        for row in -(PAD as i32)..=rows as i32 {
+            let br = ((row.clamp(0, rows as i32 - 1) as usize) >> shift).min(block_rows - 1);
+            let o = (row + PAD as i32) as usize * sw + PAD;
+            for bc in (0..block_cols).filter(|bc| which[br * across + bc] == *r) {
+                let (a, b) = (if bc == 0 { o - PAD } else { o + (bc << shift) }, if bc == block_cols - 1 { o + w + PAD } else { o + ((bc + 1) << shift) });
+                mv[a..b].copy_from_slice(&part[a..b]);
+            }
+        }
+    }
+}
+
+/// One band guessed from the kept frames (`refs`, the nearest first): which frame each
+/// block is guessed from (told from the block to its left, when there is more than one
+/// frame), its vectors, its light, its two colours; written, or read into `cur`. Gives
+/// which frame each block was guessed from.
+#[allow(clippy::too_many_arguments)]
+fn band_far<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], refs: &[[&[u8]; 3]], mut which: Vec<u16>, mut vectors: Vec<(i32, i32)>, y0: usize, y1: usize, how: How) -> Vec<u16> {
+    let (w, h) = (geo.width, geo.height);
+    let (cw, ch) = (geo.planes[1].w, geo.planes[1].h);
+    let (c0, _) = colour_rows(geo, y0, y1);
+    let across = w.div_ceil(BLOCK);
+    let blocks = across * (y1 - y0).div_ceil(BLOCK);
+    which.resize(blocks, 0);
+    vectors.resize(blocks, (0, 0));
+    if refs.len() > 1 {
+        for k in 0..blocks {
+            let left = if k % across > 0 { which[k - 1] as i32 } else { 0 };
+            which[k] = (left + number(c, &mut m.far[(left > 0) as usize], which[k] as i32 - left)).clamp(0, refs.len() as i32 - 1) as u16;
+        }
+    }
+    let unit = if how.quarter { 1 } else { 4 };
+    for k in 0..blocks {
+        let from = if k % across > 0 { vectors[k - 1] } else { (0, 0) };
+        vectors[k] = (from.0 + unit * number(c, &mut m.vector[0], (vectors[k].0 - from.0) / unit), from.1 + unit * number(c, &mut m.vector[1], (vectors[k].1 - from.1) / unit));
+    }
+    let [light, first, second] = cur;
+    let (rows, colour_rows) = (light.len() / w, first.len() / cw);
+    let mut room = std::mem::take(&mut m.room);
+    let Room { px, moved: mv, res, ec, eu } = &mut room;
+    for (r, len) in res.iter_mut().zip([(rows + PAD) * (w + 2 * PAD), (colour_rows + PAD) * (cw + 2 * PAD), (colour_rows + PAD) * (cw + 2 * PAD)]) {
+        if r.len() != len {
+            r.clear();
+            r.resize(len, 0);
+        }
+    }
+    let [res_light, res_first, res_second] = res;
+    (m.plates, m.pyramid) = (0, false);
+    let mut used = which.clone();
+    used.sort_unstable();
+    used.dedup();
+    let mut part = Vec::new();
+    moved_far(mv, &mut part, refs, 0, &used, &which, (w, h), y0, rows, &vectors, across, 4, false);
+    plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two, how.tones);
+    moved_far(mv, &mut part, refs, 1, &used, &which, (cw, ch), c0, colour_rows, &vectors, across, 3, true);
+    plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two, how.tones);
+    moved_far(mv, &mut part, refs, 2, &used, &which, (cw, ch), c0, colour_rows, &vectors, across, 3, true);
+    plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two, how.tones);
+    m.room = room;
+    which
+}
+
+/// Packs a frame exactly from the kept frames `refs` (the nearest first; none: the frame
+/// stands alone), whose small pictures are `smalls` (`small`: the frame's own). With one
+/// kept frame the bytes are `pack`'s. Gives the bytes, and which kept frame each block
+/// was guessed from (nothing for a frame that stands alone or is the nearest over again).
+#[allow(clippy::too_many_arguments)]
+pub fn pack_far(geo: &Geometry, frame: &[u8], refs: &[&[u8]], small: &[u8], smalls: &[&[u8]], bands: usize, memory: &mut Memory, how: How) -> (Vec<u8>, Vec<u16>) {
+    assert!(!how.gold && how.plates == 0 && how.light == 0, "the far cache goes with the learning mix, without the light map");
+    if refs.is_empty() {
+        return (pack(geo, frame, None, bands, memory, how), Vec::new());
+    }
+    let mut out = head_of(FROM_BEFORE, bands, how).to_vec();
+    if refs[0] == frame {
+        out[0] |= STILL;
+        return (out, Vec::new());
+    }
+    let real = planes(geo, frame);
+    let far: Vec<[&[u8]; 3]> = refs.iter().map(|r| planes(geo, r)).collect();
+    let lights: Vec<&[u8]> = far.iter().map(|p| p[0]).collect();
+    let rows = band_rows(geo, bands);
+    let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
+    memory.ready(starts.len(), false);
+    let eighths: u32 = std::env::var("FB_FAR_EIGHTHS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+    let done: Vec<(Vec<u8>, Vec<u16>)> = starts
+        .par_iter()
+        .zip(memory.0.par_iter_mut())
+        .map(|(y0, m)| {
+            let y0 = *y0;
+            let y1 = (y0 + rows).min(geo.height);
+            let (which, vectors) = choose(geo.width, geo.height, real[0], &lights, small, smalls, y0, y1, how.quarter, eighths);
+            let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
+            let mut c = Writer(Encoder::new(), [0.0; 7], 0);
+            let which = band_far(geo, &mut c, m, [&mut a, &mut b, &mut d], &far, which, vectors, y0, y1, how);
+            MISSED.fetch_add(c.2, Ordering::Relaxed);
+            (c.0.finish(), which)
+        })
+        .collect();
+    for (bytes, _) in &done {
+        out.extend((bytes.len() as u32).to_le_bytes());
+    }
+    for (bytes, _) in &done {
+        out.extend(bytes);
+    }
+    (out, done.into_iter().flat_map(|d| d.1).collect())
+}
+
+/// The player for `pack_far`: the frame, exactly, from the same kept frames.
+pub fn unpack_far(geo: &Geometry, payload: &[u8], refs: &[&[u8]], memory: &mut Memory) -> Result<Vec<u8>, String> {
+    if !from_before(payload) {
+        return unpack(geo, payload, None, memory);
+    }
+    if payload.len() < HEAD || !crate::block::fits(geo) || refs.is_empty() || refs.iter().any(|r| r.len() != geo.frame_len()) {
+        return Err("a mixed frame was rebuilt without the frames it is guessed from".into());
+    }
+    if payload[0] & STILL != 0 {
+        return Ok(refs[0].to_vec());
+    }
+    let rows = band_rows(geo, bands_of(payload));
+    let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
+    let mut data = HEAD + 4 * starts.len();
+    let mut coded = Vec::new();
+    for i in 0..starts.len() {
+        let len = payload.get(HEAD + 4 * i..HEAD + 4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize).ok_or("a mixed frame is cut")?;
+        coded.push(payload.get(data..data + len).ok_or("a mixed frame is cut")?);
+        data += len;
+    }
+    let far: Vec<[&[u8]; 3]> = refs.iter().map(|r| planes(geo, r)).collect();
+    let cw = geo.planes[1].w;
+    memory.ready(starts.len(), false);
+    let made: Vec<[Vec<u8>; 3]> = starts
+        .par_iter()
+        .zip(coded)
+        .zip(memory.0.par_iter_mut())
+        .map(|((y0, bytes), m)| {
+            let y1 = (y0 + rows).min(geo.height);
+            let (c0, c1) = colour_rows(geo, *y0, y1);
+            let mut cur = [vec![0u8; (y1 - y0) * geo.width], vec![0u8; (c1 - c0) * cw], vec![0u8; (c1 - c0) * cw]];
+            let [a, b, d] = &mut cur;
+            let mut c = Reader(Decoder::new(bytes));
+            band_far(geo, &mut c, m, [a, b, d], &far, Vec::new(), Vec::new(), *y0, y1, how_of(payload));
+            cur
+        })
+        .collect();
+    let mut out = Vec::with_capacity(geo.frame_len());
+    for p in 0..3 {
+        for b in &made {
+            out.extend(&b[p]);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2221,6 +2473,27 @@ mod tests {
                 assert_eq!(unpack(&geo, &same, Some(&b), &mut player).unwrap(), b);
                 let third = pack(&geo, &wild, Some(&b), bands, &mut packer, how);
                 assert_eq!(unpack(&geo, &third, Some(&b), &mut player).unwrap(), wild, "{w}x{h} noise, {bands} bands");
+                // The far cache: with one frame kept the bytes are the packer's; with several, every frame comes back.
+                if how.light == 0 {
+                    let (mut far_packer, mut far_player) = (Memory::new(), Memory::new());
+                    let (alone, _) = pack_far(&geo, &a, &[], &thumb(&geo, &a), &[], bands, &mut far_packer, how);
+                    assert_eq!(alone, first);
+                    assert_eq!(pack_far(&geo, &b, &[&a], &thumb(&geo, &b), &[&thumb(&geo, &a)], bands, &mut far_packer, how).0, second, "{w}x{h}, {bands} bands: one frame kept packs as the packer does");
+                    assert_eq!(unpack_far(&geo, &alone, &[], &mut far_player).unwrap(), a);
+                    assert_eq!(unpack_far(&geo, &second, &[&a], &mut far_player).unwrap(), b);
+                    // A frame made of pieces of three others: the pieces are found in the frames kept.
+                    let mut pieces = b.clone();
+                    for (i, v) in pieces.iter_mut().enumerate() {
+                        let x = (i % w) * 3 / w;
+                        *v = [a[i], wild[i], b[i]][x];
+                    }
+                    let kept: [&[u8]; 3] = [&b, &wild, &a];
+                    let smalls: Vec<Vec<u8>> = kept.iter().map(|f| thumb(&geo, f)).collect();
+                    let (packed, which) = pack_far(&geo, &pieces, &kept, &thumb(&geo, &pieces), &smalls.iter().map(|s| &s[..]).collect::<Vec<_>>(), bands, &mut far_packer, how);
+                    assert!(w < 64 || which.iter().any(|r| *r > 0), "{w}x{h}, {bands} bands: no block was guessed from a frame further off");
+                    assert_eq!(unpack_far(&geo, &packed, &kept, &mut far_player).unwrap(), pieces, "{w}x{h}, {bands} bands: the far cache");
+                    assert_eq!(unpack_far(&geo, &pack_far(&geo, &b, &kept, &thumb(&geo, &b), &smalls.iter().map(|s| &s[..]).collect::<Vec<_>>(), bands, &mut far_packer, how).0, &kept, &mut far_player).unwrap(), b);
+                }
                 // The strike gives the same bytes and the same frames, whatever the window.
                 let mut slid = a.clone();
                 slid.copy_within(0..w * h - 3, 3);
