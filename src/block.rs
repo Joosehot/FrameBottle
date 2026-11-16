@@ -40,6 +40,10 @@ const TILE: usize = 16;
 pub static SPENT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 /// Whether the spending is counted (the command's --breakdown).
 pub static COUNTING: AtomicBool = AtomicBool::new(false);
+/// The tiles of the frames between two, as the packer chose them: all, skipped (the
+/// picture where the engine predicted it, nothing put right), from the frame before,
+/// from the frame after, the mean of both, both with one weighing three times the other.
+pub static SHARES: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 thread_local! {
     /// What the bits written now are for (an index into SPENT).
     static WHAT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -154,6 +158,8 @@ struct Learned {
     /// Is a wave more than one step, more than two? By light or colour and the waves next to it.
     more: [u16; 2 * 4 * 2],
     sign: [u16; 2],
+    /// Of a tile between two frames: does one of them weigh three times the other, and is it the frame after?
+    lean: [u16; 2],
     /// For a tile of light taken as one block of 16 x 16: is it? (by whether the tile to
     /// the left was); has it any wave; where the last one is (8 binary digits); is a wave
     /// left, is it more than one step or two, and how many more.
@@ -168,7 +174,7 @@ struct Learned {
 
 impl Learned {
     fn new() -> Learned {
-        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], skip: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
+        Learned { moved: [HALF; 3], stack: [HALF; 2], split: [HALF; 2], between: [HALF; 2], after: HALF, around: [HALF; 3], skip: [HALF; 3], vector: [([HALF; 32], [HALF; 2]); 2], any: [HALF; 4], last: [[HALF; 64]; 2], left: [HALF; 72], more: [HALF; 16], sign: [HALF; 2], lean: [HALF; 2], big: [HALF; 2], any16: HALF, last16: [HALF; 256], left16: [HALF; 42], more16: [HALF; 8], size16: [[HALF; 32]; 7], size: [[HALF; 32]; 12] }
     }
 }
 
@@ -827,6 +833,8 @@ enum Kind {
     Between((i32, i32)),
     /// The frame after, by one vector (for a frame between two).
     After((i32, i32)),
+    /// As Between, but one of the two weighs three times the other (true: the frame after).
+    Lean((i32, i32), bool),
 }
 
 /// A vector, in quarter pixels.
@@ -971,6 +979,15 @@ fn guess_of(geo: &Geometry, at: &[usize], f: &From, i: usize, (bx, by): (usize, 
             for j in 0..8 {
                 for k in 0..8 {
                     guess[j * 8 + k] = (sample(&bp, bx + k, by + j, -d.0, -d.1) + sample(&ap, bx + k, by + j, d.0, d.1) + 1) >> 1;
+                }
+            }
+        }
+        Kind::Lean(d, after) => {
+            let (bp, ap) = (pic(geo, at, f.before.unwrap(), i), pic(geo, at, f.after.unwrap(), i));
+            let (wb, wa) = if *after { (1, 3) } else { (3, 1) };
+            for j in 0..8 {
+                for k in 0..8 {
+                    guess[j * 8 + k] = (wb * sample(&bp, bx + k, by + j, -d.0, -d.1) + wa * sample(&ap, bx + k, by + j, d.0, d.1) + 2) >> 2;
                 }
             }
         }
@@ -1308,6 +1325,10 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                             let ap = pic(geo, &at, after, 0);
                             let d = find_between(&s, &bp, &ap, x0, y0);
                             ways.push((Kind::Between(d), 3 + vector_bits((d.0 - guess_between.0, d.1 - guess_between.1))));
+                            if how.blend {
+                                ways.push((Kind::Lean(d, false), 5 + vector_bits((d.0 - guess_between.0, d.1 - guess_between.1))));
+                                ways.push((Kind::Lean(d, true), 5 + vector_bits((d.0 - guess_between.0, d.1 - guess_between.1))));
+                            }
                             let (ax, ay, _) = find(&s, 16, &ap, x0, y0, (how.range as i32, how.still), (-dx, -dy));
                             ways.push((Kind::After((ax, ay)), 4 + vector_bits((ax - guess_after.0, ay - guess_after.1))));
                             if f.trails.is_some() {
@@ -1365,10 +1386,13 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
                         vs = [vs[0]; 4];
                     }
                     kind = Kind::Moved(vs, split);
-                } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_))) {
-                    let wd = if let Kind::Between(d) = want { d } else { (0, 0) };
+                } else if f.after.is_some() && c.bit(&mut l.between[left_between as usize], matches!(want, Kind::Between(_) | Kind::Lean(..))) {
+                    let wd = if let Kind::Between(d) | Kind::Lean(d, _) = want { d } else { (0, 0) };
+                    let lean = how.blend && c.bit(&mut l.lean[0], matches!(want, Kind::Lean(..)));
+                    let after = lean && c.bit(&mut l.lean[1], matches!(want, Kind::Lean(_, true)));
                     spending(1);
-                    kind = Kind::Between((guess_between.0 + c.signed(&mut l.vector[0], wd.0 - guess_between.0), guess_between.1 + c.signed(&mut l.vector[1], wd.1 - guess_between.1)));
+                    let d = (guess_between.0 + c.signed(&mut l.vector[0], wd.0 - guess_between.0), guess_between.1 + c.signed(&mut l.vector[1], wd.1 - guess_between.1));
+                    kind = if lean { Kind::Lean(d, after) } else { Kind::Between(d) };
                     spending(0);
                 } else if f.after.is_some() && c.bit(&mut l.after, matches!(want, Kind::After(_))) {
                     let wv = if let Kind::After(v) = want { v } else { (0, 0) };
@@ -1474,7 +1498,14 @@ fn band(geo: &Geometry, t: &Tables, src: Option<&[u8]>, f: &From, how: &How, ty0
             above_skip[tx] = skip;
             left_models = Some(models);
             field[(ty - ty0) * across + tx] = if let Kind::Moved(v, _) = kind { Some(v[0]) } else { None };
-            left_between = matches!(kind, Kind::Between(_));
+            left_between = matches!(kind, Kind::Between(_) | Kind::Lean(..));
+            if src.is_some() && f.after.is_some() {
+                let which = if skip { 1 } else { match kind { Kind::Moved(..) => 2, Kind::After(_) => 3, Kind::Between(_) => 4, Kind::Lean(..) => 5, _ => 0 } };
+                SHARES[0].fetch_add(1, Ordering::Relaxed);
+                if which > 0 {
+                    SHARES[which].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             left_big = big;
             any_left = true;
         }
@@ -1568,6 +1599,8 @@ const HEAD: usize = 9;
 const PUT_RIGHT: u8 = 64;
 /// The frame was packed with the Predictive Motion Engine.
 const PREDICT: u8 = 128;
+/// The frame's tiles between two frames say whether one weighs more (--blend).
+const BLEND: u8 = 1;
 
 /// The vector most tiles of the frame have: every third tile each way is looked for in
 /// the frame before, and the commonest answer is taken.
@@ -1675,6 +1708,8 @@ pub struct How {
     pub group: usize,
     /// The packer may keep a tile's light as one block of 16 x 16.
     pub large: bool,
+    /// A tile between two frames may weigh one of them three times the other (the command's --blend).
+    pub blend: bool,
 }
 
 /// Packs a frame in AV1's way. `before` is the frame before as the player
@@ -1745,7 +1780,7 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, after: Option<&
     if any_off {
         put_right(geo, &mut rebuilt, &off);
     }
-    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 }) | (if predicts { PREDICT } else { 0 })];
+    let mut out = vec![(if any_off { PUT_RIGHT } else { 0 }) | (if before.is_some() { FROM_BEFORE } else { 0 }) | (if with_books { BOOKS } else { 0 }) | (if four { FOUR } else { 0 }) | (if plain { PLAIN } else { 0 }) | (if after.is_some() { BETWEEN } else { 0 }) | (if predicts { PREDICT } else { 0 }) | (if how.blend && after.is_some() { BLEND } else { 0 })];
     out.extend((bands as u16).to_le_bytes());
     out.push(coarse);
     out.push(how.slope);
@@ -1806,7 +1841,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, after: Opti
         }
         head += 96;
     }
-    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1, large: false };
+    let how = How { range: 0, slope: payload[4], dead: 1, still: 0, weigh: 0.0, between: 1.0, group: 1, large: false, blend: payload[0] & BLEND != 0 };
     let (bands, t) = (u16::from_le_bytes([payload[1], payload[2]]) as usize, Tables::new(payload[3], payload[4]));
     let rows = band_rows(geo, bands);
     let tile_rows = geo.height.div_ceil(TILE);
@@ -1855,7 +1890,7 @@ mod tests {
         let mut s = 7u32;
         let a: Vec<u8> = (0..geo.frame_len()).map(|i| { s = s.wrapping_mul(1664525).wrapping_add(1013904223); ((i % 70) as u32 * 3 + (s >> 29)) as u8 }).collect();
         let b: Vec<u8> = a.iter().map(|v| v.wrapping_add(2)).collect();
-        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true };
+        let how = How { range: 7, slope: 32, dead: 12, still: 256, weigh: 0.1, between: 1.0, group: 2, large: true, blend: false };
         for (coarse, with) in [(1u8, false), (6, true), (20, true), (6, false)] {
             let (mut packer, mut player): (Vec<Book>, Vec<Book>) = (Vec::new(), Vec::new());
             let (mut engine, mut engine_of_player) = (Motion::new(4), Motion::new(4));

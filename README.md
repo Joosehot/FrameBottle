@@ -1294,3 +1294,48 @@ On the first 60 frames of `guitar_10s.mp4` the order 0, 2, 1, 4, 3 ... had been 
 smaller than the mix (18 794 510 against 19 360 120 bytes), and periods of 4 and 8
 larger by 1.8 % and 3.0 %. On the 900 frames the same order is 6.4 % larger: what 60
 frames of one clip showed did not hold on another.
+
+### The frames between two, swept (`--group N`, `--bsteps X`, `--blend`; 2026-11-16)
+
+`--between` already packs the frames in groups (the group's last frame first, then the
+frames between, halving), lets each tile come from the frame before, the frame after
+or the mean of both, skips tiles, and gives the frames between longer steps. Three
+flags make its numbers free and add one way:
+
+- `--group N`: the frames of a group (rules.toml says 4),
+- `--bsteps X`: how much longer the steps of a frame between two are (2.1),
+- `--blend`: a tile between two may weigh one frame three times the other (told by two
+  learned yes/no after "the mean of both").
+
+The packer now prints what the tiles of the frames between two came from. Measured on
+`guitar_10s.mp4` with `--coarse 9 --between --predict` (size, VMAF, tiles skipped /
+from before / from after / the mean):
+
+| group | bsteps | bytes | PSNR | VMAF | skipped | before | after | mean |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1.6 | 4 869 812 | 46.18 | 95.91 | 66.9 % | 6.5 % | 16.3 % | 9.5 % |
+| 2 | 2.1 | 4 654 555 | 46.01 | 95.68 | 70.9 % | 5.6 % | 14.8 % | 7.9 % |
+| 2 | 2.7 | 4 564 660 | 45.86 | 95.53 | 74.4 % | 5.0 % | 13.0 % | 6.9 % |
+| 4 | 1.6 | 4 524 865 | 46.05 | 95.66 | 64.1 % | 11.3 % | 14.2 % | 9.2 % |
+| 4 | 2.1 | 4 052 624 | 45.75 | 95.22 | 69.1 % | 8.4 % | 13.4 % | 8.0 % |
+| 4 | 2.7 | 3 837 432 | 45.53 | 94.91 | 72.1 % | 7.5 % | 12.3 % | 7.1 % |
+| 8 | 1.6 | 4 572 374 | 45.94 | 95.41 | 59.9 % | 15.7 % | 12.5 % | 10.2 % |
+| 8 | 2.1 | 3 865 522 | 45.48 | 94.72 | 65.9 % | 10.9 % | 12.1 % | 9.4 % |
+| 8 | 2.7 | 3 527 793 | 45.16 | 94.21 | 68.8 % | 9.6 % | 11.5 % | 8.7 % |
+
+Packing takes 60 to 77 s, playing every frame 3.8 to 4.6 s of work (13 to 15 ms a frame).
+
+At VMAF 95 (between measured points, straight lines in the logarithm of the size):
+
+| | bytes at VMAF 95 |
+|---|---|
+| group 4, bsteps 2.1 (as it was; coarse 8 to 14 measured) | 3 840 645 |
+| group 4, bsteps 1.6 (coarse 9 to 11) | 3 811 310 (0.96 % fewer bytes over VMAF 94.55 to 95.66) |
+| group 4, bsteps 2.1, `--blend` (coarse 9 and 10) | 3 843 941 (0.08 % more; 2.3 to 2.5 % of the tiles weigh one frame more) |
+| libaom AV1, crf 26 | 1 455 077 at VMAF 94.99 |
+
+Against libaom (crf 26, 32, 38: 1 455 077 / 903 837 / 600 212 bytes at VMAF 94.99 /
+93.54 / 91.82) the bottle (coarse 8 to 14: 4 700 703 / 4 052 624 / 3 608 666 /
+2 916 439 / 2 468 803 bytes at VMAF 95.69 / 95.22 / 94.74 / 93.71 / 92.63) takes 200.7 %
+more bytes at the same VMAF, averaged over VMAF 92.63 to 94.99 (three times the size).
+Groups of 2 and of 8 were measured at coarse 9 only.

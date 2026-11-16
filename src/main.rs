@@ -555,6 +555,11 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
     }
     if sizes[0] > 0 {
         println!("SIZES  the first frame {} bytes; the frames guessed from the one before {} bytes; the frames between two {} bytes", sizes[0], sizes[1], sizes[2]);
+        let shares: Vec<u64> = block::SHARES.iter().map(|s| s.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        if shares[0] > 0 {
+            let of = |k: usize| 100.0 * shares[k] as f64 / shares[0] as f64;
+            println!("BETWEEN  groups of {}, steps {} times longer: of {} tiles {:.1} % skipped, {:.1} % from the frame before, {:.1} % from the frame after, {:.1} % the mean of both, {:.1} % both with one weighing more, {:.1} % from the tile's own surroundings", rules.blocks.group, rules.blocks.between, shares[0], of(1), of(2), of(3), of(4), of(5), 100.0 - of(1) - of(2) - of(3) - of(4) - of(5));
+        }
     }
     if let Some(l) = &light {
         println!("LIGHT  brightness kept as level numbers: {} of {} frames store a grid, the others use the one before", l.stored, l.frames);
@@ -862,6 +867,9 @@ fn run() -> Result<(), String> {
             "--near" => plan.near = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--near needs a number of frames, 1 or more")?,
             "--ahead" => plan.period = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--ahead needs a number of frames, 1 or more")?,
             "--sparse" => plan.sparse = true,
+            "--group" => rules.blocks.group = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=32).contains(n)).ok_or("--group needs a number of frames from 1 to 32")?,
+            "--bsteps" => rules.blocks.between = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1.0).ok_or("--bsteps needs a number, 1 or more")?,
+            "--blend" => rules.blocks.blend = true,
             "--chunk" => rules.chunk = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--chunk needs a whole number, 1 or more")?,
             "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
             "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,
