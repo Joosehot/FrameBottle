@@ -1,7 +1,7 @@
 //! A trial bench for the exact packers: frames from a raw yuv420p file, packed and
 //! unpacked in memory by the strike, with the size, the times and whether every sample
 //! came back. FB_HOW: the light map (0, 1, 2), then t (two guessers), q (vectors to a
-//! quarter), g (fixed weights). FB_CHUNK: the frames of a stretch (each starts with a
+//! quarter), g (fixed weights), s (a miss as bit sheets). FB_CHUNK: the frames of a stretch (each starts with a
 //! frame that stands alone). FB_WINDOW: the player's window.
 
 use crate::mix;
@@ -19,7 +19,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         all.push(f);
     }
     let said = std::env::var("FB_HOW").unwrap_or_default();
-    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g') };
+    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g'), sheets: said.contains('s') };
     let chunk: usize = std::env::var("FB_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(frames).max(1);
     let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     let refs: Vec<&[u8]> = all.iter().map(|f| &f[..]).collect();

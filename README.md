@@ -1093,3 +1093,17 @@ of the light (their top sheets are nearly all zeros: the match says little there
 Bytes by sheet, the frame before alone, 7 to 0: the samples 8.5, 13.5, 22.6, 35.6, 49.3,
 66.5, 86.6, 102.6 million; the misses 0.05, 0.1, 0.7, 2.6, 6.9, 18.1, 52.4, 49.8 million.
 The mix writes a whole miss at once, so its bytes cannot be told sheet by sheet.
+
+**The sheets inside the mix (`--mix --sheets`).** A miss is told as 0, 1, 2, 3 ... (for
+0, -1, 1, -2 ...) and written as its eight bits, the top one first; each bit is said by
+the mix's three learners mixed, who stand where the sample stands and know every bit
+above the one asked. guitar_10s.mp4, 16 bands, exact (every frame by its hash, `fbottle
+raw` byte for byte):
+
+| | bytes | packing | unpacking |
+|---|---|---|---|
+| `--mix --quarter` | 96 201 938 | 26.4 s | 9.9 s |
+| `--mix --quarter --sheets` | 101 152 027 | 44.3 s | 25.1 s |
+
+5.1 % larger, unpacking 2.5 times slower (eight mixed yes/nos for every sample; the
+mix's own way asks about two or three).

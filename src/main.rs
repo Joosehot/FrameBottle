@@ -67,6 +67,7 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
                                          --chunk N: the frames of a stretch (60); each stretch starts with a frame that stands alone
              [--quarter]                 with --mix: vectors to a quarter of a pixel
              [--two]                     with --mix: only the two learning guessers are weighed for the guess
+             [--sheets]                  with --mix: a miss is written as eight bit sheets, the top bit first, the learners knowing the bits above
              [--bands N]                 with --mix: the bands a frame is cut into (16)
              [--window N]                with --mix, and for play: the frames the strike lets in at once (32)
              [--line]                    exact, but each sample first says whether it stayed what it was
@@ -296,7 +297,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 mix_memory = mix::Memory::new();
             }
             let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
-            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter, rules.golden, rules.chunk)).as_bytes());
+            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter, rules.golden, rules.chunk, rules.sheets)).as_bytes());
             // The map: each frame's brand (alone: its own; else it names every frame so far),
             // and what Nimbus already holds under it.
             let keys: Vec<String> = raws
@@ -331,7 +332,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
-                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden };
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, sheets: rules.sheets };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
                 let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
@@ -849,6 +850,7 @@ fn run() -> Result<(), String> {
             "--relight" => rules.relight = 2,
             "--relight-offset" => rules.relight = 1,
             "--two" => rules.two = true,
+            "--sheets" => rules.sheets = true,
             "--quarter" => rules.quarter = true,
             "--golden" => rules.golden = true,
             "--chunk" => rules.chunk = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--chunk needs a whole number, 1 or more")?,
