@@ -213,7 +213,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
     println!("{frames} frames of {w} x {h}, yuv420p as they are (already light and two colours: no colour transform is made)");
     let raw = study("the samples themselves", &geo, &all, bands);
     // What the mix's guess missed by, frame by frame (vectors to a quarter, the mix that learns).
-    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false };
+    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false, plates: 0 };
     let mut memory = mix::Memory::new();
     let from = Instant::now();
     let (mut mixed, mut misses) = (0, Vec::new());

@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usize) -> Result<(), String> {
     let geo = Geometry::of("yuv420p", w, h).ok_or("no such geometry")?;
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false };
+    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false, plates: 0 };
     let mut memory = mix::Memory::new();
     let at = geo.offsets();
     let (mut before, mut bytes) = (Vec::new(), 0usize);

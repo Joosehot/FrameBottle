@@ -280,7 +280,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
     let at = geo.offsets();
     let planes: Vec<(usize, usize)> = (0..3).map(|k| (at[k], at[k] + geo.planes[k].len())).collect();
     let raw = study("the samples themselves", &["light", "colour 1", "colour 2"], &all, &|_| planes.clone(), pixels);
-    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false };
+    let how = mix::How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false, plates: 0 };
     let mut memory = mix::Memory::new();
     let from = Instant::now();
     let (mut packed, mut misses) = (Vec::new(), Vec::new());

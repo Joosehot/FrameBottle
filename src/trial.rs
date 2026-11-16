@@ -19,7 +19,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         all.push(f);
     }
     let said = std::env::var("FB_HOW").unwrap_or_default();
-    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g'), tones: said.contains('c'), pyramid: said.contains('p') };
+    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g'), tones: said.contains('c'), pyramid: said.contains('p'), plates: if said.contains('X') { 2 } else if said.contains('P') { 1 } else { 0 } };
     let chunk: usize = std::env::var("FB_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(frames).max(1);
     let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     let refs: Vec<&[u8]> = all.iter().map(|f| &f[..]).collect();
@@ -39,6 +39,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
     })?;
     let unpack_time = from.elapsed().as_secs_f64();
     let bytes: usize = packed.iter().map(|p| p.len()).sum();
+    println!("a guess is off by {:.4} on average; {:.4} bits a pixel", mix::MISSED.load(std::sync::atomic::Ordering::Relaxed) as f64 / (frames * geo.frame_len()) as f64, 8.0 * bytes as f64 / (frames * w * h) as f64);
     println!(
         "{how:?}, {bands} bands, stretches of {chunk}, a window of {window}: {bytes} bytes for {frames} frames; pack {:.1} ms a frame (vectors {:.1}, weights {:.1}; busy {:.0} %), unpack {:.1} ms a frame ({} workers, busy {:.0} %); {same} of {frames} identical",
         1000.0 * pack_time / frames as f64,

@@ -1193,3 +1193,42 @@ one another), which is not done. On the way (60 frames): four neighbours and how
 they changed as the surroundings +13.8 % against the rows; the last kind of pass given
 its four cornerwise neighbours +13.0 %; the mean of the four against the guess as a part
 of the surroundings +7.1 %.
+
+### Pressure plates (`--plates N`, 2026-11-16)
+
+The owner's design, behind a flag (nothing else is changed). Every sample already told
+around the one asked (left, above, above left and right, two away, and the frame before
+at the same place and around it) presses on the guess. How hard each presses is not
+learned by the player: where the sample stands is told as one of 60 numbers (which way
+an edge runs, in 5 steps as CALIC tells it; how much the four neighbours changed since
+the frame before, in 4; how rough it is here, in 3; a frame that stands alone: the edge
+and the roughness in 4), and each number has its own fixed set of weights, its plate.
+The guess is one lookup and one weighed sum in whole numbers, the same in the packer and
+the player. The packer works the plates out for each stretch of film (`--chunk N`, 60)
+by least squares from every fourth frame, and keeps them in the head of the stretch's
+first frame: 360 plates (3 planes, with a frame before and alone), 23 040 bytes a stretch.
+
+Three ways: `--plates 1`, the plates are the guess in place of the mix's four guessers
+(nothing learned for the guess; the misses written by the mix's learners); `--plates 2`,
+the plates are a fifth guesser weighed with the four; `--golden --plates 1`, the plates
+in place of golden's one set of weights (no learning guessers, one learner for each
+yes/no).
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, stretches of 60, an empty Nimbus; each
+bottle played with every frame checked by its hash, and `fbottle raw` byte for byte the
+source:
+
+| | bytes | bits a pixel | a guess is off by | packing | unpacking |
+|---|---|---|---|---|---|
+| `--mix --quarter` | 96 201 938 | 1.229 | 0.338 | 19.8 s | 10.4 s |
+| `--mix --quarter --plates 1` (plates alone) | 98 804 388 | 1.262 | 0.315 | 20.3 s | 9.9 s |
+| **`--mix --quarter --plates 2`** (a fifth guesser) | **95 349 821** | **1.218** | **0.301** | 21.6 s | 10.8 s |
+| `--mix --quarter --golden` | 111 645 569 | 1.426 | 0.371 | 14.1 s | 3.9 s |
+| `--mix --quarter --golden --plates 1` (the fast way) | 105 124 205 | 1.343 | 0.315 | 15.6 s | 4.7 s |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 1.288 | | 16.9 s | 0.95 s |
+
+(The mix without plates goes on through the whole film; with stretches of 60, as the
+plates have them, its frames are 96 329 247 bytes against 96 151 044.) As a fifth
+guesser the plates make the bottle 0.9 % smaller; in place of golden's weights 5.8 %
+smaller for 0.8 s more unpacking; alone, with the mix's learners, 2.7 % larger than the
+mix, though their guess is nearer on average.

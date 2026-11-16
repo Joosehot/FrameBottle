@@ -68,6 +68,8 @@ fbottle pack <movie> [-o FILE.fbott] [--for size|play] [--explain] [--tolerance 
              [--golden]                  with --mix: fixed weights for each stretch of film in place of learning (faster to unpack, larger);
                                          --chunk N: the frames of a stretch (60); each stretch starts with a frame that stands alone
              [--quarter]                 with --mix: vectors to a quarter of a pixel
+             [--plates N]                with --mix: pressure plates, fixed weights chosen by where a sample stands (worked out for each stretch, as --golden's);
+                                         1: the plates are the guess, 2: the plates are a fifth guesser; with --golden: the plates in place of its one set of weights
              [--two]                     with --mix: only the two learning guessers are weighed for the guess
              [--bands N]                 with --mix: the bands a frame is cut into (16)
              [--window N]                with --mix, and for play: the frames the strike lets in at once (32)
@@ -195,7 +197,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
         species.id, species.kind, species.k, species.out, species.into, species.affinity
     );
     let mut reader = chop::frames(movie_path, geo)?;
-    let batch = if rules.mix && rules.golden { rules.chunk } else if rules.mix { rules.window } else { rayon::current_num_threads() * 2 };
+    let batch = if rules.mix && (rules.golden || rules.plates > 0) { rules.chunk } else if rules.mix { rules.window } else { rayon::current_num_threads() * 2 };
     let mut nodes: Vec<Node> = Vec::new();
     let mut share_ids: HashMap<String, u32> = HashMap::new();
     let mut share_hashes: Vec<String> = Vec::new();
@@ -290,7 +292,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
             if !block::fits(geo) || rules.coarse > 0 || rules.tolerance > 0 || light.is_some() || rules.dictionary {
                 return Err("--mix packs 8-bit YUV 4:2:0 exactly, with --alone or without, and nothing else".into());
             }
-            if rules.golden {
+            if rules.golden || rules.plates > 0 {
                 // A stretch of fixed weights stands on its own: nothing goes on from the stretch before.
                 carry_exact = None;
                 so_far.clear();
@@ -298,7 +300,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 mix_memory = mix::Memory::new();
             }
             let raws: Vec<String> = frames.par_iter().map(|f| bottle::sha(f)).collect();
-            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter, rules.golden, rules.chunk)).as_bytes());
+            let brand_of = |raw: &str, before: &str| bottle::sha(format!("fbottle {} {} {}x{} {} {} {:?} {raw} {before}", mix::VERSION, geo.pix_fmt, geo.width, geo.height, rules.bands, rules.relight, (rules.two, rules.quarter, rules.golden, rules.chunk, rules.plates)).as_bytes());
             // The map: each frame's brand (alone: its own; else it names every frame so far),
             // and what Nimbus already holds under it.
             let keys: Vec<String> = raws
@@ -333,7 +335,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
-                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, tones: false, pyramid: false };
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, tones: false, pyramid: false, plates: rules.plates };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
                 let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
@@ -853,6 +855,7 @@ fn run() -> Result<(), String> {
             "--two" => rules.two = true,
             "--quarter" => rules.quarter = true,
             "--golden" => rules.golden = true,
+            "--plates" => rules.plates = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=2).contains(n)).ok_or("--plates needs 1 (the plates are the guess) or 2 (the plates are a fifth guesser)")?,
             "--chunk" => rules.chunk = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--chunk needs a whole number, 1 or more")?,
             "--bands" => rules.bands = it.next().and_then(|n| n.parse().ok()).filter(|n| (1..=4096).contains(n)).ok_or("--bands needs a whole number from 1 to 4096")?,
             "--window" => rules.window = it.next().and_then(|n| n.parse().ok()).filter(|n| *n >= 1).ok_or("--window needs a whole number, 1 or more")?,

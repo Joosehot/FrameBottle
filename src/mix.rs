@@ -51,6 +51,8 @@ pub const VERSION: &str = "mix 3";
 /// Thousandths of a bit spent on: light, the first colour, the second colour, vectors;
 /// and again by what was said: is there a miss, its sign, its size.
 pub static SPENT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// The sum of what the guesses missed by (without the sign), as the packer counted it.
+pub static MISSED: AtomicU64 = AtomicU64::new(0);
 
 /// With FB_PROFILE set: the processor's ticks spent in each stage of a sample, and the
 /// samples.
@@ -67,7 +69,7 @@ fn now() -> u64 {
 }
 
 /// The guessers, and the things a learning guesser weighs (two are never used).
-const NP: usize = 4;
+const NP: usize = 5;
 const FEATS: usize = 16;
 const SLOTS: usize = 16;
 /// A miss's size by bucket: where each starts, and how many digits lie inside it.
@@ -141,9 +143,12 @@ trait Bits {
     fn bit(&mut self, p: i32, v: bool, what: (usize, usize)) -> bool;
     /// One yes/no the coder learns on its own.
     fn plain(&mut self, p: &mut u16, v: bool, what: (usize, usize)) -> bool;
+    /// The packer's count of how far a guess was off.
+    #[inline(always)]
+    fn missed(&mut self, _by: u32) {}
 }
 
-struct Writer(Encoder, [f64; 7]);
+struct Writer(Encoder, [f64; 7], u64);
 struct Reader<'a>(Decoder<'a>);
 
 impl Bits for Writer {
@@ -167,6 +172,10 @@ impl Bits for Writer {
         }
         self.0.bit(p, v);
         v
+    }
+    #[inline(always)]
+    fn missed(&mut self, by: u32) {
+        self.2 += by as u64;
     }
 }
 
@@ -242,6 +251,8 @@ pub struct Model {
     /// The pyramid's learners (made when first asked), and whether the band is told as one.
     pyr: Vec<[u16; 2]>,
     pyramid: bool,
+    /// The plates' way for the band (see How).
+    plates: u8,
     /// TRIAL: how often each tone came in each plane of the band so far (halved after every
     /// frame), and from that how common it is, in 4 steps.
     tone: [[u32; 256]; 3],
@@ -290,6 +301,7 @@ impl Model {
             gold: [[0; FEATS]; GOLD_SETS],
             pyr: Vec::new(),
             pyramid: false,
+            plates: 0,
         }
     }
 
@@ -380,6 +392,7 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
         px[..PAD * sw].fill(128);
     }
     let (mut lw, mut lw_slow) = (m.lw[pk], m.lw_slow[pk]);
+    let plates = m.plates;
     let prof = profiled();
     let (mut ticks, mut tick) = ([0u64; 8], if prof { now() } else { 0 });
     let coder_before = m.coder_ticks;
@@ -440,25 +453,40 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
                 (west, 0, [north - west, nw - west, ne - west, ww - west, nn - west, nne - west, med - west, gap - west, 0, 0, 0, 0, 0, 0, 0, 0])
             };
             lap!(0);
+            // The plate's guess: the fixed weights of where the sample stands, on what the fixed
+            // weights weigh (the learning guesser's own, without CALIC's guess).
+            let plate = if plates > 0 {
+                let weighed: [i32; FEATS] = if T { std::array::from_fn(|k| if k < 9 { feats[k] } else if k < 13 { feats[k + 1] } else { 0 }) } else { std::array::from_fn(|k| if k < 7 { feats[k] } else { 0 }) };
+                let weights = &m.gold[PLATE_SETS + (if T { pk } else { 3 + pk }) * PLATES + plate_of(west, north, nw, ne, ww, nn, nne, if T { Some([feats[0], feats[1], feats[2], feats[3]]) } else { None })];
+                let mut lean = 0i32;
+                for k in 0..FEATS {
+                    lean = lean.wrapping_add(weights[k].wrapping_mul(weighed[k]));
+                }
+                (base + (lean.wrapping_add(32768) >> 16)).clamp(0, 255)
+            } else {
+                0
+            };
             let (mut lean, mut lean_slow, mut norm) = (0i32, 0i32, 32i32);
-            for k in 0..FEATS {
+            for k in 0..if plates == 1 { 0 } else { FEATS } {
                 lean = lean.wrapping_add(lw[k].wrapping_mul(feats[k]));
                 lean_slow = lean_slow.wrapping_add(lw_slow[k].wrapping_mul(feats[k]));
                 norm += feats[k] * feats[k];
             }
             let learned = (base + (lean.wrapping_add(32768) >> 16)).clamp(0, 255);
             let learned_slow = (base + (lean_slow.wrapping_add(32768) >> 16)).clamp(0, 255);
-            let offers = [med, gap, learned, learned_slow];
+            // Plates in place of the guessers: nothing is learned for the guess.
+            let (learned, learned_slow) = if plates == 1 { (plate, plate) } else { (learned, learned_slow) };
+            let offers = [med, gap, learned, learned_slow, plate];
             lap!(1);
             // The mix: each speaks as loud as it was right on the neighbours.
             let (e_w, e_n, e_nw, e_ne) = (ec[x], eu[x + 1], eu[x], eu[x + 2]);
             let (mut sum, mut total) = (0u32, 0u32);
-            for g in if two { 2 } else { 0 }..NP {
+            for g in if two { 2 } else { 0 }..if plates == 2 { NP } else { 4 } {
                 let wt = t.weight[2 * e_w[g] as usize + 2 * e_n[g] as usize + e_nw[g] as usize + e_ne[g] as usize];
                 sum += wt;
                 total += wt * offers[g] as u32;
             }
-            let mixed = ((total + sum / 2) / sum) as i32;
+            let mixed = if plates == 1 { plate } else { ((total + sum / 2) / sum) as i32 };
             let low = med.min(gap).min(learned).min(learned_slow);
             let high = med.max(gap).max(learned).max(learned_slow);
             lap!(2);
@@ -483,6 +511,7 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
             let common = if tones { m.tone_class[pk][mixed as usize] as usize * A_ALL } else { 0 };
             let got = m.miss(c, t, pk, [common + at_a, at_d, at_e], common + signs, (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed), want);
             lap!(4);
+            c.missed(got.unsigned_abs());
             let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
             px[i] = real;
             res[i] = got as i8;
@@ -497,7 +526,7 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
             let over = ((1u32 << 24) / norm as u32) as i64;
             let pull = ((((real as i32 - learned) * LEARN) as i64 * over) >> 21) as i32;
             let pull_slow = ((((real as i32 - learned_slow) * (LEARN / 16)) as i64 * over) >> 17) as i32;
-            for k in 0..FEATS {
+            for k in 0..if plates == 1 { 0 } else { FEATS } {
                 lw[k] = lw[k].wrapping_add(pull.wrapping_mul(feats[k]) >> 3);
                 lw_slow[k] = lw_slow[k].wrapping_add(pull_slow.wrapping_mul(feats[k]) >> 7);
             }
@@ -538,25 +567,31 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
 /// leans on the one before, then of a frame that stands alone (65536 is one).
 pub type Gold = [[i32; FEATS]; GOLD_SETS];
 /// The sets of weights: 6 for the rows told one after the other, then the pyramid's.
-const GOLD_SETS: usize = PYR_SETS + 6 * KINDS;
+const GOLD_SETS: usize = PLATE_SETS + 6 * PLATES;
 /// For each set of weights: the 16 x 16 sums of products of the things weighed, then
 /// the 16 sums of each with what they should have summed to.
-type Sums = [[f64; 17 * FEATS]; GOLD_SETS];
+type Sums = Vec<[f64; 17 * FEATS]>;
 /// How large the misses nearby were, in 5 steps (of the 9).
 const NEAR5: [usize; 9] = [0, 1, 2, 2, 3, 3, 3, 4, 4];
 
-/// The sets a frame's head carries: the pyramid's, or the six of the rows.
-fn gold_sets(pyramid: bool) -> std::ops::Range<usize> {
-    if pyramid { PYR_SETS..GOLD_SETS } else { 0..PYR_SETS }
+/// The sets a frame's head carries: the plates, the pyramid's, or the six of the rows.
+fn gold_sets(how: How) -> std::ops::Range<usize> {
+    if how.plates > 0 {
+        PLATE_SETS..GOLD_SETS
+    } else if how.pyramid {
+        PYR_SETS..PLATE_SETS
+    } else {
+        0..PYR_SETS
+    }
 }
 
-fn gold_bytes(g: &Gold, pyramid: bool) -> Vec<u8> {
-    g[gold_sets(pyramid)].iter().flatten().flat_map(|w| w.to_le_bytes()).collect()
+fn gold_bytes(g: &Gold, how: How) -> Vec<u8> {
+    g[gold_sets(how)].iter().flatten().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-fn gold_of(bytes: &[u8], pyramid: bool) -> Gold {
+fn gold_of(bytes: &[u8], how: How) -> Gold {
     let mut g = [[0; FEATS]; GOLD_SETS];
-    for (s, set) in g[gold_sets(pyramid)].iter_mut().enumerate() {
+    for (s, set) in g[gold_sets(how)].iter_mut().enumerate() {
         *set = std::array::from_fn(|k| i32::from_le_bytes(bytes[4 * (s * FEATS + k)..4 * (s * FEATS + k) + 4].try_into().unwrap()));
     }
     g
@@ -564,8 +599,23 @@ fn gold_of(bytes: &[u8], pyramid: bool) -> Gold {
 
 /// Where a frame's table of band lengths starts: after the head, and the weights when
 /// the frame carries them.
-fn table_at(flags: u8) -> usize {
-    HEAD + if flags & GOLD != 0 && flags & FROM_BEFORE == 0 { gold_sets(flags & PYRAMID != 0).len() * FEATS * 4 } else { 0 }
+fn table_at(head: &[u8]) -> usize {
+    let how = how_of(head);
+    HEAD + if (how.gold || how.plates > 0) && head[0] & FROM_BEFORE == 0 { gold_sets(how).len() * FEATS * 4 } else { 0 }
+}
+
+/// A frame's head: its flags, then the bands said, with the plates' way in the top two bits.
+fn head_of(flags: u8, bands: usize, how: How) -> [u8; HEAD] {
+    let said = (bands as u16 & 0x3FFF) | ((how.plates as u16) << 14);
+    [flags | how.flags(), said as u8, (said >> 8) as u8]
+}
+
+fn how_of(head: &[u8]) -> How {
+    How { plates: head[2] >> 6, ..How::of(head[0]) }
+}
+
+fn bands_of(head: &[u8]) -> usize {
+    (u16::from_le_bytes([head[1], head[2]]) & 0x3FFF) as usize
 }
 
 /// The weights that make the squares of the misses smallest, from the sums (the
@@ -597,6 +647,45 @@ fn solve(sums: &[f64; 17 * FEATS]) -> [i32; FEATS] {
         w[i] = if a[i][i] != 0.0 { (65536.0 * a[i][n] / a[i][i]).round().clamp(-524288.0, 524288.0) as i32 } else { 0 };
     }
     w
+}
+
+/// PRESSURE PLATES: fixed weights chosen by where the sample stands. What lies around a
+/// sample (how it slopes, along which way an edge runs, how much the neighbours changed
+/// since the frame before) is told as one of PLATES numbers, and each number has its own
+/// set of weights (its plate), worked out by the packer for the stretch of film and kept
+/// in the head of the stretch's first frame. The guess is one lookup and one weighed sum;
+/// the player learns nothing for it.
+const PLATES: usize = 60;
+/// Where the plates' sets of weights start: for each plane, with a frame before, then alone.
+const PLATE_SETS: usize = PYR_SETS + 6 * KINDS;
+
+/// Which plate: the edge's way in 5 steps (as CALIC tells it), then with a frame before
+/// how much the four neighbours changed (4 steps) and how rough it is here (3 steps);
+/// alone, how rough in 4 steps.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn plate_of(west: i32, north: i32, nw: i32, ne: i32, ww: i32, nn: i32, nne: i32, changed: Option<[i32; 4]>) -> usize {
+    let (dh, dv) = ((west - ww).abs() + (north - nw).abs() + (north - ne).abs(), (west - nw).abs() + (north - nn).abs() + (ne - nne).abs());
+    let edge = if dv - dh > 32 {
+        0
+    } else if dv - dh > 8 {
+        1
+    } else if dh - dv > 32 {
+        4
+    } else if dh - dv > 8 {
+        3
+    } else {
+        2
+    };
+    let rough = dh + dv;
+    match changed {
+        Some(c) => {
+            let by = c[0].abs() + c[1].abs() + c[2].abs() + c[3].abs();
+            let moved = if by == 0 { 0 } else if by <= 2 { 1 } else if by <= 6 { 2 } else { 3 };
+            (edge * 4 + moved) * 3 + if rough < 6 { 0 } else if rough < 20 { 1 } else { 2 }
+        }
+        None => edge * 4 + if rough < 4 { 0 } else if rough < 12 { 1 } else if rough < 32 { 2 } else { 3 },
+    }
 }
 
 /// PYRAMID: with fixed weights, a plane is told coarse first: every eighth sample of
@@ -822,7 +911,7 @@ fn plane_gold<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: us
         for x in 0..w {
             let i = o + x;
             let p = |k: usize| px[k] as i32;
-            let (west, north, nw, ne, ww, nn) = (p(i - 1), p(i - sw), p(i - sw - 1), p(i - sw + 1), p(i - 2), p(i - 2 * sw));
+            let (west, north, nw, ne, ww, nn, nne) = (p(i - 1), p(i - sw), p(i - sw - 1), p(i - sw + 1), p(i - 2), p(i - 2 * sw), p(i - 2 * sw + 1));
             let med = median(west, north, west + north - nw);
             let (base, stayed, feats): (i32, usize, [i32; FEATS]) = if T {
                 let q = |k: usize| before[k] as i32;
@@ -834,6 +923,13 @@ fn plane_gold<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: us
                 (west, 0, [north - west, nw - west, ne - west, ww - west, nn - west, p(i - 2 * sw + 1) - west, med - west, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             };
             lap!(0);
+            // With plates: the set of weights is the plate of where the sample stands.
+            let (set, weights) = if m.plates > 0 {
+                let s = PLATE_SETS + (if T { pk } else { 3 + pk }) * PLATES + plate_of(west, north, nw, ne, ww, nn, nne, if T { Some([feats[0], feats[1], feats[2], feats[3]]) } else { None });
+                (s, m.gold[s])
+            } else {
+                (set, weights)
+            };
             let mut lean = 0i32;
             for k in 0..FEATS {
                 lean = lean.wrapping_add(weights[k].wrapping_mul(feats[k]));
@@ -854,6 +950,7 @@ fn plane_gold<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: us
             lap!(3);
             let got = m.miss_gold(c, t, pk, at, signs, want);
             lap!(4);
+            c.missed(got.unsigned_abs());
             let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
             px[i] = real;
             res[i] = got as i8;
@@ -1108,6 +1205,10 @@ pub struct How {
     pub tones: bool,
     /// TRIAL, with fixed weights: a plane is told coarse first, then finer (a pyramid).
     pub pyramid: bool,
+    /// Pressure plates (--plates N; the weights are fixed for a stretch as with gold). With
+    /// gold: the plates are the guess. Without: 1 the plates are the guess in place of the
+    /// four guessers, 2 the plates are a fifth guesser.
+    pub plates: u8,
 }
 
 impl How {
@@ -1115,7 +1216,7 @@ impl How {
         (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 }) | (if self.tones { TONES } else { 0 }) | (if self.pyramid { PYRAMID } else { 0 })
     }
     fn of(flags: u8) -> How {
-        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0, tones: flags & TONES != 0, pyramid: flags & PYRAMID != 0 }
+        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0, tones: flags & TONES != 0, pyramid: flags & PYRAMID != 0, plates: 0 }
     }
 }
 
@@ -1257,6 +1358,7 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
         }
     }
     let [res_light, res_first, res_second] = res;
+    m.plates = how.plates;
     if how.gold {
         m.pyramid = how.pyramid;
         match prev {
@@ -1383,8 +1485,8 @@ impl Memory {
 #[allow(dead_code)]
 pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, memory: &mut Memory, how: How) -> Vec<u8> {
     assert!(!how.gold, "fixed weights are worked out for a stretch of frames: strike_pack");
-    let mut out = vec![if before.is_some() { FROM_BEFORE } else { 0 } | how.flags()];
-    out.extend((bands as u16).to_le_bytes());
+    assert!(how.plates == 0, "plates are worked out for a stretch of frames: strike_pack");
+    let mut out = head_of(if before.is_some() { FROM_BEFORE } else { 0 }, bands, how).to_vec();
     if before == Some(frame) {
         out[0] |= STILL;
         return out;
@@ -1401,8 +1503,9 @@ pub fn pack(geo: &Geometry, frame: &[u8], before: Option<&[u8]>, bands: usize, m
             let y1 = (y0 + rows).min(geo.height);
             let vectors = prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter));
             let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
-            let mut c = Writer(Encoder::new(), [0.0; 7]);
+            let mut c = Writer(Encoder::new(), [0.0; 7], 0);
             band(geo, &mut c, m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how, None);
+            MISSED.fetch_add(c.2, Ordering::Relaxed);
             (c.0.finish(), c.1)
         })
         .collect();
@@ -1429,10 +1532,10 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
     if payload[0] & STILL != 0 {
         return Ok(before.ok_or("a still frame was rebuilt without the frame before it")?.to_vec());
     }
-    let rows = band_rows(geo, u16::from_le_bytes([payload[1], payload[2]]) as usize);
+    let rows = band_rows(geo, bands_of(payload));
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
-    let table = table_at(payload[0]);
-    let gold = if table > HEAD { Some(gold_of(payload.get(HEAD..table).ok_or("a mixed frame is cut")?, payload[0] & PYRAMID != 0)) } else { None };
+    let table = table_at(payload);
+    let gold = if table > HEAD { Some(gold_of(payload.get(HEAD..table).ok_or("a mixed frame is cut")?, how_of(payload))) } else { None };
     let mut data = table + 4 * starts.len();
     let mut coded = Vec::new();
     for i in 0..starts.len() {
@@ -1456,7 +1559,7 @@ pub fn unpack(geo: &Geometry, payload: &[u8], before: Option<&[u8]>, memory: &mu
                 m.gold = g;
             }
             let mut c = Reader(Decoder::new(bytes));
-            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1, How::of(payload[0]), None);
+            band(geo, &mut c, m, [a, b, d], prev, Vec::new(), *y0, y1, how_of(payload), None);
             cur
         })
         .collect();
@@ -1699,7 +1802,7 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
         return Err("not a mixed frame".into());
     }
     let bands_said = u16::from_le_bytes([first[1], first[2]]);
-    let rows = band_rows(geo, bands_said as usize);
+    let rows = band_rows(geo, bands_of(&first));
     let starts: Vec<usize> = (0..geo.height).step_by(rows).collect();
     let bands = starts.len();
     memory.ready(bands, false);
@@ -1725,7 +1828,7 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
         if from_before(&p) && f == 0 && !before.is_some_and(|b| b.len() == geo.frame_len()) {
             return Err("a mixed frame was rebuilt without the frame before it".into());
         }
-        let table = table_at(p[0]);
+        let table = table_at(&p);
         if p.len() < table {
             return Err("a mixed frame is cut".into());
         }
@@ -1784,14 +1887,14 @@ pub fn strike_unpack(geo: &Geometry, n: usize, window: usize, before: Option<&[u
         }
         if prev.is_none() {
             let mut fresh = Model::new();
-            if table_at(p[0]) > HEAD {
-                fresh.gold = gold_of(&p[HEAD..table_at(p[0])], p[0] & PYRAMID != 0);
+            if table_at(p) > HEAD {
+                fresh.gold = gold_of(&p[HEAD..table_at(p)], how_of(p));
             }
             *slot = Some(fresh);
         }
         let m = slot.as_mut().ok_or("a mixed frame was rebuilt without the frames before it")?;
         let mut c = Reader(Decoder::new(&p[places[k].0..places[k].0 + places[k].1]));
-        band(geo, &mut c, m, cur, prev, Vec::new(), y0, y1, How::of(p[0]), None);
+        band(geo, &mut c, m, cur, prev, Vec::new(), y0, y1, how_of(p), None);
         Ok(())
     };
     let mut deliver = |f: usize| -> Result<bool, String> {
@@ -1841,7 +1944,8 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
     let (mut map_time, mut solve_time) = (0.0, 0.0);
     let mut found: Vec<Vec<(i32, i32)>> = Vec::new();
     let mut gold: Gold = [[0; FEATS]; GOLD_SETS];
-    if how.gold {
+    let fixed = how.gold || how.plates > 0;
+    if fixed {
         if before.is_some() && !alone {
             return Err("a stretch of fixed weights starts with a frame that stands alone".into());
         }
@@ -1856,19 +1960,19 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
         map_time = from.elapsed().as_secs_f64();
         let from = std::time::Instant::now();
         let sampled: Vec<usize> = (0..n).filter(|f| prev_of(*f).is_none() || f % 4 == 1).flat_map(|f| (0..bands).map(move |k| f * bands + k)).collect();
-        let sums: Box<Sums> = sampled
+        let sums: Sums = sampled
             .par_iter()
             .map(|j| {
                 let (f, k) = (j / bands, j % bands);
                 let (y0, y1) = (starts[k], (starts[k] + rows).min(geo.height));
                 let prev = prev_of(f).map(|b| Before { planes: planes(geo, b), first: [0; 3] });
                 let [mut a, mut b, mut d] = cut(geo, planes(geo, frames[f]), y0, y1).map(|p| p.to_vec());
-                let mut sums: Box<Sums> = Box::new([[0.0; 17 * FEATS]; GOLD_SETS]);
-                band(geo, &mut Dry, &mut Model::new(), [&mut a, &mut b, &mut d], prev, found[*j].clone(), y0, y1, How { light: 0, ..how }, Some(&mut sums));
+                let mut sums: Sums = vec![[0.0; 17 * FEATS]; GOLD_SETS];
+                band(geo, &mut Dry, &mut Model::new(), [&mut a, &mut b, &mut d], prev, found[*j].clone(), y0, y1, How { light: 0, gold: true, ..how }, Some(&mut sums));
                 sums
             })
             .reduce(
-                || Box::new([[0.0; 17 * FEATS]; GOLD_SETS]),
+                || vec![[0.0; 17 * FEATS]; GOLD_SETS],
                 |mut a, b| {
                     for (x, y) in a.iter_mut().flatten().zip(b.iter().flatten()) {
                         *x += y;
@@ -1890,13 +1994,14 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
         if prev.is_none() {
             *m = Model::new();
         }
-        if how.gold {
+        if fixed {
             m.gold = gold;
         }
-        let vectors = if how.gold { found[f * bands + k].clone() } else { prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter)) };
+        let vectors = if fixed { found[f * bands + k].clone() } else { prev.map_or(Vec::new(), |p| find(geo.width, geo.height, real[0], p.planes[0], y0, y1, how.quarter)) };
         let [mut a, mut b, mut d] = cut(geo, real, y0, y1).map(|p| p.to_vec());
-        let mut c = Writer(Encoder::new(), [0.0; 7]);
+        let mut c = Writer(Encoder::new(), [0.0; 7], 0);
         band(geo, &mut c, &mut m, [&mut a, &mut b, &mut d], prev, vectors, y0, y1, how, None);
+        MISSED.fetch_add(c.2, Ordering::Relaxed);
         // This job alone writes the place.
         unsafe { *done.get_mut(f * bands + k) = (c.0.finish(), c.1) };
         Ok(())
@@ -1906,10 +2011,9 @@ pub fn strike_pack(geo: &Geometry, frames: &[&[u8]], before: Option<&[u8]>, alon
     memory.0 = models.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut out = Vec::with_capacity(n);
     for f in 0..n {
-        let mut bytes = vec![if prev_of(f).is_some() { FROM_BEFORE } else { 0 } | how.flags()];
-        bytes.extend((bands_said as u16).to_le_bytes());
-        if how.gold && prev_of(f).is_none() {
-            bytes.extend(gold_bytes(&gold, how.pyramid));
+        let mut bytes = head_of(if prev_of(f).is_some() { FROM_BEFORE } else { 0 }, bands_said, how).to_vec();
+        if fixed && prev_of(f).is_none() {
+            bytes.extend(gold_bytes(&gold, how));
         }
         if still[f] {
             bytes[0] |= STILL;
@@ -1959,7 +2063,7 @@ mod tests {
                 }
             }
             let wild = noise(false);
-            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false, tones: false, pyramid: false }), (16, How { light: 2, two: false, quarter: false, gold: false, tones: false, pyramid: false }), (1, How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false })] {
+            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false, tones: false, pyramid: false, plates: 0 }), (16, How { light: 2, two: false, quarter: false, gold: false, tones: false, pyramid: false, plates: 0 }), (1, How { light: 0, two: false, quarter: true, gold: false, tones: false, pyramid: false, plates: 0 })] {
                 // The player goes through the frames in the packer's order, with its own memory.
                 let (mut packer, mut player) = (Memory::new(), Memory::new());
                 let first = pack(&geo, &a, None, bands, &mut packer, how);
