@@ -1096,3 +1096,42 @@ sheet of the mix's bytes matches the frame before 50.0 % of the time; 13 bytes t
 of 96 million); on what the mix's guess missed by they give 130 648 150 bytes (124 186 304
 with four bits seen); inside the mix, a miss written as eight sheets by the mix's own
 learners who know the bits above: 101 152 027 bytes, packing 44.3 s, unpacking 25.1 s.
+
+### A trial: the colour cheat sheet (`fbottle tones`, 2026-11-16)
+
+Apart from the packers (the owner's experiment). Each channel has a sheet of its tones;
+a common tone gets a short code, a rare one a long code, and every sample is written as
+its tone's code. Three ways: a sheet for every frame and one sheet for the whole scene
+(canonical Huffman codes of at most 15 bits; a sheet is 256 code lengths, 128 bytes),
+and a learning yes/no coder that counts the tones as they come and keeps no sheet (each
+channel in 16 parts, each part a job through the film). The clip is yuv420p already:
+the channels are light and two colours, 12 bits a pixel; there is no red, green and
+blue to try, and no colour transform to make. The clip is one scene.
+
+guitar_10s.mp4 (1080p, 302 frames), 12 threads, every sample came back each time:
+
+| | bytes | bits a pixel | writing | reading |
+|---|---|---|---|---|
+| the samples as they are | 939 340 800 | 12.000 | | |
+| cheat sheet, a sheet for every frame | 723 920 468 | 9.248 | 0.3 s | 0.3 s |
+| cheat sheet, one sheet for the scene | 724 639 565 | 9.257 | 0.2 s | 0.3 s |
+| cheat sheet, the learning coder | 613 670 751 | 7.840 | 4.1 s | 3.8 s |
+| `--mix --quarter` (frame by frame here) | 96 151 044 | 1.228 | 26.4 s | 9.9 s |
+| the mix's packed bytes by cheat sheet: every frame / the scene / learning | 96 189 700 / 96 151 172 / 96 289 537 | 1.229 / 1.228 / 1.230 | | |
+| the mix's misses by cheat sheet in place of the mix's learners: every frame / the scene / learning | 176 400 798 / 176 576 525 / 134 495 103 | 2.254 / 2.256 / 1.718 | | |
+| the mix with the tone's commonness as a part of where a sample stands | 95 870 576 | 1.225 | as the mix | as the mix |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 1.288 | 16.9 s | 0.95 s |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | 1.596 | about 730 s | 5.4 s |
+
+Bits a sample by channel (light / colour 1 / colour 2): the samples by a sheet for
+every frame 7.180 / 4.278 / 3.996, by the learning coder 6.096 / 3.659 / 3.316 (it
+beats the sheets because each of its 16 parts counts its own tones); the mix's misses
+by a sheet for every frame 1.682 / 1.170 / 1.117 (a code is never shorter than one
+bit), by the learning coder 1.449 / 0.615 / 0.460. The sheets themselves: 115 968 bytes
+when every frame has its own, 384 for the scene.
+
+The last-but-two row is a trial inside the mix (`fbottle trial` with FB_HOW=qc; not in
+`pack`): each band counts the tones of each plane as it rebuilds them (halved after
+every frame), and how common the guessed tone is, in 4 steps, is added to the first
+learner's view. 96 151 044 -> 95 870 576 bytes (0.29 % smaller), packing 66.4 -> 67.6 ms
+a frame, unpacking 34.8 -> 34.8 ms a frame, 302 of 302 frames identical.

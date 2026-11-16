@@ -239,6 +239,10 @@ pub struct Model {
     lit: [Vec<(i32, i32)>; 3],
     /// The fixed weights of the stretch of film the band is in.
     gold: Gold,
+    /// TRIAL: how often each tone came in each plane of the band so far (halved after every
+    /// frame), and from that how common it is, in 4 steps.
+    tone: [[u32; 256]; 3],
+    tone_class: [[u8; 256]; 3],
 }
 
 /// A band's working room: the rows as they are rebuilt, the frame before where the
@@ -265,7 +269,9 @@ impl Model {
         Model {
             lw: [[0; FEATS]; 3],
             lw_slow: [[0; FEATS]; 3],
-            a: vec![[32768, 0]; A_ALL * SLOTS],
+            a: vec![[32768, 0]; 4 * A_ALL * SLOTS],
+            tone: [[0; 256]; 3],
+            tone_class: [[0; 256]; 3],
             d: vec![[32768, 0]; D_ALL * SLOTS],
             e: vec![[32768, 0]; E_ALL * SLOTS],
             w: vec![[26000, 26000, 26000, 0]; SETS],
@@ -357,7 +363,7 @@ fn median(a: i32, b: i32, c: i32) -> i32 {
 /// room around it; `res` takes each sample's miss, with the same room; `first` is the
 /// misses of the first colour (for the second).
 #[allow(clippy::too_many_arguments)]
-fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool) {
+fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool, tones: bool) {
     let t = tables();
     let rows = cur.len() / w;
     let sw = w + 2 * PAD;
@@ -469,7 +475,8 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
             let real = if C::WRITE { cur[yy * w + x] } else { 0 };
             let want = if C::WRITE { real.wrapping_sub(guess as u8) as i8 as i32 } else { 0 };
             lap!(3);
-            let got = m.miss(c, t, pk, [at_a, at_d, at_e], signs, (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed), want);
+            let common = if tones { m.tone_class[pk][mixed as usize] as usize * A_ALL } else { 0 };
+            let got = m.miss(c, t, pk, [common + at_a, at_d, at_e], common + signs, (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed), want);
             lap!(4);
             let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
             px[i] = real;
@@ -498,6 +505,19 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
         std::mem::swap(ec, eu);
     }
     (m.lw[pk], m.lw_slow[pk]) = (lw, lw_slow);
+    if tones {
+        let tone = &mut m.tone[pk];
+        for v in cur.iter() {
+            tone[*v as usize] += 1;
+        }
+        // Against a tone as common as every other (1 of 256): under an eighth, under one, under four, more.
+        let all: u64 = tone.iter().map(|n| *n as u64).sum();
+        for (class, n) in m.tone_class[pk].iter_mut().zip(tone.iter_mut()) {
+            let share = *n as u64 * 256 * 8 / all.max(1);
+            *class = if share < 1 { 0 } else if share < 8 { 1 } else if share < 32 { 2 } else { 3 };
+            *n /= 2;
+        }
+    }
     if prof {
         ticks[5] = m.coder_ticks - coder_before;
         ticks[4] -= ticks[5];
@@ -872,14 +892,16 @@ pub struct How {
     /// frame's head) in place of the learning and the weighing, and one learner for each
     /// yes/no in place of three mixed.
     pub gold: bool,
+    /// TRIAL: how common the guessed tone is in its channel, as a part of where the sample stands.
+    pub tones: bool,
 }
 
 impl How {
     fn flags(self) -> u8 {
-        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 })
+        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 }) | (if self.tones { TONES } else { 0 })
     }
     fn of(flags: u8) -> How {
-        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0 }
+        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0, tones: flags & TONES != 0 }
     }
 }
 
@@ -1055,22 +1077,22 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
             if how.light > 0 {
                 relight(c, m, 0, w, rows, light, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
+            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two, how.tones);
             moved(mv, p.planes[1], p.first[1], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
             if how.light > 0 {
                 relight(c, m, 1, cw, colour_rows, first, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
+            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two, how.tones);
             moved(mv, p.planes[2], p.first[2], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
             if how.light > 0 {
                 relight(c, m, 2, cw, colour_rows, second, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
+            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two, how.tones);
         }
         None => {
-            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
-            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
-            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
+            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two, how.tones);
+            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two, how.tones);
+            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two, how.tones);
         }
     }
     m.room = room;
@@ -1082,6 +1104,7 @@ const LIGHT: u8 = 8;
 const TWO: u8 = 16;
 const QUARTER: u8 = 32;
 const GOLD: u8 = 64;
+const TONES: u8 = 128;
 const HEAD: usize = 3;
 
 /// Does rebuilding this frame need the frame before it?
@@ -1720,7 +1743,7 @@ mod tests {
                 }
             }
             let wild = noise(false);
-            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false }), (16, How { light: 2, two: false, quarter: false, gold: false }), (1, How { light: 0, two: false, quarter: true, gold: false })] {
+            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false, tones: false }), (16, How { light: 2, two: false, quarter: false, gold: false, tones: false }), (1, How { light: 0, two: false, quarter: true, gold: false, tones: false })] {
                 // The player goes through the frames in the packer's order, with its own memory.
                 let (mut packer, mut player) = (Memory::new(), Memory::new());
                 let first = pack(&geo, &a, None, bands, &mut packer, how);

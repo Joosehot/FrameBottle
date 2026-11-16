@@ -39,6 +39,7 @@ mod guess;
 mod light;
 mod mix;
 mod sheets;
+mod tones;
 mod trial;
 mod motor;
 mod pack;
@@ -331,7 +332,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
-                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden };
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, tones: false };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
                 let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
@@ -888,6 +889,11 @@ fn run() -> Result<(), String> {
             // fbottle sheets <raw yuv420p> <width> <height> <frames> [bands]
             let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "sheets: <yuv> <width> <height> <frames> [bands]".to_string()) };
             sheets::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
+        }
+        Some("tones") => {
+            // fbottle tones <raw yuv420p> <width> <height> <frames> [bands]
+            let n = |i: usize| -> Result<usize, String> { path(i, "a number")?.to_string_lossy().parse().map_err(|_| "tones: <yuv> <width> <height> <frames> [bands]".to_string()) };
+            tones::run(path(0, "the raw frames")?, n(1)?, n(2)?, n(3)?, n(4).unwrap_or(rules.bands))?;
         }
         Some("verify") => {
             let b = Bottle::open(path(0, "the bottle")?)?;
