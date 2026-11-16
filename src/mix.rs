@@ -207,8 +207,6 @@ const A_ALL: usize = A_SIZE + 81;
 const D_ALL: usize = 625 * 3;
 const E_ALL: usize = 625 * 3;
 const SETS: usize = SLOTS * 3 * 3;
-/// With sheets: what a learner keeps for each surrounding, one for every run of bits above.
-const ABOVE: usize = 256;
 
 /// What a band has learned so far.
 pub struct Model {
@@ -345,29 +343,6 @@ impl Model {
         let size = (LO[b] + inside) as i32;
         if negative { -size } else { size }
     }
-
-    /// A miss as eight bit sheets: 0, -1, 1, -2 ... told as 0, 1, 2, 3 ..., and that
-    /// number bit by bit, the top one first. Each bit is said by the three learners mixed;
-    /// they stand where the sample stands and know every bit above the one asked.
-    #[inline(always)]
-    fn miss_sheets<C: Bits>(&mut self, c: &mut C, t: &Tables, pk: usize, at: [usize; 3], (set, set2): (usize, usize), v: i32) -> i32 {
-        if self.a.len() != A_ALL * ABOVE {
-            self.a = vec![[32768, 0]; A_ALL * ABOVE];
-            self.d = vec![[32768, 0]; D_ALL * ABOVE];
-            self.e = vec![[32768, 0]; E_ALL * ABOVE];
-        }
-        let want = ((v << 1) ^ (v >> 31)) as u32 & 255;
-        // The bits above, with a 1 in front: 1 for the top sheet, 2 and 3 for the next ...
-        let mut above = 1usize;
-        for sheet in (0..8).rev() {
-            // The mixer's weights go by the sheet, and by whether a bit above it is set.
-            let slot = sheet + if above.count_ones() > 1 { 8 } else { 0 };
-            let bit = self.mixed(c, t, [at[0] * ABOVE + above, at[1] * ABOVE + above, at[2] * ABOVE + above], ((slot * 3 + pk) * 3 + set, (slot * 3 + pk) * 5 + set2), (want >> sheet) & 1 == 1, (pk, 6));
-            above = (above << 1) | bit as usize;
-        }
-        let z = (above & 255) as i32;
-        ((z >> 1) ^ -(z & 1)) as i8 as i32
-    }
 }
 
 #[inline(always)]
@@ -382,7 +357,7 @@ fn median(a: i32, b: i32, c: i32) -> i32 {
 /// room around it; `res` takes each sample's miss, with the same room; `first` is the
 /// misses of the first colour (for the second).
 #[allow(clippy::too_many_arguments)]
-fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool, sheets: bool) {
+fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, cur: &mut [u8], before: &[u8], (px, ec, eu): (&mut Vec<u8>, &mut Vec<[u8; NP]>, &mut Vec<[u8; NP]>), res: &mut [i8], first: Option<&[i8]>, two: bool) {
     let t = tables();
     let rows = cur.len() / w;
     let sw = w + 2 * PAD;
@@ -494,8 +469,7 @@ fn plane<C: Bits, const T: bool>(c: &mut C, m: &mut Model, pk: usize, w: usize, 
             let real = if C::WRITE { cur[yy * w + x] } else { 0 };
             let want = if C::WRITE { real.wrapping_sub(guess as u8) as i8 as i32 } else { 0 };
             lap!(3);
-            let sets = (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed);
-            let got = if sheets { m.miss_sheets(c, t, pk, [at_a, at_d, at_e], sets, want) } else { m.miss(c, t, pk, [at_a, at_d, at_e], signs, sets, want) };
+            let got = m.miss(c, t, pk, [at_a, at_d, at_e], signs, (if near < 2 { 0 } else if near < 5 { 1 } else { 2 }, stayed), want);
             lap!(4);
             let real = if C::WRITE { real } else { (guess as u8).wrapping_add(got as u8) };
             px[i] = real;
@@ -898,17 +872,14 @@ pub struct How {
     /// frame's head) in place of the learning and the weighing, and one learner for each
     /// yes/no in place of three mixed.
     pub gold: bool,
-    /// A miss is written as its eight bits, the top one first, each told by the learners
-    /// mixed, who know the bits above it (--sheets).
-    pub sheets: bool,
 }
 
 impl How {
     fn flags(self) -> u8 {
-        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 }) | (if self.sheets { SHEETS } else { 0 })
+        (if self.light > 0 { LIGHT } else { 0 }) | (if self.two { TWO } else { 0 }) | (if self.quarter { QUARTER } else { 0 }) | (if self.gold { GOLD } else { 0 })
     }
     fn of(flags: u8) -> How {
-        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0, sheets: flags & SHEETS != 0 }
+        How { light: if flags & LIGHT != 0 { 2 } else { 0 }, two: flags & TWO != 0, quarter: flags & QUARTER != 0, gold: flags & GOLD != 0 }
     }
 }
 
@@ -1084,22 +1055,22 @@ fn band<C: Bits>(geo: &Geometry, c: &mut C, m: &mut Model, cur: [&mut [u8]; 3], 
             if how.light > 0 {
                 relight(c, m, 0, w, rows, light, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two, how.sheets);
+            plane::<C, true>(c, m, 0, w, light, mv, (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
             moved(mv, p.planes[1], p.first[1], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
             if how.light > 0 {
                 relight(c, m, 1, cw, colour_rows, first, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two, how.sheets);
+            plane::<C, true>(c, m, 1, cw, first, mv, (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
             moved(mv, p.planes[2], p.first[2], (cw, ch), c0, colour_rows, &vectors, across, 3, true);
             if how.light > 0 {
                 relight(c, m, 2, cw, colour_rows, second, mv, how.light > 1);
             }
-            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two, how.sheets);
+            plane::<C, true>(c, m, 2, cw, second, mv, (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
         }
         None => {
-            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two, how.sheets);
-            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two, how.sheets);
-            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two, how.sheets);
+            plane::<C, false>(c, m, 0, w, light, &[], (&mut *px, &mut *ec, &mut *eu), res_light, None, how.two);
+            plane::<C, false>(c, m, 1, cw, first, &[], (&mut *px, &mut *ec, &mut *eu), res_first, None, how.two);
+            plane::<C, false>(c, m, 2, cw, second, &[], (&mut *px, &mut *ec, &mut *eu), res_second, Some(res_first), how.two);
         }
     }
     m.room = room;
@@ -1111,7 +1082,6 @@ const LIGHT: u8 = 8;
 const TWO: u8 = 16;
 const QUARTER: u8 = 32;
 const GOLD: u8 = 64;
-const SHEETS: u8 = 128;
 const HEAD: usize = 3;
 
 /// Does rebuilding this frame need the frame before it?
@@ -1750,7 +1720,7 @@ mod tests {
                 }
             }
             let wild = noise(false);
-            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false, sheets: false }), (16, How { light: 2, two: false, quarter: false, gold: false, sheets: false }), (1, How { light: 0, two: false, quarter: true, gold: false, sheets: false }), (3, How { light: 0, two: false, quarter: true, gold: false, sheets: true })] {
+            for (bands, how) in [(1, How::default()), (3, How::default()), (16, How::default()), (3, How { light: 2, two: true, quarter: true, gold: false }), (16, How { light: 2, two: false, quarter: false, gold: false }), (1, How { light: 0, two: false, quarter: true, gold: false })] {
                 // The player goes through the frames in the packer's order, with its own memory.
                 let (mut packer, mut player) = (Memory::new(), Memory::new());
                 let first = pack(&geo, &a, None, bands, &mut packer, how);

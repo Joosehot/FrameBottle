@@ -1065,45 +1065,34 @@ second) and packing 1.3 times faster; the bottle is 16.1 % larger than that mix 
 cost little: 30 frames instead of 120 is 0.2 %. Tried before building, on the mix that
 learns (24 frames): fixed weights alone +5.1 %, one learner alone +5.7 %, both +10.0 %.
 
-### A trial: stacked bit sheets (`fbottle sheets`, 2026-11-16)
+### A raw video compression trick: stacked bit sheets (`fbottle sheets`, 2026-11-16)
 
-Apart from the packers (the owner's experiment). Every sample is split into its eight
-bits, sheet 7 (the top bit) down to sheet 0, and each bit is written by a learning
-yes/no coder, two ways: seeing only the same bit of the frame before, or seeing four
-bits (the frame before, left, above, and the sample's bit one sheet higher). Tried on
-the samples themselves and on what the mix's guess missed by (0, -1, 1, -2 ... told as
-0, 1, 2, 3 ...). The clip is yuv420p already, so no colour transform is made.
+A trick for raw video, apart from the packers (the owner's idea; not part of any
+packing mode). Every sample is split into its eight bits, sheet 7 (the top bit) down
+to sheet 0, and each bit is written by a learning yes/no coder that sees only the same
+bit of the frame before. No guesser, no vectors, no neighbours; the player sees the
+same bit, so nothing else is kept.
 
-guitar_10s.mp4 (1080p, 302 frames), 16 bands, 12 threads, every sample came back:
+guitar_10s.mp4 as raw yuv420p (1080p, 302 frames, 939 340 800 bytes), 16 bands, 12
+threads, every sample came back:
 
-| | bytes | writing | reading |
-|---|---|---|---|
-| sheets of the samples, the frame before alone | 385 143 386 | 7.9 s | 7.8 s |
-| sheets of the samples, four bits seen | 241 138 540 | 7.4 s | 7.6 s |
-| sheets of the mix's misses, the frame before alone | 130 648 150 | 6.9 s (+ the guess) | 6.7 s (+ the guess) |
-| sheets of the mix's misses, four bits seen | 124 186 304 | 6.8 s (+ the guess) | 6.8 s (+ the guess) |
-| `--mix --quarter` | 96 201 938 | 26.4 s | 9.9 s |
-| x264 lossless (qp 0, veryslow) | 100 839 923 | 16.9 s | 0.95 s |
-| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | about 730 s | 5.4 s |
+| | bytes | of the raw | writing | reading |
+|---|---|---|---|---|
+| raw video | 939 340 800 | 100 % | | |
+| **sheets, the bit of the frame before alone** | **385 143 386** | **41.0 % (2.4 times smaller)** | 7.9 s | 7.8 s |
+| sheets, four bits seen (the frame before, left, above, the sheet above) | 241 138 540 | 25.7 % (3.9 times smaller) | 7.4 s | 7.6 s |
+| `--mix --quarter` | 96 201 938 | 10.2 % | 26.4 s | 9.9 s |
+| x264 lossless (qp 0, veryslow) | 100 839 923 | 10.7 % | 16.9 s | 0.95 s |
+| AV1 lossless (libaom, cpu-used 2) | 124 942 885 | 13.3 % | about 730 s | 5.4 s |
 
-How often a bit is what it was in the frame before (light / colour), sheet 7 to 0: the
-samples 98.6 / 99.7, 97.3 / 99.7, 95.0 / 99.4, 91.8 / 97.8, 87.2 / 96.7, 80.6 / 93.7,
-72.3 / 86.6, 62.9 / 77.5 %; the misses 100, 100, 99.9, 99.3, 98.0, 93.9, 80.2, 82.3 %
-of the light (their top sheets are nearly all zeros: the match says little there).
-Bytes by sheet, the frame before alone, 7 to 0: the samples 8.5, 13.5, 22.6, 35.6, 49.3,
-66.5, 86.6, 102.6 million; the misses 0.05, 0.1, 0.7, 2.6, 6.9, 18.1, 52.4, 49.8 million.
-The mix writes a whole miss at once, so its bytes cannot be told sheet by sheet.
+Sheet by sheet, 7 to 0: how often a bit is what it was in the frame before (light /
+colour) 98.6 / 99.7, 97.3 / 99.7, 95.0 / 99.4, 91.8 / 97.8, 87.2 / 96.7, 80.6 / 93.7,
+72.3 / 86.6, 62.9 / 77.5 % (noise would be 50 %); bytes 8.5, 13.5, 22.6, 35.6, 49.3,
+66.5, 86.6, 102.6 million. The top sheets nearly stand still and cost little; the
+bottom three are near noise and hold two thirds of the bytes.
 
-**The sheets inside the mix (`--mix --sheets`).** A miss is told as 0, 1, 2, 3 ... (for
-0, -1, 1, -2 ...) and written as its eight bits, the top one first; each bit is said by
-the mix's three learners mixed, who stand where the sample stands and know every bit
-above the one asked. guitar_10s.mp4, 16 bands, exact (every frame by its hash, `fbottle
-raw` byte for byte):
-
-| | bytes | packing | unpacking |
-|---|---|---|---|
-| `--mix --quarter` | 96 201 938 | 26.4 s | 9.9 s |
-| `--mix --quarter --sheets` | 101 152 027 | 44.3 s | 25.1 s |
-
-5.1 % larger, unpacking 2.5 times slower (eight mixed yes/nos for every sample; the
-mix's own way asks about two or three).
+What was tried with it and left: on a packed bottle the sheets find nothing (every
+sheet of the mix's bytes matches the frame before 50.0 % of the time; 13 bytes to win
+of 96 million); on what the mix's guess missed by they give 130 648 150 bytes (124 186 304
+with four bits seen); inside the mix, a miss written as eight sheets by the mix's own
+learners who know the bits above: 101 152 027 bytes, packing 44.3 s, unpacking 25.1 s.

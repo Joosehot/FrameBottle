@@ -76,8 +76,6 @@ pub struct Rules {
     /// the two learning guessers weighed (--two).
     pub relight: u8,
     pub two: bool,
-    /// With --mix: a miss as eight bit sheets (--sheets).
-    pub sheets: bool,
     /// With the mix: vectors to a quarter of a pixel (--quarter).
     pub quarter: bool,
     /// With the mix: fixed weights for each stretch of film (--golden), and a stretch's frames (--chunk).
@@ -231,7 +229,6 @@ impl Rules {
             mix: false,
             relight: 0,
             two: false,
-            sheets: false,
             quarter: false,
             golden: false,
             chunk: 60,
