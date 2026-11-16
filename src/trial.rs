@@ -19,7 +19,7 @@ pub fn run(path: &std::path::Path, w: usize, h: usize, frames: usize, bands: usi
         all.push(f);
     }
     let said = std::env::var("FB_HOW").unwrap_or_default();
-    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g'), tones: said.contains('c') };
+    let how = mix::How { light: said.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(0) as u8, two: said.contains('t'), quarter: said.contains('q'), gold: said.contains('g'), tones: said.contains('c'), pyramid: said.contains('p') };
     let chunk: usize = std::env::var("FB_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(frames).max(1);
     let window: usize = std::env::var("FB_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
     let refs: Vec<&[u8]> = all.iter().map(|f| &f[..]).collect();

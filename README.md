@@ -1166,3 +1166,30 @@ all nothing, and writes a sign as one plain bit. In this clip, with the mix's mi
   colour 1 46.8 / 20.7 / 3.7 %, colour 2 61.8 / 39.6 / 18.7 %;
 - the mix's bytes: is there a miss 54.2 million, its sign 16.8 million (0.683 bits a
   sign; plain bits would be 24.6 million), its size 23.8 million, the vectors 1.3 million.
+
+### A trial: the pyramid (coarse first, then finer; 2026-11-16)
+
+The owner's question: can a frame be told in pieces, low quality first, then higher? A
+trial on the fixed weights (`fbottle trial` with FB_HOW=qgp; not in `pack`). A plane of
+a band is told in passes: every eighth sample of every eighth row, then the samples
+between those (the middle of four, then the two kinds beside them), then the same at
+half the step, down to every sample. A sample is guessed with fixed weights from the
+four around it that are told already (on all its sides; eight for the last kind) and
+the frame before: how each of them changed since the frame before, and how the frame
+before slopes to it. Nothing of a sample's own pass is read. Weights for each plane and
+kind of pass (10 kinds), one learner for each yes/no of a miss.
+
+guitar_10s.mp4 (1080p, 302 frames), 16 bands, stretches of 60, in memory, 302 of 302
+frames identical:
+
+| | bytes of frames | packing | unpacking |
+|---|---|---|---|
+| fixed weights, row after row (`--golden`) | 111 594 685 | 23.4 ms a frame | 12.2 ms a frame |
+| fixed weights, the pyramid, first version | 120 017 561 | 27.2 ms a frame | 19.9 ms a frame |
+
+7.5 % larger and 1.6 times slower to unpack as it stands. The passes are written sample
+by sample here; a pass's guesses could be worked out all at once (they do not wait for
+one another), which is not done. On the way (60 frames): four neighbours and how unlike
+they changed as the surroundings +13.8 % against the rows; the last kind of pass given
+its four cornerwise neighbours +13.0 %; the mean of the four against the guess as a part
+of the surroundings +7.1 %.

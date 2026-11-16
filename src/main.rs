@@ -333,7 +333,7 @@ fn pack(movie_path: &Path, out: Option<PathBuf>, profile_name: &str, explain: bo
                 all.extend(known.iter().flatten().cloned());
             }
             if !fresh.is_empty() {
-                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, tones: false };
+                let how = mix::How { light: rules.relight, two: rules.two, quarter: rules.quarter, gold: rules.golden, tones: false, pyramid: false };
                 let these: Vec<&[u8]> = fresh.iter().map(|i| &frames[*i][..]).collect();
                 let before: Option<&[u8]> = if fresh[0] > 0 { Some(&frames[fresh[0] - 1]) } else { carry_exact.as_ref().map(|(f, _)| f.as_slice()) };
                 let (packed, how) = if rules.alone { mix::strike_pack(geo, &these, None, true, rules.bands, &mut mix::Memory::new(), how)? } else { mix::strike_pack(geo, &these, before, false, rules.bands, &mut mix_memory, how)? };
